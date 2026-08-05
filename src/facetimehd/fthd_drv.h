@@ -11,9 +11,11 @@
 #define _FTHD_DRV_H
 
 #include <linux/pci.h>
+#include <linux/kref.h>
 #include <linux/spinlock.h>
 #include <linux/wait.h>
 #include <linux/mutex.h>
+#include <linux/pm_runtime.h>
 #include <linux/version.h>
 #include <media/videobuf2-dma-sg.h>
 #include <media/v4l2-device.h>
@@ -54,9 +56,12 @@ struct fthd_private {
 	struct v4l2_device v4l2_dev;
 	struct video_device *videodev;
 	struct mutex ioctl_lock;
-	int users;
+	struct kref ref;
+	bool removing;
+	bool v4l2_registered;
 	/* lock for synchronizing with irq/workqueue */
 	spinlock_t io_lock;
+	spinlock_t buffer_lock;
 
 	/* Mapped PCI resources */
 	void __iomem *s2_io;
@@ -80,6 +85,8 @@ struct fthd_private {
 
 	/* Root resource for memory management */
 	struct resource *mem;
+	struct mutex mem_lock;
+	struct list_head mem_objects;
 	/* Resource for managing IO mmu slots */
 	struct resource *iommu;
 	/* ISP memory objects */
@@ -112,17 +119,61 @@ struct fthd_private {
 	struct fthd_fmt fmt;
 
 	struct vb2_queue vb2_queue;
-	struct mutex vb2_queue_lock;
-	struct list_head buffer_queue;
-#if LINUX_VERSION_CODE < KERNEL_VERSION(4,8,0)
-	struct vb2_alloc_ctx *alloc_ctx;
-#endif
 	struct h2t_buf_ctx h2t_bufs[FTHD_BUFFERS];
+	unsigned int protocol_errors;
 
 	struct v4l2_ctrl_handler v4l2_ctrl_handler;
+	/* True between a successful fthd_start_channel() and fthd_stop_channel().
+	 * The ISP only accepts the image-quality commands while the channel is
+	 * running, so s_ctrl consults this rather than failing when it isn't. */
+	bool channel_running;
 	int frametime;
 	unsigned int sequence;
+	u64 buffer_tag;
+	/* Serialises the hardware up/down transitions and @suspended. Runtime
+	 * callbacks take only this lock; paths that also shut userspace out take
+	 * ioctl_lock first, then pm_lock. */
+	struct mutex pm_lock;
+	bool suspended;
+	/* Set across a system-sleep transition.  The system suspend callback
+	 * deliberately invalidates allocated vb2 buffers before asking the
+	 * runtime-PM core to force the hardware down, so runtime suspend must not
+	 * reject that particular transition merely because vb2 is still busy. */
+	bool system_suspending;
+	/* Set when firmware stops answering or violates the streaming protocol,
+	 * so commands fail fast and VB2 waiters wake with an error. Cleared in
+	 * fthd_pm_down(), whose teardown reclaims whatever the wedge left
+	 * unfreed; the next open() reloads firmware via fthd_pm_up(). */
+	bool wedged;
 	struct dentry *debugfs;
 };
+
+bool fthd_get(struct fthd_private *dev_priv);
+void fthd_put(struct fthd_private *dev_priv);
+void fthd_mark_firmware_wedged(struct fthd_private *dev_priv);
+
+/* Bring the camera out of runtime suspend and hold it there.  Returns 0 with a
+ * reference held, or a negative error with none.  Not usable from atomic
+ * context, and not from anything holding pm_lock. */
+static inline int fthd_pm_get(struct fthd_private *dev_priv)
+{
+	return pm_runtime_resume_and_get(&dev_priv->pdev->dev);
+}
+
+/* Drop the reference taken by fthd_pm_get() and restart the autosuspend
+ * timer. */
+static inline void fthd_pm_put(struct fthd_private *dev_priv)
+{
+	if (READ_ONCE(dev_priv->removing)) {
+		pm_runtime_put_noidle(&dev_priv->pdev->dev);
+		return;
+	}
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6,17,0)
+	/* Folded into pm_runtime_put_autosuspend() in 6.17, and removed
+	 * outright once the tree-wide conversion finished. */
+	pm_runtime_mark_last_busy(&dev_priv->pdev->dev);
+#endif
+	pm_runtime_put_autosuspend(&dev_priv->pdev->dev);
+}
 
 #endif

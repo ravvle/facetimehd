@@ -10,6 +10,13 @@
 #ifndef _ISP_H
 #define _ISP_H
 
+#include <linux/compiler_attributes.h>
+#include <linux/ioport.h>
+#include <linux/list.h>
+#include <linux/types.h>
+
+struct fthd_private;
+
 /* ISP memory types */
 #define FTHD_MEM_FIRMWARE	1
 #define FTHD_MEM_HEAP		2
@@ -470,6 +477,8 @@ enum isp_debug_cmds {
 
 struct isp_mem_obj {
 	struct resource base;
+	struct list_head list;
+	struct fthd_private *owner;
 	unsigned int type;
 	resource_size_t size;
 	resource_size_t size_aligned;
@@ -494,11 +503,11 @@ struct isp_cmd_hdr {
 	u32 unknown0;
 	u16 opcode;
 	u16 status;
-} __attribute__((packed));
+} __packed;
 
 struct isp_cmd_print_enable {
 	u32 enable;
-} __attribute__((packed));
+} __packed;
 
 struct isp_cmd_config {
 	u32 field0;
@@ -509,13 +518,13 @@ struct isp_cmd_config {
 	u32 field14;
 	u32 field18;
 	u32 field1c;
-} __attribute__((packed));
+} __packed;
 
 struct isp_cmd_set_loadfile {
 	u32 unknown;
 	u32 addr;
 	u32 length;
-} __attribute__((packed));
+} __packed;
 
 struct isp_cmd_channel_info {
 	u32 field_0;
@@ -534,7 +543,7 @@ struct isp_cmd_channel_info {
 	u8 unknown2[40];
 	u8 sensor_serial_number[8];
 	u8 camera_module_serial_number[18];
-} __attribute__((packed));
+} __packed;
 
 struct isp_cmd_channel_camera_config {
 	u32 unknown;
@@ -664,6 +673,13 @@ struct isp_cmd_channel_ae_metering_mode_set {
 	u32 mode;
 };
 
+/* Payload layout inferred from the uniform shape of the other per-channel
+ * setters; @freq is the mains frequency in Hz.  See patch 0016. */
+struct isp_cmd_channel_ae_flicker_freq_set {
+	u32 channel;
+	u32 freq;
+};
+
 struct isp_cmd_channel_start {
 	u32 channel;
 };
@@ -716,6 +732,8 @@ extern struct isp_mem_obj *isp_mem_create(struct fthd_private *dev_priv,
 					  unsigned int type,
 					  resource_size_t size);
 extern int isp_mem_destroy(struct isp_mem_obj *obj);
+extern int isp_mem_destroy_offset(struct fthd_private *dev_priv, u32 offset,
+				  unsigned int type);
 extern int fthd_isp_cmd_start(struct fthd_private *dev_priv);
 extern int fthd_isp_cmd_stop(struct fthd_private *dev_priv);
 extern int isp_powerdown(struct fthd_private *dev_priv);
@@ -753,11 +771,13 @@ extern int fthd_isp_cmd_channel_temporal_filter_disable(struct fthd_private *dev
 extern int fthd_isp_cmd_channel_motion_history_start(struct fthd_private *dev_priv, int channel);
 extern int fthd_isp_cmd_channel_motion_history_stop(struct fthd_private *dev_priv, int channel);
 extern int fthd_isp_cmd_channel_ae_metering_mode_set(struct fthd_private *dev_priv, int channel, int mode);
+extern int fthd_isp_cmd_channel_ae_flicker_freq_set(struct fthd_private *dev_priv, int channel, int freq);
 extern int fthd_isp_cmd_channel_brightness_set(struct fthd_private *dev_priv, int channel, int brightness);
 extern int fthd_isp_cmd_channel_contrast_set(struct fthd_private *dev_priv, int channel, int contrast);
 extern int fthd_isp_cmd_channel_saturation_set(struct fthd_private *dev_priv, int channel, int saturation);
 extern int fthd_isp_cmd_channel_hue_set(struct fthd_private *dev_priv, int channel, int hue);
 extern int fthd_isp_cmd_channel_awb(struct fthd_private *dev_priv, int channel, int hue);
+extern int fthd_isp_cmd_channel_ae(struct fthd_private *dev_priv, int channel, int enable);
 extern int fthd_isp_cmd_channel_buffer_return(struct fthd_private *dev_priv, int channel);
 extern int fthd_start_channel(struct fthd_private *dev_priv, int channel);
 extern int fthd_stop_channel(struct fthd_private *dev_priv, int channel);

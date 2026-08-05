@@ -24,7 +24,7 @@ static int fthd_hw_s2_pll_reset(struct fthd_private *dev_priv)
 
 	FTHD_S2_REG_WRITE(0x3, S2_PLL_CTRL_14);
 
-	dev_info(&dev_priv->pdev->dev, "PLL reset finished\n");
+	dev_dbg(&dev_priv->pdev->dev, "PLL reset finished\n");
 
 	return 0;
 }
@@ -49,7 +49,7 @@ static int fthd_hw_s2_init_pcie_link(struct fthd_private *dev_priv)
 	}
 
 	/* PLL is powered down */
-	dev_info(&dev_priv->pdev->dev, "S2 PCIe link init succeeded\n");
+	dev_dbg(&dev_priv->pdev->dev, "S2 PCIe link init succeeded\n");
 
 	FTHD_S2_REG_WRITE(0x1f08, S2_PCIE_LINK_D128);
 	FTHD_S2_REG_WRITE(0x80008610, S2_PCIE_LINK_D12C);
@@ -73,9 +73,9 @@ static int fthd_hw_s2_pll_init(struct fthd_private *dev_priv, u32 ddr_speed)
 	ref_clk_25 = reg & S2_PLL_REFCLK_25MHZ ? 1 : 0;
 
 	if (ref_clk_25)
-		dev_info(&dev_priv->pdev->dev, "Refclk: 25MHz (0x%x)\n", reg);
+		dev_dbg(&dev_priv->pdev->dev, "Refclk: 25MHz (0x%x)\n", reg);
 	else
-		dev_info(&dev_priv->pdev->dev, "Refclk: 24MHz (0x%x\n", reg);
+		dev_dbg(&dev_priv->pdev->dev, "Refclk: 24MHz (0x%x\n", reg);
 
 	if (ddr_speed == 400) {
 		if (ref_clk_25) {
@@ -129,22 +129,23 @@ static int fthd_hw_s2_pll_init(struct fthd_private *dev_priv, u32 ddr_speed)
 
 	fthd_hw_s2_pll_reset(dev_priv);
 
-	dev_info(&dev_priv->pdev->dev, "Waiting for S2 PLL to lock at %d MHz\n",
-		 ddr_speed);
+	dev_dbg(&dev_priv->pdev->dev, "Waiting for S2 PLL to lock at %d MHz\n",
+		ddr_speed);
 
-	do {
+	for (retries = 0; retries < 10000; retries++) {
 		reg = FTHD_S2_REG_READ(S2_PLL_CMU_STATUS);
+		if (reg & S2_PLL_CMU_STATUS_LOCKED)
+			break;
 		udelay(10);
-		retries++;
-	} while (((reg & 0xff00) & S2_PLL_CMU_STATUS_LOCKED) && retries <= 10000);
+	}
 
-	if (retries > 10000) {
-		dev_info(&dev_priv->pdev->dev, "Failed to lock S2 PLL: 0x%x\n",
-			 reg);
+	if (retries >= 10000) {
+		dev_err(&dev_priv->pdev->dev, "Failed to lock S2 PLL: 0x%x\n",
+			reg);
 		return -EINVAL;
 	} else {
-		dev_info(&dev_priv->pdev->dev, "S2 PLL is locked after %d us\n",
-			 (retries * 10));
+		dev_dbg(&dev_priv->pdev->dev, "S2 PLL is locked after %d us\n",
+			(retries * 10));
 	}
 
 	reg = FTHD_S2_REG_READ(S2_PLL_STATUS_A8);
@@ -153,9 +154,9 @@ static int fthd_hw_s2_pll_init(struct fthd_private *dev_priv, u32 ddr_speed)
 
 	reg = FTHD_S2_REG_READ(S2_PLL_STATUS_A8);
 	if (reg & S2_PLL_BYPASS)
-		dev_info(&dev_priv->pdev->dev, "S2 PLL is in bypass mode\n");
+		dev_dbg(&dev_priv->pdev->dev, "S2 PLL is in bypass mode\n");
 	else
-		dev_info(&dev_priv->pdev->dev, "S2 PLL is in non-bypass mode\n");
+		dev_dbg(&dev_priv->pdev->dev, "S2 PLL is in non-bypass mode\n");
 
 	return 0;
 }
@@ -246,8 +247,8 @@ static int fthd_hw_ddr_rewrite_mode_regs(struct fthd_private *dev_priv)
 	if (ret != 0)
 		return ret;
 
-	dev_info(&dev_priv->pdev->dev,
-		 "Rewrite DDR mode registers succeeded\n");
+	dev_dbg(&dev_priv->pdev->dev,
+		"Rewrite DDR mode registers succeeded\n");
 
 	return 0;
 }
@@ -278,7 +279,9 @@ static int fthd_hw_s2_init_ddr_controller_soc(struct fthd_private *dev_priv)
 	FTHD_S2_REG_WRITE(reg & 0xfffffcff, S2_PLL_CTRL_9C);
 	FTHD_S2_REG_WRITE(reg | 0x300, S2_PLL_CTRL_9C);
 
-	fthd_hw_s2_pll_init(dev_priv, dev_priv->ddr_speed);
+	ret = fthd_hw_s2_pll_init(dev_priv, dev_priv->ddr_speed);
+	if (ret)
+		return ret;
 
 	fthd_hw_ddr_phy_soft_reset(dev_priv);
 
@@ -342,8 +345,8 @@ static int fthd_hw_s2_init_ddr_controller_soc(struct fthd_private *dev_priv)
 		return -EIO;
 	}
 
-	dev_info(&dev_priv->pdev->dev,
-		 "DDR40 PHY PLL locked on safe settings\n");
+	dev_dbg(&dev_priv->pdev->dev,
+		"DDR40 PHY PLL locked on safe settings\n");
 
 	/* Default is DDR model 4 */
 	switch (dev_priv->ddr_model) {
@@ -398,7 +401,7 @@ static int fthd_hw_s2_init_ddr_controller_soc(struct fthd_private *dev_priv)
 			"Timeout waiting for STRAP valid\n");
 		return -ENODEV;
 	} else {
-		dev_info(&dev_priv->pdev->dev, "STRAP valid\n");
+		dev_dbg(&dev_priv->pdev->dev, "STRAP valid\n");
 	}
 
 	/* Manual DDR40 PHY init */
@@ -408,8 +411,8 @@ static int fthd_hw_s2_init_ddr_controller_soc(struct fthd_private *dev_priv)
 			 dev_priv->ddr_speed);
 	}
 
-	dev_info(&dev_priv->pdev->dev,
-		 "Configuring DDR PLLs for %u MHz\n", dev_priv->ddr_speed);
+	dev_dbg(&dev_priv->pdev->dev,
+		"Configuring DDR PLLs for %u MHz\n", dev_priv->ddr_speed);
 
 	if ((dev_priv->ddr_speed * 2) < 500)
 		val = 0x2040;
@@ -441,7 +444,7 @@ static int fthd_hw_s2_init_ddr_controller_soc(struct fthd_private *dev_priv)
 		return -ENODEV;
 	}
 
-	dev_info(&dev_priv->pdev->dev, "DDR40 PLL is locked after %d us\n", i);
+	dev_dbg(&dev_priv->pdev->dev, "DDR40 PLL is locked after %d us\n", i);
 
 	/* Configure DDR40 VDL */
 	FTHD_S2_REG_WRITE(0, S2_DDR40_PHY_VDL_CTL);
@@ -456,12 +459,12 @@ static int fthd_hw_s2_init_ddr_controller_soc(struct fthd_private *dev_priv)
 	}
 
 	if (reg & 0x1) {
-		dev_info(&dev_priv->pdev->dev,
-			 "First DDR40 VDL calibration completed after %d us",
-			 i);
+		dev_dbg(&dev_priv->pdev->dev,
+			"First DDR40 VDL calibration completed after %d us",
+			i);
 
 		if ((reg & 0x2) == 0) {
-			dev_info(&dev_priv->pdev->dev,
+			dev_warn(&dev_priv->pdev->dev,
 				 "...but failed to lock\n");
 		}
 
@@ -481,20 +484,20 @@ static int fthd_hw_s2_init_ddr_controller_soc(struct fthd_private *dev_priv)
 		udelay(1);
 	}
 
-	dev_info(&dev_priv->pdev->dev,
-		 "Second DDR40 VDL calibration completed after %d us\n", i);
+	dev_dbg(&dev_priv->pdev->dev,
+		"Second DDR40 VDL calibration completed after %d us\n", i);
 
 	if (reg & 0x2) {
 		step_size = (reg & S2_DDR40_PHY_VDL_STEP_MASK) >>
 			    S2_DDR40_PHY_VDL_STEP_SHIFT;
-		dev_info(&dev_priv->pdev->dev, "Using step size %u\n",
-			 step_size);
+		dev_dbg(&dev_priv->pdev->dev, "Using step size %u\n",
+			step_size);
 	} else {
 
 		val = 1000000 / dev_priv->ddr_speed;
 		step_size = (val * 0x4ec4ec4f) >> 22;
-		dev_info(&dev_priv->pdev->dev, "Using default step size (%u)\n",
-			 step_size);
+		dev_dbg(&dev_priv->pdev->dev, "Using default step size (%u)\n",
+			step_size);
 	}
 
 	dev_priv->vdl_step_size = step_size;
@@ -522,9 +525,9 @@ static int fthd_hw_s2_init_ddr_controller_soc(struct fthd_private *dev_priv)
 
 		FTHD_S2_REG_WRITE(vdl_coarse, S2_DDR40_PHY_VDL_OVR_COARSE);
 
-		dev_info(&dev_priv->pdev->dev,
-			 "VDL set to: coarse=0x%x, fine=0x%x\n",
-			 vdl_coarse, vdl_fine);
+		dev_dbg(&dev_priv->pdev->dev,
+			"VDL set to: coarse=0x%x, fine=0x%x\n",
+			vdl_coarse, vdl_fine);
 	}
 
 	/* Configure Virtual VTT connections and override */
@@ -537,7 +540,7 @@ static int fthd_hw_s2_init_ddr_controller_soc(struct fthd_private *dev_priv)
 
 	FTHD_S2_REG_WRITE(0x4, S2_DDR40_PHY_VTT_CTL);
 
-	dev_info(&dev_priv->pdev->dev, "Virtual VTT enabled");
+	dev_dbg(&dev_priv->pdev->dev, "Virtual VTT enabled");
 
 	/* Process, Voltage and Temperature compensation */
 	FTHD_S2_REG_WRITE(0xc0fff, S2_DDR40_PHY_ZQ_PVT_COMP_CTL);
@@ -580,8 +583,8 @@ static int fthd_hw_s2_init_ddr_controller_soc(struct fthd_private *dev_priv)
 
 	/* Read DRAM mem address (FIXME: Need to mask a few bits here) */
 	reg = FTHD_S2_REG_READ(S2_DDR40_STRAP_STATUS);
-	dev_info(&dev_priv->pdev->dev,
-		 "S2 DRAM memory address: 0x%08x\n", reg);
+	dev_dbg(&dev_priv->pdev->dev,
+		"S2 DRAM memory address: 0x%08x\n", reg);
 
 	switch (dev_priv->ddr_model) {
 	case 4:
@@ -598,7 +601,9 @@ static int fthd_hw_s2_init_ddr_controller_soc(struct fthd_private *dev_priv)
 	FTHD_S2_REG_WRITE(val, S2_3208);
 	FTHD_S2_REG_WRITE(0x1040, S2_3200);
 
-	fthd_hw_ddr_rewrite_mode_regs(dev_priv);
+	ret = fthd_hw_ddr_rewrite_mode_regs(dev_priv);
+	if (ret)
+		return ret;
 
 	FTHD_S2_REG_WRITE(0x20000, S2_DDR_2014);
 	FTHD_S2_REG_WRITE(1, S2_DDR_2008);
@@ -646,16 +651,22 @@ int fthd_irq_disable(struct fthd_private *dev_priv)
 	return 0;
 }
 
-int fthd_hw_init(struct fthd_private *dev_priv)
+int fthd_hw_init(struct fthd_private *dev_priv, bool full_verify)
 {
+	int words = full_verify ? MEM_VERIFY_NUM_PROBE : MEM_VERIFY_NUM;
 	int ret;
 
 	ret = fthd_hw_s2_init_pcie_link(dev_priv);
 	if (ret)
 		goto out;
 
-	fthd_hw_s2_preinit_ddr_controller_soc(dev_priv);
-	fthd_hw_s2_init_ddr_controller_soc(dev_priv);
+	ret = fthd_hw_s2_preinit_ddr_controller_soc(dev_priv);
+	if (ret)
+		goto out;
+
+	ret = fthd_hw_s2_init_ddr_controller_soc(dev_priv);
+	if (ret)
+		goto out;
 
 /*
 	dev_info(&dev_priv->pdev->dev,
@@ -671,20 +682,19 @@ int fthd_hw_init(struct fthd_private *dev_priv)
 	}
 */
 
-	ret = fthd_ddr_verify_mem(dev_priv, 0, MEM_VERIFY_NUM);
+	/* Not a full verification of the 128MB array - see MEM_VERIFY_NUM* for
+	 * what this does and does not cover, and why it is sized differently on
+	 * probe than on a runtime-PM resume. */
+	ret = fthd_ddr_verify_mem(dev_priv, MEM_VERIFY_BASE, words);
 	if (ret) {
 		dev_err(&dev_priv->pdev->dev,
-			"Full memory verification failed! (%d)\n", ret);
-		/*
-		 * Here we should do a shmoo calibration but it's not yet
-		 * fully implemented.
-		 */
-
-		/* fthd_ddr_calibrate(dev_priv); */
-	} else {
-		dev_info(&dev_priv->pdev->dev,
-			 "Full memory verification succeeded! (%d)\n", ret);
+			"DDR verification failed over %d words: bad data lines %#x\n",
+			words, ret);
+		ret = -EIO;
+		goto out;
 	}
+	dev_dbg(&dev_priv->pdev->dev, "DDR verification passed over %d words\n",
+		words);
 
 	/* Save our working configuration */
 	fthd_ddr_phy_save_regs(dev_priv);
@@ -695,10 +705,15 @@ int fthd_hw_init(struct fthd_private *dev_priv)
 	FTHD_ISP_REG_WRITE(0, ISP_REG_40004);
 
 	ret = isp_init(dev_priv);
-	if (ret)
-	    goto out;
+	if (ret) {
+		/* isp_init() allocates incrementally; unwind partial initialisation
+		 * here so probe and runtime-resume failures cannot leak ISP memory. */
+		if (dev_priv->mem)
+			isp_uninit(dev_priv);
+		goto out;
+	}
 
-	dev_info(&dev_priv->pdev->dev, "Enabling interrupts\n");
+	dev_dbg(&dev_priv->pdev->dev, "Enabling interrupts\n");
 	fthd_irq_enable(dev_priv);
 out:
 	return ret;
@@ -706,7 +721,7 @@ out:
 
 void fthd_hw_deinit(struct fthd_private *dev_priv)
 {
-	dev_info(&dev_priv->pdev->dev, "%s", __FUNCTION__);
+	dev_dbg(&dev_priv->pdev->dev, "%s", __func__);
 	FTHD_ISP_REG_WRITE(0, ISP_REG_41020);
 	fthd_irq_disable(dev_priv);
 }

@@ -1,0 +1,145 @@
+name: CI
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+  # The point of this project is that it keeps working without anyone touching
+  # it. That only holds if something notices when a new kernel release breaks
+  # it, so the whole matrix runs weekly regardless of commits.
+  schedule:
+    - cron: '17 5 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  shellcheck:
+    name: shellcheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install shellcheck
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends shellcheck
+      - name: Lint
+        run: |
+          shellcheck -x --source-path=SCRIPTDIR \
+            setup.sh \
+            scripts/install.sh scripts/uninstall.sh \
+            scripts/macbook-tune.sh \
+            scripts/extract-firmware.sh \
+            tests/build-driver.sh tests/smoke-capture.sh
+      - name: Check scripts are executable
+        run: |
+          for f in setup.sh scripts/*.sh tests/*.sh; do
+            [ -x "$f" ] || { echo "$f is not executable"; exit 1; }
+          done
+
+  build:
+    # Compiles src/facetimehd against each supported kernel's
+    # headers. This is the early-warning system for kernel API churn: if a new
+    # kernel drops an API the driver uses, this goes red here instead of on a
+    # user's laptop after 'apt upgrade'.
+    name: build (${{ matrix.name }}, kernel ${{ matrix.kernel-note }})
+    runs-on: ubuntu-latest
+    container: ${{ matrix.container }}
+    continue-on-error: ${{ matrix.experimental }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: 'ubuntu 22.04'
+            container: 'ubuntu:22.04'
+            family: debian
+            kernel-note: '5.15 / HWE'
+            experimental: false
+          - name: 'ubuntu 24.04'
+            container: 'ubuntu:24.04'
+            family: debian
+            kernel-note: '6.8 / HWE'
+            experimental: false
+          - name: 'ubuntu 26.04'
+            container: 'ubuntu:26.04'
+            family: debian
+            kernel-note: '7.0'
+            experimental: false
+          # Fedora carries the newest kernel of anything here, so it is where
+          # kernel API churn shows up first.
+          - name: 'fedora 44'
+            container: 'fedora:44'
+            family: rpm
+            kernel-note: '7.1'
+            experimental: false
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install toolchain and kernel headers (apt)
+        if: matrix.family == 'debian'
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            build-essential kmod linux-headers-generic
+
+      - name: Install toolchain and kernel headers (dnf)
+        if: matrix.family == 'rpm'
+        run: |
+          dnf install -y --setopt=install_weak_deps=False \
+            gcc make tar kmod elfutils-libelf-devel kernel-devel
+
+      - name: Build the driver out-of-tree (apt)
+        if: matrix.family == 'debian'
+        env:
+          WERROR: '1'
+        run: ./tests/build-driver.sh
+
+      - name: Build the driver out-of-tree (dnf)
+        if: matrix.family == 'rpm'
+        # kernel-devel unpacks to /usr/src/kernels/<ver>. The container has no
+        # kernel package, so the /lib/modules/<ver>/build symlink that would
+        # point there on a real system does not exist - hand the tree to
+        # build-driver.sh directly.
+        env:
+          WERROR: '1'
+        run: |
+          KDIR="$(ls -d /usr/src/kernels/*/ | head -1)"
+          echo "Building against $KDIR"
+          KDIR="$KDIR" ./tests/build-driver.sh
+
+  driver-clang:
+    name: driver build (Clang)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Strict build against Clang-built kernel headers
+        run: |
+          docker run --rm \
+            -v "$GITHUB_WORKSPACE:/workspace:ro" -w /workspace \
+            docker.io/chimeralinux/chimera:latest sh -euxc '
+              apk update
+              apk add bash clang gmake kmod linux-stable-devel lld llvm
+              KDIR="$(ls -d /usr/src/linux-headers-* | head -1)"
+              MAKE=gmake LLVM=1 W=1 WERROR=1 KDIR="$KDIR" \
+                bash ./tests/build-driver.sh
+            '
+
+  driver-sparse:
+    name: driver static analysis (Sparse)
+    runs-on: ubuntu-latest
+    container: ubuntu:24.04
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install Sparse and kernel headers
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            build-essential kmod linux-headers-generic sparse
+      - name: Sparse semantic checks
+        env:
+          SPARSE: '1'
+          W: '1'
+        run: ./tests/build-driver.sh

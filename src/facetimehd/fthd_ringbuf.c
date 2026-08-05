@@ -76,9 +76,6 @@ int fthd_channel_ringbuf_send(struct fthd_private *dev_priv, struct fw_channel *
 	spin_lock_irq(&chan->lock);
 	entry = get_entry_addr(dev_priv, chan, chan->ringbuf.idx);
 
-	if (++chan->ringbuf.idx >= chan->size)
-		chan->ringbuf.idx = 0;
-
 	if (!(FTHD_S2_MEM_READ(entry + FTHD_RINGBUF_ADDRESS_FLAGS) & 1) ^ (chan->type != 0)) {
 		spin_unlock_irq(&chan->lock);
 		return -EAGAIN;
@@ -89,6 +86,8 @@ int fthd_channel_ringbuf_send(struct fthd_private *dev_priv, struct fw_channel *
 	wmb();
 	FTHD_S2_MEM_WRITE(data_offset | (chan->type == 0 ? 0 : 1),
 			  entry + FTHD_RINGBUF_ADDRESS_FLAGS);
+	if (++chan->ringbuf.idx >= chan->size)
+		chan->ringbuf.idx = 0;
 	spin_unlock_irq(&chan->lock);
 
 	spin_lock_irq(&dev_priv->io_lock);
@@ -124,12 +123,17 @@ out:
 
 int fthd_channel_wait_ready(struct fthd_private *dev_priv, struct fw_channel *chan, u32 entry, int timeout)
 {
-	if (wait_event_interruptible_timeout(chan->wq,
-					     (FTHD_S2_MEM_READ(entry + FTHD_RINGBUF_ADDRESS_FLAGS) & 1) ^ (chan->type != 0),
-		msecs_to_jiffies(timeout)) <= 0) {
+	long ret;
+
+	ret = wait_event_interruptible_timeout(chan->wq,
+			(FTHD_S2_MEM_READ(entry + FTHD_RINGBUF_ADDRESS_FLAGS) & 1) ^
+			(chan->type != 0), msecs_to_jiffies(timeout));
+	if (!ret) {
 		dev_err(&dev_priv->pdev->dev, "%s: timeout\n", chan->name);
 		fthd_channel_ringbuf_dump(dev_priv, chan);
 		return -ETIMEDOUT;
 	}
+	if (ret < 0)
+		return ret;
 	return 0;
 }
