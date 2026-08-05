@@ -1,7 +1,7 @@
 # Downstream changes to the FaceTime HD driver
 
 This directory is the driver built and installed by this project. It is a
-maintained fork of `patjak/facetimehd` commit
+ fork of `patjak/facetimehd` commit
 `364b1c663583e64e27f07ed0257a7584bef095fc`.
 
 ## Safety and correctness

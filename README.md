@@ -24,7 +24,7 @@ facetimehd contributors**:
 - [linux-on-mac/mbpfan](https://github.com/linux-on-mac/mbpfan) provides the
   optional fan daemon used by the setup helper.
 
-The installer, maintained driver fork, audits, tests and documentation were
+The installer, driver fork, audits, tests and documentation were
 developed with assistance from **Claude Code** and **ChatGPT
 Codex**. The driver was forked @ [patjak/facetimehd](https://github.com/patjak/facetimehd)
 [`364b1c6`](https://github.com/patjak/facetimehd/commit/364b1c663583e64e27f07ed0257a7584bef095fc).
@@ -32,9 +32,9 @@ Codex**. The driver was forked @ [patjak/facetimehd](https://github.com/patjak/f
 ## What this project does
 
 The repository packages everything needed to make the PCIe FaceTime HD camera
-usable without manually combining several old installation guides:
+usable and mbpfan to improve cpu thermals:
 
-- builds the maintained `facetimehd` driver;
+- builds the `facetimehd` driver;
 - registers it with DKMS so it is rebuilt after kernel updates;
 - downloads an Apple update and safely extracts the proprietary camera
   firmware, which cannot be redistributed in this repository;
@@ -43,7 +43,7 @@ usable without manually combining several old installation guides:
 - optionally installs and enables `mbpfan` on Apple hardware.
 
 The driver built by this project lives in
-[`src/facetimehd/`](src/facetimehd/). It is a maintained fork of
+[`src/facetimehd/`](src/facetimehd/). It is a fork of
 `patjak/facetimehd` at
 [`364b1c6`](https://github.com/patjak/facetimehd/commit/364b1c663583e64e27f07ed0257a7584bef095fc),
 with a concise record of its changes in
