@@ -61,7 +61,7 @@ sudo ./scripts/extract-firmware.sh --calibration-only --sys /path/AppleCamera.sy
 sudo ./setup.sh [-y]
 
 # Install / uninstall (require root)
-sudo ./scripts/install.sh [-y|--force|--skip-firmware|--skip-calibration|--skip-hw-check]
+sudo ./scripts/install.sh [-y|--force|--skip-firmware|--skip-hw-check]
 sudo ./scripts/uninstall.sh [--keep-tuning]
 
 # Make sure mbpfan is installed and running (requires root)

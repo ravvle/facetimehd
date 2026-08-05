@@ -28,7 +28,6 @@ MODULE_NAME=facetimehd
 ASSUME_YES=0
 FORCE_REBUILD=0
 SKIP_FIRMWARE=0
-SKIP_CALIBRATION=0
 SKIP_HW_CHECK=0
 
 usage() {
@@ -38,8 +37,6 @@ Usage: sudo $0 [OPTIONS]
   -y, --yes            Do not prompt for confirmation.
       --force          Rebuild and reinstall even if already up to date.
       --skip-firmware  Do not touch the firmware (it is already installed).
-      --skip-calibration
-                       Do not fetch the sensor calibration files.
       --skip-hw-check  Install even if no FaceTime HD camera is detected.
   -h, --help           Show this help.
 
@@ -55,7 +52,6 @@ while [ $# -gt 0 ]; do
         -y|--yes)        ASSUME_YES=1 ;;
         --force)         FORCE_REBUILD=1 ;;
         --skip-firmware) SKIP_FIRMWARE=1 ;;
-        --skip-calibration) SKIP_CALIBRATION=1 ;;
         --skip-hw-check) SKIP_HW_CHECK=1 ;;
         -h|--help)       usage; exit 0 ;;
         *)               error "Unknown option: $1"; usage >&2; exit 2 ;;
@@ -123,6 +119,8 @@ pkg_refresh
 # curl/xz/cpio/gzip are what the firmware extractor needs; cpio in particular
 # is no longer part of a default install on either family. git is deliberately
 # absent - the maintained source is included, so installing needs no GitHub.
+# unar unpacks the sensor calibration files' Boot Camp driver; it is required,
+# not optional, because calibration is no longer a skippable step.
 if [ "$PKG_FAMILY" = rpm ]; then
     # diffutils is what makes the rebuild-skip below work. It is Essential on
     # Debian and so never listed there, but a minimal Fedora has no diff at all
@@ -130,27 +128,17 @@ if [ "$PKG_FAMILY" = rpm ]; then
     # rebuilds from scratch. elfutils-libelf-devel is what the kernel build
     # system needs and does not pull in itself.
     DEPS=(gcc make cpio curl diffutils dkms elfutils-libelf-devel gzip kmod
-          pciutils v4l-utils xz)
-    # Only needed to unpack the sensor calibration files, and the install is
-    # useful without them, so a distribution that lacks it must not be fatal.
-    OPTIONAL_DEPS=(unar)
+          pciutils unar v4l-utils xz)
 else
-    DEPS=(build-essential cpio curl dkms gzip kmod pciutils v4l-utils
+    DEPS=(build-essential cpio curl dkms gzip kmod pciutils unar v4l-utils
           xz-utils)
-    OPTIONAL_DEPS=(unar)
 fi
-
-for opt in "${OPTIONAL_DEPS[@]}"; do
-    pkg_installed "$opt" && continue
-    pkg_available "$opt" || continue
-    pkg_install "$opt" >/dev/null 2>&1 || true
-done
 
 pkg_install "${DEPS[@]}" || die \
     "Could not install the build dependencies: ${DEPS[*]}
        If one of those names does not exist on this distribution, install the
        equivalents yourself (a compiler, make, dkms, kernel headers, cpio, curl,
-       xz, gzip and kmod) and re-run this script."
+       xz, gzip, kmod and unar) and re-run this script."
 
 # Headers for the running kernel, so we can build right now, plus whatever
 # makes future kernels arrive with headers already in place so DKMS never
@@ -362,17 +350,13 @@ fi
 
 # The sensor calibration files are a separate concern from the firmware: they
 # come from a different Apple download (the Windows Boot Camp driver, the only
-# thing that ships them), the camera streams without them, and they only fix
-# its colours. So a failure here is a warning, never fatal - and the whole step
-# is skipped when they are already in place, since nothing about them changes.
-if [ "$SKIP_FIRMWARE" -eq 0 ] && [ "$SKIP_CALIBRATION" -eq 0 ]; then
+# thing that ships them), and they fix its colours. They are not optional -
+# unar is a required dependency above precisely so this step always runs - but
+# a failure here is still a warning, never fatal: the camera streams without
+# them, just with the wrong colours.
+if [ "$SKIP_FIRMWARE" -eq 0 ]; then
     if compgen -G "$FW_DIR/*_01XX.dat" >/dev/null && [ "$FORCE_REBUILD" -eq 0 ]; then
         step "Sensor calibration files already present"
-    elif ! have unar && ! have unrar; then
-        step "Skipping the sensor calibration files"
-        info "They live inside a RAR-packed Boot Camp driver and need unar to"
-        info "unpack. Install it and re-run, or fetch them later with:"
-        info "  sudo ./scripts/extract-firmware.sh --calibration-only"
     else
         step "Extracting the sensor calibration files"
         info "A second ~1.2 MB download. Without these the camera works but"

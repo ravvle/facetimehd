@@ -38,8 +38,8 @@ usable and mbpfan to improve cpu thermals:
 - registers it with DKMS so it is rebuilt after kernel updates;
 - downloads an Apple update and safely extracts the proprietary camera
   firmware, which cannot be redistributed in this repository;
-- installs the matching sensor calibration files when the required unpacker is
-  available; and
+- installs the matching sensor calibration files (`unar` is a required
+  dependency for this); and
 - optionally installs and enables `mbpfan` on Apple hardware.
 
 The driver built by this project lives in
@@ -176,11 +176,12 @@ installing:
 
 Calibration files come from a separate Apple Boot Camp package. They are not
 required for capture, but missing calibration can produce incorrect colours.
-If they were skipped because `unar` was unavailable, install it and rerun the
-guided setup, selecting the camera driver again:
+`install.sh` fetches them on every run, since `unar` is a required dependency;
+if that step still failed for some other reason (e.g. no network access to
+Apple's Boot Camp download), retry it directly:
 
 ```bash
-sudo ./setup.sh
+sudo ./scripts/extract-firmware.sh --calibration-only
 ```
 
 These Apple downloads are the only installation steps that require network
