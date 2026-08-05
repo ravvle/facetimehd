@@ -1,6 +1,6 @@
 # shellcheck shell=bash
 #
-# Shared helpers for the facetimehd-ubuntu-macbook scripts.
+# Shared helpers for the facetimehd scripts.
 # Sourced, never executed directly.
 
 [ -n "${_FTHD_COMMON_SH:-}" ] && return 0

@@ -21,7 +21,7 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib/common.sh
 . "$SCRIPT_DIR/lib/common.sh"
 
-STATE_DIR=/var/lib/facetimehd-ubuntu-macbook
+STATE_DIR=/var/lib/facetimehd
 MBPFAN_ENABLED="$STATE_DIR/mbpfan.enabled-by-us"
 
 ASSUME_YES=0

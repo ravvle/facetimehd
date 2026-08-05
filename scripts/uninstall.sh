@@ -13,7 +13,7 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 . "$SCRIPT_DIR/lib/common.sh"
 
 MODULE_NAME=facetimehd
-STATE_DIR=/var/lib/facetimehd-ubuntu-macbook
+STATE_DIR=/var/lib/facetimehd
 
 ASSUME_YES=0
 KEEP_TUNING=0

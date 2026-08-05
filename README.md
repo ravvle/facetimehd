@@ -128,7 +128,7 @@ Clone the repository and run the guided setup:
 
 ```bash
 git clone https://github.com/ravvle/facetimehd.git
-cd facetimehd-ubuntu-macbook
+cd facetimehd
 sudo ./setup.sh
 sudo reboot
 ```

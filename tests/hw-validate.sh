@@ -29,7 +29,7 @@ REPO_DIR="$(dirname -- "$SCRIPT_DIR")"
 . "$REPO_DIR/scripts/lib/common.sh"
 
 MODULE_NAME=facetimehd
-STATE_DIR=/var/lib/facetimehd-ubuntu-macbook
+STATE_DIR=/var/lib/facetimehd
 REBOOT_STATE="$STATE_DIR/hw-validate-reboot"
 REPORT="${REPORT:-/tmp/facetimehd-hw-validate-$(date +%Y%m%d-%H%M%S).log}"
 
