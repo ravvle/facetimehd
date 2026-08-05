@@ -4,8 +4,8 @@ Enable the built-in Apple FaceTime HD camera on 2013–2015 Intel MacBooks
 running Ubuntu, Fedora or a compatible Linux distribution. Main improvements over
 [patjak/facetimehd](https://github.com/patjak/facetimehd) is **working suspend/resume**, **safer code**, **image resolution/scaling fixes**, **auto calibration** and exposing the extra controls to user programs. It also uses more modern kernel tie ins and drops support for kernels older than 5.15.
 
-[![CI](https://github.com/ravvle/facetimehd-ubuntu-macbook/actions/workflows/ci.yml/badge.svg)](https://github.com/ravvle/facetimehd-ubuntu-macbook/actions/workflows/ci.yml)
-[![License](https://img.shields.io/github/license/ravvle/facetimehd-ubuntu-macbook)](LICENSE)
+[![CI](https://github.com/ravvle/facetimehd/actions/workflows/ci.yml/badge.svg)](https://github.com/ravvle/facetimehd/actions/workflows/ci.yml)
+[![License](https://img.shields.io/github/license/ravvle/facetimehd)](LICENSE)
 [![Distros](https://img.shields.io/badge/distros-Ubuntu%20%7C%20Fedora-orange)](#distribution-compatibility)
 [![Kernel](https://img.shields.io/badge/kernel-5.15%2B-blue)](https://kernel.org)
 
@@ -127,7 +127,7 @@ normally supplied through EPEL, which this installer does not enable.
 Clone the repository and run the guided setup:
 
 ```bash
-git clone https://github.com/ravvle/facetimehd-ubuntu-macbook.git
+git clone https://github.com/ravvle/facetimehd.git
 cd facetimehd-ubuntu-macbook
 sudo ./setup.sh
 sudo reboot
@@ -275,7 +275,7 @@ sudo dmesg | grep -iE 'facetimehd|bcwc'
 ```
 
 Issues and contributions are welcome through
-[GitHub](https://github.com/ravvle/facetimehd-ubuntu-macbook/issues). Reports from additional 2013–2015 MacBook
+[GitHub](https://github.com/ravvle/facetimehd/issues). Reports from additional 2013–2015 MacBook
 models are especially useful.
 
 ## License
