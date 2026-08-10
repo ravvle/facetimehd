@@ -330,6 +330,8 @@ if [ "$DO_CALIBRATION" -eq 1 ]; then
         [ -n "$unpacker" ] || die \
             "Need unar (or unrar) to unpack the Boot Camp driver.
        Install it with: apt install unar   /   dnf install unar
+       On Enterprise Linux (AlmaLinux, Rocky, RHEL) unar is in EPEL:
+           dnf install epel-release && dnf install unar
        Or supply an unpacked AppleCamera.sys with --sys FILE."
 
         info "This fetches ~1.2 MB of $BOOTCAMP_URL"

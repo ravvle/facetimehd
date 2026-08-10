@@ -1,12 +1,12 @@
 # FaceTime HD Camera for Linux
 
 Enable the built-in Apple FaceTime HD camera on 2013–2015 Intel MacBooks
-running Ubuntu, Fedora or a compatible Linux distribution. Main improvements over
+running Ubuntu, Fedora, AlmaLinux or a compatible Linux distribution. Main improvements over
 [patjak/facetimehd](https://github.com/patjak/facetimehd) is **working suspend/resume**, **safer code**, **image resolution/scaling fixes**, **auto calibration** and exposing the extra controls to user programs. It also uses more modern kernel tie ins and drops support for kernels older than 5.15.
 
 [![CI](https://github.com/ravvle/facetimehd/actions/workflows/ci.yml/badge.svg)](https://github.com/ravvle/facetimehd/actions/workflows/ci.yml)
 [![License](https://img.shields.io/github/license/ravvle/facetimehd)](LICENSE)
-[![Distros](https://img.shields.io/badge/distros-Ubuntu%20%7C%20Fedora-orange)](#distribution-compatibility)
+[![Distros](https://img.shields.io/badge/distros-Ubuntu%20%7C%20Fedora%20%7C%20AlmaLinux-orange)](#distribution-compatibility)
 [![Kernel](https://img.shields.io/badge/kernel-5.15%2B-blue)](https://kernel.org)
 
 ## Origins and acknowledgements
@@ -114,13 +114,39 @@ lspci -nn | grep -i '14e4:1570'
 | Ubuntu 24.04 LTS | 6.8 / HWE | 3.0.11 | Supported and CI-tested |
 | Ubuntu 22.04 LTS | 5.15 / HWE | 2.8.7 | Supported and CI-tested |
 | Fedora 44 | 7.1 | 3.4.2 | Supported and CI-tested |
+| AlmaLinux 10 | 6.12 | 3.x (EPEL) | Supported and CI-tested |
 
 The scripts automatically use `apt-get` or `dnf`. Debian, Linux Mint, Pop!_OS
 and Fedora derivatives will usually work when they provide DKMS and matching
 kernel headers, but only the releases in the table are covered by CI.
 
-RHEL, AlmaLinux and Rocky Linux are not directly supported because DKMS is
-normally supplied through EPEL, which this installer does not enable.
+#### Enterprise Linux (AlmaLinux, Rocky, CentOS Stream, RHEL)
+
+Red Hat does not ship DKMS, so on these distributions it comes from
+[EPEL](https://docs.fedoraproject.org/en-US/epel/), which is not enabled out of
+the box. **The installer enables it for you**: it turns on CodeReady Builder
+(which EPEL's own dependencies need) and installs `epel-release` from the
+distribution's `extras` repository, falling back to the EPEL project's own
+`epel-release-latest-<major>` package on RHEL proper, which has no `extras`.
+Both steps are skipped when EPEL is already enabled, and neither is undone by
+`scripts/uninstall.sh` — other packages may depend on EPEL by then, so removing
+a system-wide repository on the way out would be the more surprising choice.
+
+To set it up yourself beforehand, or to check what the installer did:
+
+```bash
+sudo dnf install epel-release
+sudo dnf config-manager setopt crb.enabled=1   # dnf4: --set-enabled crb
+dnf repolist --enabled | grep -E 'epel|crb'
+```
+
+**AlmaLinux 10 is the first Enterprise Linux release this driver can be used
+on.** RHEL 9 and its rebuilds ship kernel 5.14, just below the 5.15 floor;
+RHEL 10's 6.12 clears it comfortably. `mbpfan` and `unar` also come from EPEL,
+and EPEL does not rebuild every Fedora package for every EL release — if either
+is missing, the installer says so and carries on. Neither is needed to build or
+load the driver; `unar` only unpacks the sensor calibration files, so without
+it the camera works but its colours are off.
 
 ## Installation
 
@@ -176,9 +202,11 @@ installing:
 
 Calibration files come from a separate Apple Boot Camp package. They are not
 required for capture, but missing calibration can produce incorrect colours.
-`install.sh` fetches them on every run, since `unar` is a required dependency;
-if that step still failed for some other reason (e.g. no network access to
-Apple's Boot Camp download), retry it directly:
+`install.sh` fetches them on every run where `unar` is available — which is
+every distribution in the table above, `unar` being a normal dependency of the
+install. If that step failed for some other reason (no network access to
+Apple's Boot Camp download, or a distribution that does not package `unar`),
+retry it directly once the cause is fixed:
 
 ```bash
 sudo ./scripts/extract-firmware.sh --calibration-only

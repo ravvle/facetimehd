@@ -110,12 +110,22 @@ pkg_manager >/dev/null ||
 
 step "Installing mbpfan"
 
+# On Enterprise Linux mbpfan can only come from EPEL, so there is no point
+# asking whether it is available before EPEL is switched on. Skipped when
+# mbpfan is already here, so a re-run does not reconfigure repositories for
+# nothing. Not fatal - pkg_available answers the question honestly either way.
+if is_enterprise_linux && ! have mbpfan && ! pkg_installed mbpfan; then
+    info "Enterprise Linux: mbpfan can only come from EPEL. Enabling it."
+    ensure_epel || warn "Could not enable EPEL; mbpfan is unlikely to be found."
+fi
+
 if have mbpfan || pkg_installed mbpfan; then
     info "mbpfan is already installed"
 elif ! pkg_available mbpfan; then
     # Ubuntu has it in universe and Fedora in the main repositories, but a
-    # derivative may have neither. Say so plainly instead of letting the
-    # package manager fail with "no match for argument: mbpfan".
+    # derivative may have neither, and EPEL does not rebuild every Fedora
+    # package for every Enterprise Linux release. Say so plainly instead of
+    # letting the package manager fail with "no match for argument: mbpfan".
     error "mbpfan is not available in this system's repositories."
     echo
     info "Upstream is https://github.com/linux-on-mac/mbpfan and it builds"

@@ -3,7 +3,8 @@
 # FaceTime HD Camera Driver Installer
 #
 # Builds and registers the facetimehd (BCM1570) driver with DKMS and installs
-# the Apple camera firmware, on Ubuntu 22.04 LTS through 26.04 LTS and newer.
+# the Apple camera firmware, on Ubuntu 22.04 LTS through 26.04 LTS, Fedora and
+# AlmaLinux 10 (and the other RHEL 10 rebuilds).
 #
 # The maintained driver source is included under src/, so installing needs no
 # access to GitHub. The only remaining network access is firmware extraction
@@ -12,7 +13,7 @@
 #
 # Nothing here pins a kernel version or a driver version: the version is read
 # from the maintained dkms.conf, and DKMS rebuilds on every kernel
-# update. See docs/AUDIT-2026-08.md for why it is built this way.
+# update. See CLAUDE.md, "Deliberate decisions", for why it is built this way.
 
 set -euo pipefail
 
@@ -105,7 +106,7 @@ fi
 if have mokutil && [ "$(mokutil --sb-state 2>/dev/null || true)" = "SecureBoot enabled" ]; then
     warn "Secure Boot is enabled. DKMS will sign the module with your MOK key if"
     warn "one is enrolled; otherwise the module will build but refuse to load."
-    warn "See docs/TROUBLESHOOTING.md -> Secure Boot."
+    warn "See README.md -> Troubleshooting and support."
 fi
 
 # ---------------------------------------------------------------------------
@@ -114,31 +115,98 @@ fi
 
 step "Installing build dependencies"
 
+# Enterprise Linux (AlmaLinux, Rocky, CentOS Stream, RHEL) has no dkms of its
+# own - it comes from EPEL, which is not enabled out of the box. A no-op on
+# Fedora and on the Debian family.
+if is_enterprise_linux; then
+    info "Enterprise Linux: dkms comes from EPEL, which is not enabled by"
+    info "default. Enabling it (and CodeReady Builder, which EPEL needs)."
+    if ensure_epel; then
+        ok "EPEL is enabled"
+    else
+        # Not fatal: the dependency install below is what actually discovers a
+        # missing package, and it names it. Stopping here would also be wrong
+        # on a system whose administrator has EPEL mirrored under another name.
+        warn "Could not enable EPEL automatically. If the next step cannot find"
+        warn "dkms, enable it yourself and re-run:"
+        warn "    sudo dnf install epel-release && sudo dnf config-manager setopt crb.enabled=1"
+    fi
+fi
+
 pkg_refresh
 
 # curl/xz/cpio/gzip are what the firmware extractor needs; cpio in particular
 # is no longer part of a default install on either family. git is deliberately
 # absent - the maintained source is included, so installing needs no GitHub.
-# unar unpacks the sensor calibration files' Boot Camp driver; it is required,
-# not optional, because calibration is no longer a skippable step.
 if [ "$PKG_FAMILY" = rpm ]; then
     # diffutils is what makes the rebuild-skip below work. It is Essential on
     # Debian and so never listed there, but a minimal Fedora has no diff at all
     # - without it the idempotency check silently fails open and every run
     # rebuilds from scratch. elfutils-libelf-devel is what the kernel build
-    # system needs and does not pull in itself.
-    DEPS=(gcc make cpio curl diffutils dkms elfutils-libelf-devel gzip kmod
-          pciutils unar v4l-utils xz)
+    # system needs and does not pull in itself; it is in AppStream on EL10, so
+    # it needs no extra repository.
+    DEPS=(gcc make cpio diffutils dkms elfutils-libelf-devel gzip kmod xz)
+
+    # curl is asked for by name only when it is actually absent. The RPM
+    # families' default installs carry curl-minimal, which already provides
+    # /usr/bin/curl, and 'dnf install curl' *conflicts* with it rather than
+    # upgrading it - so listing curl unconditionally breaks the whole
+    # dependency step on a stock AlmaLinux or Fedora system.
+    have curl || DEPS+=(curl)
 else
-    DEPS=(build-essential cpio curl dkms gzip kmod pciutils unar v4l-utils
-          xz-utils)
+    DEPS=(build-essential cpio curl dkms gzip kmod xz-utils)
 fi
 
 pkg_install "${DEPS[@]}" || die \
     "Could not install the build dependencies: ${DEPS[*]}
        If one of those names does not exist on this distribution, install the
        equivalents yourself (a compiler, make, dkms, kernel headers, cpio, curl,
-       xz, gzip, kmod and unar) and re-run this script."
+       xz, gzip and kmod) and re-run this script.
+       On Enterprise Linux, dkms comes from EPEL: check that
+       'dnf repolist --enabled' lists epel and crb."
+
+# Everything above is needed to build and install the driver, so failing to get
+# it is fatal. These three are not: pciutils only powers the hardware check,
+# v4l-utils only the verification advice at the end, and unar only the sensor
+# calibration files. They are installed the same way, but a distribution that
+# does not package one of them costs a diagnostic or the camera's colours - not
+# a working camera - and refusing to install over that would be wrong.
+#
+# unar is the realistic case. It comes from EPEL on Enterprise Linux, and EPEL
+# does not rebuild every Fedora package for every EL release.
+EXTRAS=()
+
+# Queue one such package, named by the command it provides so that an already
+# satisfied dependency is never handed to the package manager again. Returns
+# non-zero only when the package is genuinely not available anywhere, which is
+# the answer the caller acts on.
+want_extra() {
+    local pkg="$1" cmd="$2"
+    have "$cmd" && return 0
+    if pkg_available "$pkg"; then
+        EXTRAS+=("$pkg")
+        return 0
+    fi
+    warn "$pkg is not packaged for this distribution."
+    return 1
+}
+
+HAVE_UNAR=1
+want_extra pciutils  lspci    || true
+want_extra v4l-utils v4l2-ctl || true
+want_extra unar      unar     || HAVE_UNAR=0
+
+if [ ${#EXTRAS[@]} -gt 0 ] && ! pkg_install "${EXTRAS[@]}"; then
+    warn "Could not install: ${EXTRAS[*]}"
+    warn "Continuing - none of these is needed to build or load the driver."
+    have unar || HAVE_UNAR=0
+fi
+
+if [ "$HAVE_UNAR" -eq 0 ]; then
+    warn "Without unar the sensor calibration files cannot be unpacked. The"
+    warn "camera will work; its colours will be off. Install unar later and"
+    warn "re-run 'sudo $FIRMWARE_EXTRACTOR --calibration-only' to fix that."
+fi
 
 # Headers for the running kernel, so we can build right now, plus whatever
 # makes future kernels arrive with headers already in place so DKMS never
@@ -350,11 +418,12 @@ fi
 
 # The sensor calibration files are a separate concern from the firmware: they
 # come from a different Apple download (the Windows Boot Camp driver, the only
-# thing that ships them), and they fix its colours. They are not optional -
-# unar is a required dependency above precisely so this step always runs - but
-# a failure here is still a warning, never fatal: the camera streams without
-# them, just with the wrong colours.
-if [ "$SKIP_FIRMWARE" -eq 0 ]; then
+# thing that ships them), and they fix its colours. This step runs on every
+# install that has unar, but a failure here is still a warning, never fatal:
+# the camera streams without them, just with the wrong colours.
+if [ "$SKIP_FIRMWARE" -eq 0 ] && [ "$HAVE_UNAR" -eq 0 ]; then
+    step "Skipping the sensor calibration files (no unar)"
+elif [ "$SKIP_FIRMWARE" -eq 0 ]; then
     if compgen -G "$FW_DIR/*_01XX.dat" >/dev/null && [ "$FORCE_REBUILD" -eq 0 ]; then
         step "Sensor calibration files already present"
     else
@@ -449,7 +518,7 @@ Optional:
   Fans and keyboard:    sudo ./scripts/macbook-tune.sh
                         (makes sure mbpfan and hid_apple are installed and
                          running - neither is reconfigured)
-  Troubleshooting:      docs/TROUBLESHOOTING.md
+  Troubleshooting:      README.md -> Troubleshooting and support
 
 The module rebuilds itself on kernel updates via DKMS; there is nothing to
 re-run after 'apt upgrade' or 'dnf upgrade'.

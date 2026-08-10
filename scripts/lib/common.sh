@@ -88,30 +88,32 @@ confirm() {
 
 # --- Platform detection -----------------------------------------------------
 
-# Populates OS_ID, OS_ID_LIKE, OS_VERSION_ID, OS_PRETTY from /etc/os-release.
+# Populates OS_ID, OS_ID_LIKE, OS_VERSION_ID, OS_PLATFORM_ID, OS_PRETTY from
+# /etc/os-release.
 #
 # The file is sourced in a *subshell*, not here: it is a shell fragment that
 # defines NAME, VERSION, LOGO, SUPPORT_END and whatever else a distribution
 # felt like adding, none of which belongs in the calling script's namespace.
-# Only the four fields below cross back. The result is cached because
+# Only the five fields below cross back. The result is cached because
 # is_debian_like/is_rpm_like call this on every invocation and /etc/os-release
 # does not change underneath a running script.
 # shellcheck disable=SC2034  # OS_* are read by the scripts that source this file
 detect_os() {
     [ -n "${_FTHD_OS_CACHED:-}" ] && return 0
-    OS_ID=''; OS_ID_LIKE=''; OS_VERSION_ID=''; OS_PRETTY=''
+    OS_ID=''; OS_ID_LIKE=''; OS_VERSION_ID=''; OS_PLATFORM_ID=''; OS_PRETTY=''
     _FTHD_OS_CACHED=1
     [ -r /etc/os-release ] || return 0
     {
         IFS= read -r OS_ID
         IFS= read -r OS_ID_LIKE
         IFS= read -r OS_VERSION_ID
+        IFS= read -r OS_PLATFORM_ID
         IFS= read -r OS_PRETTY
     } < <(
         # shellcheck disable=SC1091
         . /etc/os-release
-        printf '%s\n%s\n%s\n%s\n' "${ID:-}" "${ID_LIKE:-}" "${VERSION_ID:-}" \
-            "${PRETTY_NAME:-${ID:-} ${VERSION_ID:-}}"
+        printf '%s\n%s\n%s\n%s\n%s\n' "${ID:-}" "${ID_LIKE:-}" "${VERSION_ID:-}" \
+            "${PLATFORM_ID:-}" "${PRETTY_NAME:-${ID:-} ${VERSION_ID:-}}"
     )
 }
 
@@ -125,13 +127,49 @@ is_debian_like() {
 
 # Fedora and its derivatives. Fedora itself carries no ID_LIKE at all, hence
 # the explicit ID check; the rhel/centos arms catch the enterprise rebuilds,
-# which are not a tested platform but do use the same package names.
+# which use the same package names.
 is_rpm_like() {
     detect_os
     case " $OS_ID $OS_ID_LIKE " in
         *" fedora "*|*" rhel "*|*" centos "*) return 0 ;;
     esac
     [ "$OS_ID" = fedora ]
+}
+
+# Enterprise Linux - RHEL and its rebuilds (AlmaLinux, Rocky, CentOS Stream,
+# Oracle) - as opposed to Fedora. Both are is_rpm_like, but only these need
+# EPEL: Red Hat ships a deliberately small package set, and dkms is not in it.
+#
+# AlmaLinux sets ID_LIKE="rhel centos fedora", so the fedora arm of is_rpm_like
+# matches it too; that is why Fedora is excluded by ID *first* rather than by
+# letting the case below decide. A Fedora derivative that inherits only
+# ID_LIKE="fedora" falls through to 1, which is what we want - it has dkms.
+is_enterprise_linux() {
+    detect_os
+    [ "$OS_ID" = fedora ] && return 1
+    case " $OS_ID $OS_ID_LIKE " in
+        *" rhel "*|*" centos "*) return 0 ;;
+    esac
+    return 1
+}
+
+# Major EL release ("10"), empty when it cannot be determined.
+#
+# PLATFORM_ID is the field to read: it is "platform:el10" on RHEL and on every
+# rebuild of it, and it stays correct across point releases, where VERSION_ID
+# has already become "10.1". VERSION_ID is the fallback for the rebuilds that
+# omit PLATFORM_ID.
+el_major_version() {
+    detect_os
+    case "$OS_PLATFORM_ID" in
+        platform:el*) printf '%s\n' "${OS_PLATFORM_ID#platform:el}"; return 0 ;;
+    esac
+    # The VERSION_ID fallback is only meaningful on an EL rebuild. Everywhere
+    # else that major number counts something else entirely - Fedora 44, Ubuntu
+    # 24.04 - and an epel-release-latest-24 URL is not a useful thing to build.
+    is_enterprise_linux || return 1
+    [ -n "$OS_VERSION_ID" ] || return 1
+    printf '%s\n' "${OS_VERSION_ID%%.*}"
 }
 
 # --- Package management -----------------------------------------------------
@@ -196,6 +234,90 @@ pkg_installed() {
         dnf) rpm -q "$1" >/dev/null 2>&1 ;;
         *)   return 1 ;;
     esac
+}
+
+# --- EPEL, on Enterprise Linux ----------------------------------------------
+#
+# This is the one place where the package layer knows a package *name* rather
+# than only a verb, and the exception is deliberate: "enable EPEL" is a verb,
+# epel-release is the same name on every RHEL rebuild, and both install.sh
+# (dkms) and macbook-tune.sh (mbpfan) need it. Splitting it between them would
+# put the same three-repository dance in two files.
+
+# Is this dnf repository configured *and* enabled?
+dnf_repo_enabled() {
+    have dnf || have yum || return 1
+    "$(_pkg_cmd)" repolist --enabled 2>/dev/null |
+        awk -v want="$1" 'NR > 1 && $1 == want { found = 1 } END { exit !found }'
+}
+
+# dnf5 (EL10) replaced 'config-manager --set-enabled' with 'config-manager
+# setopt'; dnf4 (EL9, Fedora before 41) understands only the former. Try both
+# rather than working out which generation this system has.
+_enable_crb_once() {
+    "$(_pkg_cmd)" config-manager --set-enabled crb >/dev/null 2>&1 ||
+    "$(_pkg_cmd)" config-manager setopt crb.enabled=1 >/dev/null 2>&1
+}
+
+# CodeReady Builder, Red Hat's build-dependency repository.
+#
+# Nothing this project installs comes from CRB directly - elfutils-libelf-devel
+# is in AppStream on EL10 - but a large part of EPEL build-depends on it, so
+# EPEL packages can fail to resolve while it is off. AlmaLinux has enabled it by
+# default since 2025-09; this is for the installs made before that and for the
+# rebuilds that have not followed.
+#
+# Best-effort by design: a failure here is not worth stopping for, because the
+# dependency install that follows reports exactly which package could not be
+# resolved, which is more useful than anything guessed at this point.
+enable_crb() {
+    dnf_repo_enabled crb && return 0
+
+    _enable_crb_once || {
+        # config-manager is a plugin, and a minimal install may not have it.
+        # The package is named for the dnf generation that provides it.
+        pkg_install dnf-plugins-core >/dev/null 2>&1 ||
+            pkg_install dnf5-plugins >/dev/null 2>&1 || true
+        _enable_crb_once || true
+    }
+
+    dnf_repo_enabled crb
+}
+
+# Make EPEL available, on the distributions that need it. A no-op on Fedora and
+# on the Debian family, so callers do not have to ask first.
+#
+# Returns 0 when EPEL is usable afterwards and 1 when it is not. Callers treat
+# that as advisory for the same reason enable_crb is best-effort: pkg_install
+# is what actually discovers a missing package, and it says which one.
+ensure_epel() {
+    is_enterprise_linux || return 0
+
+    if dnf_repo_enabled epel; then
+        enable_crb || true
+        return 0
+    fi
+
+    enable_crb || true
+
+    # AlmaLinux, Rocky and CentOS Stream carry epel-release in their own
+    # 'extras' repository, which is enabled out of the box, so this is all it
+    # takes there.
+    if pkg_install epel-release >/dev/null 2>&1 && dnf_repo_enabled epel; then
+        return 0
+    fi
+
+    # RHEL proper has no epel-release of its own; it is fetched from the
+    # project. The URL is keyed by the EL major version and is the one EPEL
+    # documents, so there is no version list to keep here.
+    local major
+    major="$(el_major_version)" || return 1
+    [ -n "$major" ] || return 1
+    pkg_install \
+        "https://dl.fedoraproject.org/pub/epel/epel-release-latest-${major}.noarch.rpm" \
+        >/dev/null 2>&1 || return 1
+
+    dnf_repo_enabled epel
 }
 
 # PCI ID of the Broadcom 1570 ISP behind the FaceTime HD camera.

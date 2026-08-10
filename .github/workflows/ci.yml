@@ -71,6 +71,17 @@ jobs:
             family: rpm
             kernel-note: '7.1'
             experimental: false
+          # AlmaLinux 10 is the opposite end: an Enterprise Linux kernel that
+          # stays on 6.12 for a decade while Red Hat backports into it. It
+          # catches the mirror image of Fedora's failure - code that assumes an
+          # API newer than the oldest supported kernel - and it is the only
+          # RHEL rebuild whose kernel clears this driver's 5.15 floor, EL9
+          # having shipped 5.14.
+          - name: 'almalinux 10'
+            container: 'almalinux:10'
+            family: rpm
+            kernel-note: '6.12 / EL'
+            experimental: false
     steps:
       - uses: actions/checkout@v5
 
@@ -86,6 +97,18 @@ jobs:
       - name: Install toolchain and kernel headers (dnf)
         if: matrix.family == 'rpm'
         run: |
+          # CodeReady Builder carries build dependencies on Enterprise Linux.
+          # Everything installed below is in AppStream on EL10 and AlmaLinux
+          # enables CRB by default anyway, so this is belt and braces for an
+          # older EL image. Guarded on the repository actually existing, so it
+          # stays a no-op on Fedora instead of writing a stray [crb] section
+          # into its dnf config; config-manager is a plugin and need not be
+          # installed at all, hence the || true.
+          if dnf repolist --all 2>/dev/null |
+               awk 'NR > 1 && $1 == "crb" { f = 1 } END { exit !f }'; then
+            dnf config-manager setopt crb.enabled=1 2>/dev/null ||
+              dnf config-manager --set-enabled crb 2>/dev/null || true
+          fi
           dnf install -y --setopt=install_weak_deps=False \
             gcc make tar kmod elfutils-libelf-devel kernel-devel
 
