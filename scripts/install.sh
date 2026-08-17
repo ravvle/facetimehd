@@ -196,6 +196,18 @@ show_status() {
         bad "No sensor calibration files - the camera works, its colours are off"
         info "    fix: sudo $FIRMWARE_EXTRACTOR --calibration-only"
     fi
+    # The glob above only proves *some* calibration file made it to disk, not
+    # that it is the one this machine's sensor asked for - extract-firmware.sh
+    # does not yet produce every file MODULE_FIRMWARE lists (see README.md,
+    # "Firmware and sensor calibration"). The driver logs by name when its own
+    # request comes back empty; dmesg is the only place that is visible from,
+    # and only when it can actually be read.
+    if [ "$(id -u)" -eq 0 ] && have dmesg &&
+       dmesg 2>/dev/null | grep -q "no sensor calibration file"; then
+        bad "Kernel log: this machine's own calibration file is not installed"
+        info "    its sensor is one extract-firmware.sh cannot fetch yet - see"
+        info "    README.md, 'Firmware and sensor calibration'"
+    fi
 
     step "Secure Boot"
     if ! have mokutil; then
@@ -215,18 +227,38 @@ show_status() {
     fi
 
     step "Device"
-    if compgen -G '/dev/video*' >/dev/null; then
-        local d
-        for d in /dev/video*; do ok "Present: $d"; done
-    else
-        bad "No /dev/video* device"; rc=1
+    # Any /dev/video* only proves *a* V4L2 driver is bound to something - a
+    # USB webcam on the same machine would pass just as well with this module
+    # unloaded. /sys/class/video4linux/*/name is what fthd_v4l2_register()
+    # actually names the device, so check that instead.
+    local found_dev=0 vd name
+    if compgen -G '/sys/class/video4linux/video*' >/dev/null; then
+        for vd in /sys/class/video4linux/video*; do
+            name="$(cat "$vd/name" 2>/dev/null || true)"
+            [ "$name" = "Apple Facetime HD" ] || continue
+            ok "Present: /dev/$(basename "$vd") ($name)"
+            found_dev=1
+        done
+    fi
+    if [ "$found_dev" -eq 0 ]; then
+        bad "No Apple Facetime HD /dev/video* device"; rc=1
     fi
 
     step "Power management"
-    if [ -f "$RUNTIME_PM_DROPIN" ]; then
-        info "Runtime PM disabled by $RUNTIME_PM_DROPIN"
+    # The drop-in only says what install.sh last wrote; the module parameter
+    # is what the running driver actually honours, and it disagrees with the
+    # drop-in whenever runtime_pm came from the kernel command line instead,
+    # or the module loaded before the file was written. Readable by anyone.
+    if [ -r "/sys/module/$MODULE_NAME/parameters/runtime_pm" ]; then
+        case "$(cat "/sys/module/$MODULE_NAME/parameters/runtime_pm" 2>/dev/null || true)" in
+            Y) info "Runtime PM: on" ;;
+            N) info "Runtime PM: off" ;;
+            *) info "Runtime PM: unknown" ;;
+        esac
+    elif [ -f "$RUNTIME_PM_DROPIN" ]; then
+        info "Runtime PM disabled by $RUNTIME_PM_DROPIN (module not loaded to confirm)"
     else
-        info "Runtime PM left at the driver's default (on)"
+        info "Runtime PM left at the driver's default (on) - module not loaded to confirm"
     fi
 
     echo
@@ -806,10 +838,20 @@ else
     bad "Module not loaded yet (reboot required)"
 fi
 
-if [ -e /dev/video0 ]; then
-    ok "Video device present: /dev/video0"
+# Named, not just present: a USB webcam's /dev/video0 would satisfy a plain
+# existence check with this module not even loaded.
+video_dev=''
+if compgen -G '/sys/class/video4linux/video*' >/dev/null; then
+    for vd in /sys/class/video4linux/video*; do
+        [ "$(cat "$vd/name" 2>/dev/null || true)" = "Apple Facetime HD" ] || continue
+        video_dev="/dev/$(basename "$vd")"
+        break
+    done
+fi
+if [ -n "$video_dev" ]; then
+    ok "Video device present: $video_dev"
 else
-    bad "No /dev/video0 yet (reboot required)"
+    bad "No Apple Facetime HD /dev/video* device yet (reboot required)"
 fi
 
 echo

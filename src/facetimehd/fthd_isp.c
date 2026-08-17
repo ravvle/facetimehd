@@ -701,10 +701,19 @@ int fthd_isp_cmd_set_loadfile(struct fthd_private *dev_priv)
 		return 0;
 	}
 
-	/* The set file is allowed to be missing but we don't get calibration */
+	/* The set file is allowed to be missing - the camera still works, only
+	 * its colours are off - but that has to be visible somewhere other than
+	 * a silent 0 return, or nothing ever tells the user which file their
+	 * machine wanted. extract-firmware.sh does not yet produce every name
+	 * MODULE_FIRMWARE lists above; see README.md, "Firmware and sensor
+	 * calibration". */
 	ret = request_firmware(&fw, filename, &dev_priv->pdev->dev);
-	if (ret)
+	if (ret) {
+		dev_info(&dev_priv->pdev->dev,
+			 "no sensor calibration file %s; colours may be off (see README.md)\n",
+			 filename);
 		return 0;
+	}
 
 	if (dev_priv->set_file) {
 		dev_warn(&dev_priv->pdev->dev,

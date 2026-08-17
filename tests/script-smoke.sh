@@ -116,6 +116,8 @@ check_documented_options "$INSTALL"
 check_documented_options "$UNINSTALL"
 check_documented_options "$EXTRACT"
 check_documented_options "$TUNE"
+check_documented_options "$SETUP"
+check_documented_options "$DIAG"
 
 # ---------------------------------------------------------------------------
 step "install.sh --status"

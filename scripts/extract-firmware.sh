@@ -347,10 +347,10 @@ if [ "$DO_CALIBRATION" -eq 1 ]; then
 
     if [ -n "$SYS_FILE" ]; then
         [ -f "$SYS_FILE" ] || die "No such file: $SYS_FILE"
-        require_cmds sha256sum awk dd md5sum
+        require_cmds sha256sum awk dd
         info "Using local $SYS_FILE"
     else
-        require_cmds sha256sum awk dd md5sum curl zcat
+        require_cmds sha256sum awk dd curl zcat
         # unar handles solid RAR3, which this archive is; unrar-free does not,
         # so it is not an acceptable substitute. The proprietary unrar works.
         unpacker=''
@@ -391,9 +391,20 @@ if [ "$DO_CALIBRATION" -eq 1 ]; then
     sys_hash="$(sha256 "$SYS_FILE")"
     layout="${CALIBRATION_LAYOUT[$sys_hash]:-}"
     if [ -z "$layout" ]; then
-        error "Unrecognised $SYS_NAME: SHA-256 is $sys_hash."
-        error "No calibration layout is known for it, and guessing offsets"
-        error "would install whatever happened to be at them."
+        if [ -n "${DRIVER_NAMES[$sys_hash]:-}" ]; then
+            # A known driver, just not one CALIBRATION_LAYOUT has offsets for
+            # yet - worth saying differently from "never seen this file",
+            # since guessing offsets into a *different* driver binary is the
+            # dangerous case, not merely an unindexed one.
+            error "${DRIVER_NAMES[$sys_hash]} ($SYS_NAME, SHA-256 $sys_hash) is a"
+            error "recognised camera driver, but no calibration layout has been"
+            error "recorded for it yet - only Boot Camp 5.1.5722 is. Guessing"
+            error "offsets would install whatever happened to be at them."
+        else
+            error "Unrecognised $SYS_NAME: SHA-256 is $sys_hash."
+            error "No calibration layout is known for it, and guessing offsets"
+            error "would install whatever happened to be at them."
+        fi
         die "No calibration files extracted."
     fi
     ok "Boot Camp driver recognised: ${DRIVER_NAMES[$sys_hash]:-$sys_hash}"

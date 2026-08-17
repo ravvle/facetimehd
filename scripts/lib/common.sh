@@ -359,8 +359,6 @@ firmware_root() {
 
 # --- systemd ----------------------------------------------------------------
 
-have_systemd() { [ -d /run/systemd/system ]; }
-
 unit_exists() {
     have systemctl || return 1
     systemctl list-unit-files "$1" >/dev/null 2>&1 &&

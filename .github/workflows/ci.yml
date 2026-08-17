@@ -38,11 +38,19 @@ jobs:
             tests/build-driver.sh tests/smoke-capture.sh \
             tests/hw-validate.sh tests/script-smoke.sh
       # Catches a script added to the repository and never added above.
+      #
+      # Scoped to the Lint step's own run block below, not the whole workflow
+      # file: a script named only in an explanatory comment elsewhere in this
+      # file would otherwise satisfy a plain grep without ever reaching
+      # shellcheck - which is exactly how the largest test script here once
+      # went unlinted for a while.
       - name: Every shell script is linted
         run: |
+          lint_step="$(sed -n '/- name: Lint$/,/- name: Every shell script is linted$/p' \
+                           .github/workflows/ci.yml)"
           rc=0
           while IFS= read -r f; do
-            grep -q "$f" .github/workflows/ci.yml ||
+            printf '%s\n' "$lint_step" | grep -q -- "$f" ||
               { echo "$f is not in the shellcheck list"; rc=1; }
           done < <(git ls-files '*.sh' | grep -v '^scripts/lib/')
           exit $rc

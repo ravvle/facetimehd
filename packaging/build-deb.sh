@@ -81,7 +81,12 @@ Maintainer: facetimehd contributors <https://github.com/ravvle/facetimehd>
 Section: kernel
 Priority: optional
 Installed-Size: $INSTALLED_KB
-Depends: dkms (>= 2.8)
+# build-essential mirrors the RPM spec's hard Requires on gcc and make: dkms's
+# own Recommends on it is dropped by --no-install-recommends, and without it
+# the postinst's 'dkms build' fails on every install rather than only on one
+# missing kernel headers, which is the one failure that is actually the user's
+# to fix.
+Depends: dkms (>= 2.8), build-essential
 Recommends: v4l-utils, unar
 Suggests: mbpfan
 Homepage: https://github.com/ravvle/facetimehd

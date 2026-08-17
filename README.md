@@ -233,9 +233,12 @@ Calibration files come from a separate Apple Boot Camp package. They are not
 required for capture, but missing calibration can produce incorrect colours.
 `install.sh` fetches them on every run where `unar` is available — which is
 every distribution in the table above, `unar` being a normal dependency of the
-install. If that step failed for some other reason (no network access to
-Apple's Boot Camp download, or a distribution that does not package `unar`),
-retry it directly once the cause is fixed:
+install. That download currently carries files for four of the nine sensors
+the driver recognises; a machine whose sensor needs one of the other five sees
+this in `dmesg` (`no sensor calibration file ...`), and `install.sh --status`
+surfaces the same thing. If the step instead failed outright (no network
+access to Apple's Boot Camp download, or a distribution that does not package
+`unar`), retry it directly once the cause is fixed:
 
 ```bash
 sudo ./scripts/extract-firmware.sh --calibration-only

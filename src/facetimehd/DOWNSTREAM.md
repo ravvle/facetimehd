@@ -201,9 +201,16 @@ crop-and-scale - only the rectangle was constant.
 - Calibration selection uses the correct DMI product and vendor fields.
   MacBook Air systems now request their intended `1771_01XX.dat` file rather
   than incorrectly falling back to `1871_01XX.dat`.
-- All eight possible sensor calibration files are listed with
+- All nine possible sensor calibration files are listed with
   `MODULE_FIRMWARE`, allowing initramfs tools and `modinfo` to discover them.
   Missing calibration remains non-fatal but can result in incorrect colours.
+  `extract-firmware.sh` currently produces only four of the nine - the ones
+  reachable inside Boot Camp 5.1.5722's `AppleCamera.sys`, which is the only
+  Boot Camp `.sys` a calibration layout has been recorded for - so a machine
+  needing one of the other five gets no calibration until an offset table is
+  added for a driver binary that carries it. `fthd_isp_cmd_set_loadfile()`
+  logs the filename it wanted whenever the request comes back empty, so that
+  gap is visible in `dmesg` rather than silent.
 - `V4L2_CID_POWER_LINE_FREQUENCY` exposes disabled, 50 Hz and 60 Hz anti-banding
   settings using the firmware flicker-frequency command.
 - `V4L2_CID_EXPOSURE_AUTO` exposes the firmware's automatic/manual exposure
