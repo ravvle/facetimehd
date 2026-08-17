@@ -94,7 +94,13 @@ static int fthd_hwmon_read(struct device *dev, enum hwmon_sensor_types type,
 	return 0;
 }
 
-static const struct hwmon_channel_info * const fthd_hwmon_info[] = {
+/*
+ * Linux 5.15 declares hwmon_chip_info.info as a pointer to mutable pointers,
+ * while newer kernels make those pointers const.  Keep the array elements
+ * unqualified so this initializer is accepted by both APIs; the channel info
+ * objects themselves remain const.
+ */
+static const struct hwmon_channel_info *fthd_hwmon_info[] = {
 	HWMON_CHANNEL_INFO(temp, HWMON_T_INPUT),
 	NULL,
 };
