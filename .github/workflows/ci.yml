@@ -22,6 +22,10 @@ jobs:
       - uses: actions/checkout@v5
       - name: Install shellcheck
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends shellcheck
+      # Every shell script in the repository, with no exceptions list to drift.
+      # tests/hw-validate.sh used to be left out because it needs a MacBook to
+      # *run*; it does not need one to lint, and at 1200 lines it was the
+      # largest unlinted file here.
       - name: Lint
         run: |
           shellcheck -x --source-path=SCRIPTDIR \
@@ -29,12 +33,96 @@ jobs:
             scripts/install.sh scripts/uninstall.sh \
             scripts/macbook-tune.sh \
             scripts/extract-firmware.sh \
-            tests/build-driver.sh tests/smoke-capture.sh
+            scripts/collect-diagnostics.sh \
+            packaging/build-deb.sh packaging/build-rpm.sh \
+            tests/build-driver.sh tests/smoke-capture.sh \
+            tests/hw-validate.sh tests/script-smoke.sh
+      # Catches a script added to the repository and never added above.
+      - name: Every shell script is linted
+        run: |
+          rc=0
+          while IFS= read -r f; do
+            grep -q "$f" .github/workflows/ci.yml ||
+              { echo "$f is not in the shellcheck list"; rc=1; }
+          done < <(git ls-files '*.sh' | grep -v '^scripts/lib/')
+          exit $rc
       - name: Check scripts are executable
         run: |
-          for f in setup.sh scripts/*.sh tests/*.sh; do
+          for f in setup.sh scripts/*.sh tests/*.sh packaging/*.sh; do
             [ -x "$f" ] || { echo "$f is not executable"; exit 1; }
           done
+
+  script-smoke:
+    # Drives the installer and uninstaller far enough to catch the failures
+    # shellcheck structurally cannot see: an option documented and never wired
+    # up, a --status that dies on a machine with no camera, a dkms status
+    # format that stopped parsing, a source file added to the tree and not to
+    # the Makefile. Runs as a normal user and touches nothing outside its own
+    # temporary directory.
+    name: installer smoke test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Run the script smoke test
+        run: ./tests/script-smoke.sh
+
+  packages:
+    # The .deb and .rpm are only useful if they still build, and neither is
+    # exercised by anything else here.
+    name: packaging (${{ matrix.kind }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - kind: deb
+            packages: dpkg-dev
+            build: ./packaging/build-deb.sh
+          - kind: rpm
+            packages: rpm
+            build: ./packaging/build-rpm.sh
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install the packaging tools
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ${{ matrix.packages }}
+      - name: Build
+        run: ${{ matrix.build }}
+      - name: Show what was built
+        run: ls -l packaging/out/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: facetimehd-${{ matrix.kind }}
+          path: packaging/out/*
+          if-no-files-found: error
+
+  apple-sources:
+    # The early-warning system for the *other* thing that can break this project
+    # without anyone touching it. The driver half is covered by the build matrix
+    # below; this is the firmware half. If Apple retires the update this
+    # extracts from, or republishes it with different content, every new install
+    # breaks and the first anyone would otherwise know is a bug report.
+    #
+    # Downloads ~4 MB, verifies it against the checksum tables in
+    # extract-firmware.sh, and writes nothing: no Apple content is stored, and
+    # the job is a checksum comparison rather than a redistribution.
+    #
+    # Not run on pull requests: a fork's CI has no business hammering Apple's
+    # CDN, and a failure here is never caused by the diff under review.
+    name: Apple download watchdog
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install the extractor's dependencies
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends cpio curl unar xz-utils
+      - name: Verify both Apple downloads still match the checksum tables
+        run: ./scripts/extract-firmware.sh --check-sources
 
   build:
     # Compiles src/facetimehd against each supported kernel's

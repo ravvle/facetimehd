@@ -76,6 +76,12 @@ The downstream driver retains the original hardware support while adding:
 - manual exposure time, gain and white-balance temperature, which the automatic
   switches previously offered no way to set, alongside exposure compensation,
   metering mode, sharpness and a sensor test pattern;
+- backlight compensation, noise reduction and chroma noise suppression;
+- **selectable frame rates** — an application asking for 15 fps now gets 15 fps
+  instead of 30, at any whole division of the sensor's rate;
+- **digital zoom and pan** through `VIDIOC_S_SELECTION`, instead of a crop
+  rectangle fixed at the full sensor;
+- the sensor die temperature through `hwmon` and debugfs;
 - `NV16` offered next to `YUYV` and `YVYU`;
 - correct MacBook Air sensor-calibration selection and complete
   `MODULE_FIRMWARE` declarations; and
@@ -176,10 +182,12 @@ driver is not rebuilt unnecessarily.
 After rebooting:
 
 ```bash
-lsmod | grep facetimehd
-dkms status -m facetimehd
-v4l2-ctl --list-devices
+./scripts/install.sh --status
 ```
+
+This checks the hardware, the DKMS registration, the module, the firmware, the
+calibration files, Secure Boot and the video device in one pass, and prints a
+`fix:` line for anything that is wrong. It needs no root.
 
 The camera should appear as **Apple FaceTime HD** under `/dev/videoN`.
 
@@ -190,9 +198,24 @@ in:
 sudo usermod -aG video "$USER"
 ```
 
-Secure Boot systems may require enrollment of the DKMS Machine Owner Key before
-the module can load. See [Troubleshooting and support](#troubleshooting-and-support)
-if the build succeeds but `modprobe facetimehd` fails.
+### Secure Boot
+
+With Secure Boot enabled, an unsigned kernel module builds perfectly and then
+refuses to load — which looks like a successful install and a broken camera.
+DKMS can sign the module, but only with a key the firmware trusts:
+
+```bash
+sudo ./scripts/install.sh --enroll-mok
+```
+
+That generates a Machine Owner Key, points DKMS at it and hands it to
+`mokutil`, which asks you to choose a one-time password. **The next boot needs
+you at the keyboard**: a blue MokManager screen appears before the system
+starts, where you choose *Enrol MOK → Continue → Yes* and enter that password.
+Skip that screen and the key is not enrolled.
+
+`install.sh --status` reports whether a key is enrolled. Uninstalling does not
+remove the key — by then it may be signing other modules on the machine.
 
 ## Firmware and sensor calibration
 
@@ -221,6 +244,58 @@ sudo ./scripts/extract-firmware.sh --calibration-only
 These Apple downloads are the only installation steps that require network
 access beyond installing distribution packages; the driver source is already
 included in the repository.
+
+## Installing as a package
+
+If you would rather have the driver tracked by `dpkg` or `rpm` than by a shell
+script — or you are building a system image:
+
+```bash
+./packaging/build-deb.sh     # facetimehd-dkms_<version>_all.deb
+./packaging/build-rpm.sh     # facetimehd-dkms-<version>-1.noarch.rpm
+sudo apt install ./packaging/out/facetimehd-dkms_*.deb
+sudo facetimehd-firmware-install
+```
+
+The packages install the driver source and register it with DKMS. They
+deliberately do **not** download the firmware during installation: it is
+Apple's and cannot be redistributed, and a package post-install script that
+reaches the network breaks offline installs and image builds. That is what the
+separate `facetimehd-firmware-install` command is for. See
+[`packaging/README.md`](packaging/README.md).
+
+Secure Boot is also outside what a package can do — enrolling a key needs a
+password typed at a console and a reboot. Use `install.sh --enroll-mok`.
+
+## Camera controls
+
+Beyond the usual brightness and contrast, the driver exposes:
+
+```bash
+v4l2-ctl --list-ctrls                       # everything available
+v4l2-ctl --set-parm 15                      # 15 fps instead of 30
+v4l2-ctl --set-ctrl auto_exposure=1,exposure_time_absolute=200
+v4l2-ctl --set-ctrl backlight_compensation=200   # lift a backlit face
+v4l2-ctl --set-ctrl noise_reduction=200          # dim rooms
+v4l2-ctl --set-ctrl power_line_frequency=1       # 50 Hz anti-banding
+```
+
+Frame rates are any whole division of the sensor's fixed 30 fps — 30, 15, 10,
+7.5, 6, 5 and so on — reported exactly by `v4l2-ctl --list-formats-ext`.
+
+Digital zoom crops the sensor and lets the ISP scale the result:
+
+```bash
+v4l2-ctl --set-selection=target=crop,left=160,top=90,width=960,height=540
+```
+
+The crop is only settable while nothing is streaming, and never smaller than the
+capture size.
+
+The sensor die temperature appears under `hwmon` when the firmware reports it in
+a scale the driver can trust; the raw value is always in
+`/sys/kernel/debug/facetimehd/*/sensor_temperature_raw`. See
+[`DOWNSTREAM.md`](src/facetimehd/DOWNSTREAM.md) for why that distinction exists.
 
 ## Optional fan support
 
@@ -278,39 +353,51 @@ Driver fixes belong in `src/facetimehd/`, should be recorded in
 ```text
 setup.sh                       Guided camera/fan setup
 scripts/install.sh             Driver, DKMS, firmware and calibration installer
+                               (also --status, --enroll-mok, --runtime-pm)
 scripts/uninstall.sh           Complete removal
 scripts/macbook-tune.sh        Optional mbpfan helper
 scripts/extract-firmware.sh    Maintained Apple firmware extractor
+scripts/collect-diagnostics.sh One-file bug report
+packaging/                     .deb and .rpm builders
 src/facetimehd/                Maintained driver built by the installer
-tests/                         Build, capture and hardware-validation scripts
+tests/                         Build, capture, script and hardware-validation
+                               scripts
 ```
 
 ## Troubleshooting and support
 
-These commands provide the most useful initial diagnostics:
+Start here — it names the problem in most cases and tells you how to fix it:
 
 ```bash
-lspci -nn | grep -i '14e4:1570'
-dkms status -m facetimehd
-lsmod | grep facetimehd
-v4l2-ctl --list-devices
-sudo dmesg | grep -iE 'facetimehd|bcwc'
+./scripts/install.sh --status
 ```
 
-When opening an issue, include the MacBook model, distribution, kernel, DKMS
-status and relevant kernel messages:
+Common answers:
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| Module builds, will not load | Secure Boot with no enrolled key | `sudo ./scripts/install.sh --enroll-mok` |
+| Camera present, black image | Firmware not installed | `sudo ./scripts/extract-firmware.sh` |
+| Image works, colours wrong | Calibration files missing | `sudo ./scripts/extract-firmware.sh --calibration-only` |
+| Nothing rebuilt after a kernel update | Kernel headers missing | `apt install linux-headers-$(uname -r)` / `dnf install kernel-devel-$(uname -r)` |
+| Camera unreliable when idle | Driver runtime PM | `sudo ./scripts/install.sh --runtime-pm off` |
+| Install fails at the Apple download | Apple's URL moved | `./scripts/extract-firmware.sh --check-sources` and open an issue |
+
+### Opening an issue
 
 ```bash
-sudo dmidecode -s system-product-name
-cat /etc/os-release
-uname -r
-dkms status -m facetimehd
-sudo dmesg | grep -iE 'facetimehd|bcwc'
+./scripts/collect-diagnostics.sh
 ```
 
-Issues and contributions are welcome through
-[GitHub](https://github.com/ravvle/facetimehd/issues). Reports from additional 2013–2015 MacBook
-models are especially useful.
+That writes one file with the model, distribution, kernel, PCI device, DKMS
+state, module parameters, firmware, Secure Boot state and kernel messages. It
+removes the DMI serial number and UUID; please skim it before posting. Attach it
+to a [GitHub issue](https://github.com/ravvle/facetimehd/issues) — the templates
+ask for it.
+
+**Reports from MacBook models other than the MacBookAir7,2 are the single most
+useful contribution to this project**, whether the camera worked or not. See
+[CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## License
 

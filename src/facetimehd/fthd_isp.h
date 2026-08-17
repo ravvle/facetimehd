@@ -733,6 +733,37 @@ struct isp_cmd_channel_test_pattern_config {
 	u32 pattern;
 };
 
+/* Spatial noise reduction strength.  Same inferred-payload caveat as the
+ * block above: the opcode is real, the argument layout is the shape every
+ * other per-channel setter uses. */
+struct isp_cmd_channel_noise_reduction_set {
+	u32 channel;
+	u32 strength;
+};
+
+/* Chroma noise suppression strength. */
+struct isp_cmd_channel_chroma_suppression_set {
+	u32 channel;
+	u32 strength;
+};
+
+/* Dynamic range compression strength.  DRC is already started unconditionally
+ * by fthd_start_channel(); this sets how hard it pulls shadows up, which is
+ * what V4L2_CID_BACKLIGHT_COMPENSATION means on a camera that has no
+ * backlight-specific hardware. */
+struct isp_cmd_channel_drc_set {
+	u32 channel;
+	u32 strength;
+};
+
+/* Sensor die temperature.  A GET: @temperature is written by the firmware.
+ * The scale is not documented; see fthd_isp_cmd_channel_sensor_temperature()
+ * for how the driver avoids having to guess one. */
+struct isp_cmd_channel_sensor_temperature {
+	u32 channel;
+	s32 temperature;
+};
+
 struct isp_cmd_channel_start {
 	u32 channel;
 };
@@ -832,6 +863,10 @@ extern int fthd_isp_cmd_channel_awb_cct_manual(struct fthd_private *dev_priv, in
 extern int fthd_isp_cmd_channel_awb_gain_manual(struct fthd_private *dev_priv, int channel, unsigned int red, unsigned int blue);
 extern int fthd_isp_cmd_channel_sharpness_set(struct fthd_private *dev_priv, int channel, int sharpness);
 extern int fthd_isp_cmd_channel_test_pattern_config(struct fthd_private *dev_priv, int channel, int pattern);
+extern int fthd_isp_cmd_channel_noise_reduction_set(struct fthd_private *dev_priv, int channel, int strength);
+extern int fthd_isp_cmd_channel_chroma_suppression_set(struct fthd_private *dev_priv, int channel, int strength);
+extern int fthd_isp_cmd_channel_drc_strength_set(struct fthd_private *dev_priv, int channel, int strength);
+extern int fthd_isp_cmd_channel_sensor_temperature(struct fthd_private *dev_priv, int channel, s32 *raw);
 extern int fthd_isp_cmd_channel_brightness_set(struct fthd_private *dev_priv, int channel, int brightness);
 extern int fthd_isp_cmd_channel_contrast_set(struct fthd_private *dev_priv, int channel, int contrast);
 extern int fthd_isp_cmd_channel_saturation_set(struct fthd_private *dev_priv, int channel, int saturation);

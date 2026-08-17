@@ -115,15 +115,76 @@ was not already loading.
 - `S_FMT` refuses to change firmware geometry while old-size buffers are still
   allocated or queued.
 
+## Frame-rate selection
+
+`S_PARM` used to accept any rate and deliver 30 fps regardless, reporting 30
+back so the two at least agreed. An application asking for 15 fps - which is
+what video-conferencing software and most encoders do when they want to spend
+less bandwidth - got 30 with no way to tell.
+
+The sensor has one mode and one rate, so the rate is now produced by delivering
+one frame in N and handing the rest straight back to the ISP:
+
+- `V4L2_CID`-free and firmware-free by design. The obvious alternative was the
+  ISP's own AE frame-rate window, `CISP_CMD_CH_AE_FRAME_RATE_{MIN,MAX}_SET`,
+  which `fthd_start_channel()` already programs. It was rejected: it is the
+  exposure loop's rate window rather than a sensor mode, its units are
+  undocumented, and the sensor demonstrably keeps delivering 30 fps with it
+  programmed to the value used there. Reporting a rate the hardware does not
+  deliver is exactly the bug that made GStreamer's `pipewiresrc` compute
+  negative frame durations and stall after one frame. Decimation cannot desync
+  that way, because the divisor is applied to frames the driver already has.
+- `G_PARM` reports `divisor/30` rather than a rounded integer, so 7.5 fps stays
+  exact. `ENUM_FRAMEINTERVALS` reports the matching stepwise range - `1/30` to
+  `30/30` in steps of `1/30` - which is precisely the set `S_PARM` can honour.
+  A discrete list would either omit rates `S_PARM` accepts or advertise ones it
+  cannot hit.
+- A decimated buffer is never made visible to userspace: it stays owned by the
+  driver and is resubmitted from a work item. It cannot be resubmitted inline,
+  because `fthd_buffer_return_handler()` runs inside `fthd_irq_work()` and
+  `fthd_send_h2t_buffer()` waits on the very channel whose completions that same
+  work item processes.
+- `fthd_stop_streaming()` and the suspend path `cancel_work_sync()` that worker
+  after clearing `channel_running` and before reclaiming buffers. Without that
+  ordering a worker already past its state check could hand a buffer back to the
+  ISP just as vb2 reclaimed it.
+
+The cost is honest and bounded: the ISP still runs at full rate, so this saves
+work in the application and on the bus, not power in the camera.
+
+## Cropping and digital zoom
+
+`S_SELECTION` is implemented for `V4L2_SEL_TGT_CROP`, making the ISP's crop
+rectangle settable rather than pinned to the full sensor array. On a fixed-focus
+720p webcam that is digital zoom and pan, and the hardware was already doing the
+crop-and-scale - only the rectangle was constant.
+
+- The crop is never allowed smaller than the negotiated output size, so the
+  scaler is only ever asked to shrink. Upscaling is a separate capability and
+  nothing here can confirm the ISP has it.
+- `S_FMT` grows the crop if the new output would not fit, which is the
+  adjustment V4L2 permits and avoids making the result depend on whether the
+  format or the selection was set first.
+- `S_SELECTION` is refused with `-EBUSY` while buffers exist, because the
+  rectangle only reaches the firmware in the channel-start sequence; accepting
+  one mid-stream would silently do nothing until the next `STREAMON`.
+- `V4L2_SEL_FLAG_GE`/`_LE` are refused with `-ERANGE`. The driver rounds in both
+  directions and cannot keep either promise, and returning a rectangle that
+  breaks the requested constraint is worse than refusing it.
+- `fthd_v4l2_refresh_crop()` re-fits the stored rectangle at channel start,
+  which is where the sensor's real geometry is first learned. This is what keeps
+  a crop from surviving into a state the ISP would reject on the 12-inch
+  MacBook, whose 848x588 array is smaller than the fallback bounds.
+
 ## V4L2 API improvements
 
 - `S_PARM`, `G_PARM` and frame-interval enumeration consistently report the
-  fixed frame rate the sensor actually delivers.
+  frame rate the driver actually delivers.
 - Frame-size enumeration reports the same stepwise range accepted by
   `TRY_FMT`/`S_FMT`, and frame-interval enumeration validates both format and
   minimum/maximum dimensions.
-- `G_SELECTION` reports the detected full sensor rectangle for the capture
-  crop targets.
+- `G_SELECTION` reports the active crop for `V4L2_SEL_TGT_CROP` and the detected
+  full sensor rectangle for the default and bounds targets.
 - V4L2 controls are replayed after the ISP channel starts, so values set before
   `STREAMON` and across runtime-PM cycles take effect. Hardcoded brightness and
   contrast resets were removed, saturation/hue/white balance are restored, and
@@ -181,12 +242,57 @@ picture wherever the automatic loop had last left it.
   separate "the sensor or firmware is not producing frames" from "the ring, the
   IOMMU mapping or buffer return is broken" without a lit room or a subject.
 
+## Image-quality controls
+
+Three more of the ISP's processing blocks are exposed. All follow the same rule
+as the block above: the opcodes are real, the payload layouts are inferred from
+the shape every other per-channel setter uses, and a wrong guess is refused by
+the firmware rather than being destructive.
+
+- `V4L2_CID_BACKLIGHT_COMPENSATION` drives `CISP_CMD_CH_DRC_SET`. Dynamic range
+  compression is already started unconditionally by `fthd_start_channel()`; this
+  is the separate opcode that says how hard it pulls the shadows up, which is
+  what backlight compensation means on a camera with no backlight-specific
+  hardware of its own.
+- Noise reduction (`CISP_CMD_CH_NOISE_REDUCTION_SET`) and chroma suppression
+  (`CISP_CMD_CH_CHROMA_SUPPRESSION_SET`) are exposed as **driver-private**
+  controls at `V4L2_CID_USER_BASE | 0x1001` and `| 0x1002`. V4L2 has no standard
+  CID for either. `V4L2_CID_IMAGE_STABILIZATION` was the tempting place to put
+  denoising and would have been wrong: an application asking for stabilisation
+  would silently have got something else. A private control with an honest name
+  is better than a standard one with an invented meaning.
+
+## Sensor temperature
+
+`CISP_CMD_CH_SENSOR_TEMPERATURE_GET` is read and exposed two ways, because its
+*scale* is undocumented - celsius, deci-celsius and a raw sensor code are all
+plausible readings of the same number.
+
+- `hwmon` publishes `temp1_input`, which is millidegrees celsius by definition.
+  A number in the wrong scale there is not a caveat, it is a wrong reading in
+  every monitoring tool on the system. So the driver publishes a value only when
+  the firmware returns something that can only sensibly be celsius (-40..125)
+  and returns `-EIO` otherwise, with a rate-limited warning carrying the raw
+  value.
+- `debugfs/facetimehd/<dev>/sensor_temperature_raw` always reports the number
+  exactly as the firmware gave it. That is the file to read when working out
+  what the scale really is.
+- Reading either powers a runtime-suspended camera up, the same documented
+  trade-off the other debugfs accessors make. That is also why this is not a
+  volatile V4L2 control: `G_CTRL` is not expected to spin up hardware.
+
 `CISP_CMD_CH_AWB_1ST_GAIN_MANUAL` is deliberately **not** exposed as
 `V4L2_CID_RED_BALANCE`/`BLUE_BALANCE`. The colour temperature and the
 per-channel gains are two ways of writing the same white-balance state, so
 putting both in one cluster would make the replay order decide which wins —
 and runtime PM replays the whole handler on every idle cycle. One unambiguous
 control is better than two that quietly fight.
+
+`fthd_isp_cmd_channel_awb_gain_manual()` is nevertheless kept, unused and
+commented as such. The choice between the two is a choice between two writable
+representations of one piece of state, not between a working and a broken one -
+so anyone reconsidering it (say, because hardware shows the CCT command is the
+one the firmware ignores) needs this side implemented to compare against.
 
 As with the anti-banding command, the opcodes above are real but Apple
 documents none of their argument layouts, so each payload follows the shape
@@ -229,6 +335,10 @@ them are hardware-validation targets.
 - `tests/smoke-capture.sh` checks the V4L2 surface on real hardware, while
   `tests/hw-validate.sh` covers probe, timing, controls, runtime PM, suspend,
   firmware-wedge evidence and the optional reboot path.
+- `tests/script-smoke.sh` covers the installer plumbing that shellcheck cannot
+  see, including that every source file in this directory is listed in the
+  Makefile - the failure that otherwise compiles in no CI job and only shows up
+  on a user's machine.
 
 ## DDR handling
 
@@ -278,7 +388,25 @@ This validates one machine, model and kernel rather than the complete
 - NV16 capture: that the ISP accepts output format code 0 through the current
   `S_FMT` path, that the chroma plane really does land at
   `bytesperline * height` into the buffer, and that no frame is written past
-  `sizeimage`.
+  `sizeimage`;
+- frame-rate selection: that a decimated stream really arrives at the requested
+  rate with even spacing, that the requeue worker keeps up without starving the
+  ISP of buffers at low divisors (only four exist), and that `STREAMOFF` during
+  heavy decimation returns every buffer. This part needs no firmware guessing -
+  it is driver logic - but it has not been run against hardware;
+- the crop: that the ISP accepts a non-zero `x1`/`y1` at all, whether the
+  rectangle needs an alignment stricter than the eight pixels assumed here, and
+  whether the scaler will upscale (which would make the "crop is never smaller
+  than the output" rule unnecessary rather than merely conservative);
+- backlight compensation, noise reduction and chroma suppression: the same
+  inferred-payload question as the controls above, plus whether their visible
+  effect matches their names;
+- the sensor temperature: what scale the firmware reports it in. Read
+  `debugfs/facetimehd/<dev>/sensor_temperature_raw` on a warm camera and a cold
+  one; if the values look like celsius the hwmon device is already correct, and
+  if they do not the conversion in `fthd_hwmon_read()` needs writing. Also
+  whether the command works at all with no channel running, which decides
+  whether `sensors` is useful when the camera is idle.
 
 Remove entries from this document when the corresponding fixes are accepted
 upstream.

@@ -17,6 +17,7 @@
 #include "fthd_isp.h"
 #include "fthd_ringbuf.h"
 #include "fthd_hw.h"
+#include "fthd_hwmon.h"
 
 static DEFINE_MUTEX(fthd_debugfs_lock);
 static struct dentry *fthd_debugfs_root;
@@ -239,6 +240,26 @@ static int seq_channel_debug_read(struct seq_file *seq, void *data)
 	return seq_channel_read(seq, dev_priv, &dev_priv->channel_debug);
 }
 
+/*
+ * The sensor temperature exactly as the firmware reports it, with no scale
+ * applied.  The hwmon device only publishes a reading it can defend as
+ * celsius (see fthd_hwmon.c); this is the unfiltered value, and the place to
+ * look for anyone working out what the firmware actually means by it.
+ */
+static int seq_sensor_temperature_read(struct seq_file *seq, void *data)
+{
+	struct fthd_private *dev_priv = seq->private;
+	s32 raw;
+	int ret;
+
+	ret = fthd_hwmon_read_raw(dev_priv, &raw);
+	if (ret)
+		return ret;
+
+	seq_printf(seq, "%d\n", raw);
+	return 0;
+}
+
 static int fthd_debugfs_seq_open(struct inode *inode, struct file *file,
 				 int (*show)(struct seq_file *, void *))
 {
@@ -289,6 +310,7 @@ FTHD_DEBUGFS_SEQ_FOPS(seq_channel_io_t2h_read);
 FTHD_DEBUGFS_SEQ_FOPS(seq_channel_buf_h2t_read);
 FTHD_DEBUGFS_SEQ_FOPS(seq_channel_buf_t2h_read);
 FTHD_DEBUGFS_SEQ_FOPS(seq_channel_debug_read);
+FTHD_DEBUGFS_SEQ_FOPS(seq_sensor_temperature_read);
 
 static const struct file_operations fops_debug = {
 	.write = fthd_store_debug,
@@ -338,6 +360,8 @@ int fthd_debugfs_init(struct fthd_private *dev_priv)
 			    &seq_channel_buf_t2h_read_fops);
 	debugfs_create_file("channel_debug", 0400, d, dev_priv,
 			    &seq_channel_debug_read_fops);
+	debugfs_create_file("sensor_temperature_raw", 0400, d, dev_priv,
+			    &seq_sensor_temperature_read_fops);
 	debugfs_create_file("debug", 0600, d, dev_priv, &fops_debug);
 	dev_priv->debugfs = d;
 	fthd_debugfs_users++;

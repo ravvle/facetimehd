@@ -34,6 +34,7 @@ struct fthd_fmt {
 struct fthd_private;
 extern int fthd_v4l2_register(struct fthd_private *dev_priv);
 extern void fthd_v4l2_unregister(struct fthd_private *dev_priv);
+extern void fthd_v4l2_refresh_crop(struct fthd_private *dev_priv);
 extern void fthd_v4l2_suspend_stop(struct fthd_private *dev_priv, bool park);
 extern void fthd_v4l2_resume_start(struct fthd_private *dev_priv, bool powered);
 

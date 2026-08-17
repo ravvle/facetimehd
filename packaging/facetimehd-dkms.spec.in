@@ -1,0 +1,118 @@
+# RPM spec for facetimehd-dkms. @VERSION@ is substituted by build-rpm.sh from
+# src/facetimehd/dkms.conf, so there is no version number to keep in sync here.
+#
+# noarch because the package ships source, not a built module: DKMS compiles it
+# per kernel on the target machine.
+
+%global module_name facetimehd
+%global debug_package %{nil}
+
+Name:           facetimehd-dkms
+Version:        @VERSION@
+Release:        1%{?dist}
+Summary:        Apple FaceTime HD (BCM1570) camera driver (DKMS)
+
+License:        GPL-2.0-only
+URL:            https://github.com/ravvle/facetimehd
+Source0:        %{name}-%{version}.tar.gz
+
+BuildArch:      noarch
+Requires:       dkms >= 2.8
+Requires:       gcc
+Requires:       make
+Recommends:     v4l-utils
+# unar is in EPEL on Enterprise Linux and EPEL does not rebuild every Fedora
+# package for every EL release, so this stays a weak dependency: without it the
+# camera works and its colours are wrong.
+Recommends:     unar
+Suggests:       mbpfan
+
+%description
+Builds the facetimehd kernel module for the Broadcom BCM1570 PCIe camera found
+in 2013-2015 Intel MacBooks, via DKMS, so it is rebuilt automatically for each
+new kernel.
+
+The camera also needs Apple's proprietary firmware, which cannot be
+redistributed and is therefore not in this package. After installing, run
+facetimehd-firmware-install once to fetch it from Apple.
+
+%prep
+%setup -q
+
+%build
+# Nothing to build: DKMS compiles the module on the target machine, against the
+# kernel that is actually running there.
+
+%install
+mkdir -p %{buildroot}%{_usrsrc}/%{module_name}-%{version}
+cp -a src/%{module_name}/. %{buildroot}%{_usrsrc}/%{module_name}-%{version}/
+rm -f %{buildroot}%{_usrsrc}/%{module_name}-%{version}/.gitignore
+
+mkdir -p %{buildroot}%{_datadir}/%{name}/lib
+install -m 755 scripts/extract-firmware.sh %{buildroot}%{_datadir}/%{name}/
+install -m 644 scripts/lib/common.sh %{buildroot}%{_datadir}/%{name}/lib/
+
+mkdir -p %{buildroot}%{_bindir}
+cat > %{buildroot}%{_bindir}/facetimehd-firmware-install <<EOF
+#!/bin/sh
+# Fetch and install the Apple camera firmware. Separate from the package
+# because the firmware is proprietary and cannot be redistributed, and because
+# a post-install scriptlet has no business reaching the network.
+exec %{_datadir}/%{name}/extract-firmware.sh --with-calibration "\$@"
+EOF
+chmod 755 %{buildroot}%{_bindir}/facetimehd-firmware-install
+
+%post
+# An interrupted upgrade can leave the same version half-registered, which makes
+# dkms add fail rather than recover.
+if dkms status -m %{module_name} -v %{version} 2>/dev/null | grep -q .; then
+    dkms remove -m %{module_name} -v %{version} --all >/dev/null 2>&1 || true
+fi
+dkms add -m %{module_name} -v %{version} || :
+# A build failure is reported, not fatal: the usual cause is a missing
+# kernel-devel, which the user can install and then fix with 'dkms autoinstall'.
+# Failing the scriptlet would leave the package installed but unconfigured.
+if dkms build -m %{module_name} -v %{version} && \
+   dkms install -m %{module_name} -v %{version} --force; then
+    echo "facetimehd: module built for $(uname -r)"
+else
+    echo "facetimehd: DKMS build failed - install kernel-devel-$(uname -r)" >&2
+    echo "            and run 'dkms autoinstall'." >&2
+fi
+
+if [ ! -s /usr/lib/firmware/%{module_name}/firmware.bin ] &&
+   [ ! -s /lib/firmware/%{module_name}/firmware.bin ]; then
+    echo ""
+    echo "facetimehd: the camera firmware is NOT installed."
+    echo "            It is Apple's and cannot be shipped in a package."
+    echo "            Run: sudo facetimehd-firmware-install"
+    echo ""
+fi
+
+%preun
+# $1 is 0 on erase and 1 on upgrade; on upgrade the new package's %post
+# re-registers, so only a real removal should deregister here.
+if [ "$1" = 0 ]; then
+    if dkms status -m %{module_name} -v %{version} 2>/dev/null | grep -q .; then
+        dkms remove -m %{module_name} -v %{version} --all >/dev/null 2>&1 || true
+    fi
+fi
+
+%postun
+# The Apple firmware is deliberately left in place: the user fetched it
+# themselves and it is not this package's to delete.
+if [ "$1" = 0 ]; then
+    echo "facetimehd: the Apple firmware under /lib/firmware/%{module_name} was"
+    echo "            left in place. Remove it by hand if you want it gone."
+fi
+
+%files
+%license LICENSE
+%doc README.md
+%{_usrsrc}/%{module_name}-%{version}/
+%{_datadir}/%{name}/
+%{_bindir}/facetimehd-firmware-install
+
+%changelog
+* Mon Aug 17 2026 facetimehd contributors <https://github.com/ravvle/facetimehd>
+- Packaged from the maintained driver source; see DOWNSTREAM.md for changes.

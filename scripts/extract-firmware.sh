@@ -137,6 +137,8 @@ IGNORE_HASHES=0
 DO_INSTALL=1
 DO_CALIBRATION=0
 CALIBRATION_ONLY=0
+CHECK_SOURCES=0
+CALIBRATION_SKIPPED=0
 
 usage() {
     cat <<EOF
@@ -163,6 +165,10 @@ FaceTime HD camera firmware from it, and installs it as firmware.bin.
                       alone. Use when the firmware is already installed.
       --sys FILE      Take the calibration files from a local AppleCamera.sys
                       instead of downloading Boot Camp.
+      --check-sources Verify that both Apple downloads still resolve and still
+                      contain what the checksum tables above expect, then exit.
+                      Installs nothing, writes nothing and needs no root.
+                      Non-zero exit means an install would fail today.
   -h, --help          Show this help.
 EOF
 }
@@ -181,6 +187,7 @@ while [ $# -gt 0 ]; do
         -i|--ignore-hashes) IGNORE_HASHES=1 ;;
         --with-calibration) DO_CALIBRATION=1 ;;
         --calibration-only) DO_CALIBRATION=1; CALIBRATION_ONLY=1 ;;
+        --check-sources)  CHECK_SOURCES=1; DO_INSTALL=0; DO_CALIBRATION=1 ;;
         --sys)            if [ $# -lt 2 ] || [ -z "$2" ]; then
                               error "--sys requires a file argument."; exit 2
                           fi
@@ -295,7 +302,13 @@ else
 
     # --- 5. Install it ----------------------------------------------------------
 
-    if [ "$DO_INSTALL" -eq 0 ]; then
+    if [ "$CHECK_SOURCES" -eq 1 ]; then
+        # Nothing is written: the point of this mode is to prove the download
+        # and the checksum table still agree, and the proof is the verification
+        # that has already happened above. Writing the firmware out would also
+        # mean leaving proprietary Apple code in a CI workspace.
+        ok "Firmware source verified (nothing installed)"
+    elif [ "$DO_INSTALL" -eq 0 ]; then
         cp -- "$fw" ./firmware.bin
         ok "Firmware written to $PWD/firmware.bin"
     else
@@ -314,8 +327,23 @@ fi
 # id (see fthd_isp_cmd_set_loadfile), but they total under 100 kB, so install
 # all of them and let any machine find its own.
 
+# A --check-sources run on a machine with no unpacker cannot check the
+# calibration archive. That is a gap in the checking environment, not a broken
+# Apple download, so it is reported as skipped rather than failed - otherwise
+# the watchdog would blame Apple every time a CI image drops unar.
+if [ "$CHECK_SOURCES" -eq 1 ] && [ "$DO_CALIBRATION" -eq 1 ] && [ -z "$SYS_FILE" ] &&
+   ! have unar && ! have unrar; then
+    warn "Neither unar nor unrar is installed; the calibration source cannot be checked."
+    CALIBRATION_SKIPPED=1
+    DO_CALIBRATION=0
+fi
+
 if [ "$DO_CALIBRATION" -eq 1 ]; then
-    step "Extracting the sensor calibration files"
+    if [ "$CHECK_SOURCES" -eq 1 ]; then
+        step "Checking the sensor calibration source"
+    else
+        step "Extracting the sensor calibration files"
+    fi
 
     if [ -n "$SYS_FILE" ]; then
         [ -f "$SYS_FILE" ] || die "No such file: $SYS_FILE"
@@ -395,7 +423,9 @@ if [ "$DO_CALIBRATION" -eq 1 ]; then
     [ "$cal_ok" -gt 0 ] || die "No calibration file passed verification."
     ok "Verified $cal_ok calibration file(s)"
 
-    if [ "$DO_INSTALL" -eq 0 ]; then
+    if [ "$CHECK_SOURCES" -eq 1 ]; then
+        ok "Calibration source verified (nothing installed)"
+    elif [ "$DO_INSTALL" -eq 0 ]; then
         cp -- "$cal_dir"/*.dat ./
         ok "Calibration files written to $PWD"
     else
@@ -404,4 +434,22 @@ if [ "$DO_CALIBRATION" -eq 1 ]; then
         install -m 644 -- "$cal_dir"/*.dat "$DEST_DIR/"
         ok "Calibration files installed to $DEST_DIR"
     fi
+fi
+
+# --- 7. Summary, for --check-sources ----------------------------------------
+#
+# Everything above dies on a mismatch, so reaching here means the downloads and
+# the checksum tables still agree. The point of saying so explicitly is that
+# this mode exists to be run unattended by CI, where a silent success and a
+# silently skipped run look identical.
+
+if [ "$CHECK_SOURCES" -eq 1 ]; then
+    echo
+    ok "Apple firmware source is reachable and matches the checksum table."
+    if [ "$CALIBRATION_SKIPPED" -eq 1 ]; then
+        warn "The calibration source was NOT checked (no unar/unrar here)."
+    else
+        ok "Boot Camp calibration source is reachable and matches its table."
+    fi
+    info "Nothing was installed and no Apple content was written to disk."
 fi

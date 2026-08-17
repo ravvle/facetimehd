@@ -1,0 +1,75 @@
+name: Bug report
+description: The camera does not work, or stopped working
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Before filing, please run:
+
+        ```bash
+        ./scripts/install.sh --status
+        ./scripts/collect-diagnostics.sh
+        ```
+
+        `--status` usually names the problem on its own. The collector writes a
+        single file with everything needed to debug this one; it removes the DMI
+        serial number and UUID, but please skim it before attaching.
+
+  - type: textarea
+    id: what-happens
+    attributes:
+      label: What happens
+      description: What you did, what you expected, and what you got instead.
+      placeholder: |
+        Opened GNOME Snapshot; it shows "no camera found". v4l2-ctl lists
+        /dev/video0 but capture fails immediately.
+    validations:
+      required: true
+
+  - type: input
+    id: model
+    attributes:
+      label: MacBook model
+      description: "`sudo dmidecode -s system-product-name`, e.g. MacBookPro11,3"
+    validations:
+      required: true
+
+  - type: input
+    id: distro
+    attributes:
+      label: Distribution and kernel
+      description: "`cat /etc/os-release | head -1` and `uname -r`"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: regression
+    attributes:
+      label: Did this ever work?
+      options:
+        - "Never worked on this machine"
+        - "Worked, then stopped after a kernel update"
+        - "Worked, then stopped after suspend/resume"
+        - "Worked, then stopped for another reason"
+        - "Not sure"
+    validations:
+      required: true
+
+  - type: textarea
+    id: status
+    attributes:
+      label: Output of ./scripts/install.sh --status
+      render: text
+    validations:
+      required: true
+
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Diagnostics
+      description: >
+        Attach the file from ./scripts/collect-diagnostics.sh by dragging it
+        into this box, or paste it here.
+    validations:
+      required: false

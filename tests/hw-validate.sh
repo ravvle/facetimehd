@@ -192,7 +192,12 @@ check_ring_wrap() {
 pci_slot() {
     local d vendor device
     for d in /sys/bus/pci/devices/*; do
-        [ -r "$d/vendor" ] && [ -r "$d/device" ] || continue
+        # Written as a negated if rather than 'A && B || continue': that reads
+        # as if-then-else but is not one, and the pattern is worth avoiding even
+        # where, as here, it happens to behave correctly.
+        if [ ! -r "$d/vendor" ] || [ ! -r "$d/device" ]; then
+            continue
+        fi
         read -r vendor <"$d/vendor"
         read -r device <"$d/device"
         if [ "$vendor" = 0x14e4 ] && [ "$device" = 0x1570 ]; then

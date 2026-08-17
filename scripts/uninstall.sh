@@ -128,6 +128,18 @@ find /lib/modules -name 'bcwc_pcie.ko*' -delete 2>/dev/null || true
 # Written by DKMS from upstream's MODULES_CONF ("blacklist bdc_pci"); dkms
 # remove usually takes it with it, but not if the registration was already gone.
 rm -f -- "/etc/modprobe.d/${MODULE_NAME}-dkms.conf"
+# Written only by 'install.sh --runtime-pm off'. Removed here because it names a
+# module that is going away: left behind, it would apply to a future reinstall
+# that never asked for it.
+if [ -f "/etc/modprobe.d/${MODULE_NAME}-runtime-pm.conf" ]; then
+    rm -f -- "/etc/modprobe.d/${MODULE_NAME}-runtime-pm.conf"
+    ok "removed /etc/modprobe.d/${MODULE_NAME}-runtime-pm.conf"
+fi
+
+# The MOK signing key is deliberately left alone. It may well be signing other
+# DKMS modules on this machine, and removing an enrolled key is a firmware-level
+# change that a camera uninstaller has no business making - the same reasoning
+# that leaves EPEL enabled.
 
 step "Updating module dependencies"
 depmod -a

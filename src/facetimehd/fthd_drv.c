@@ -25,6 +25,7 @@
 #include "fthd_buffer.h"
 #include "fthd_v4l2.h"
 #include "fthd_debugfs.h"
+#include "fthd_hwmon.h"
 
 /* Powering the ISP back up means re-training DDR and re-uploading the firmware
  * image, which is not cheap.  Idle for this long before doing it. */
@@ -688,6 +689,10 @@ static int fthd_pci_probe(struct pci_dev *pdev,
 	ret = fthd_debugfs_init(dev_priv);
 	if (ret)
 		goto fail_v4l2;
+
+	/* Best-effort, and deliberately after everything that can fail: a
+	 * camera with no temperature reading is a working camera. */
+	fthd_hwmon_register(dev_priv);
 
 	/* One line per probe, carrying what the twenty-line bring-up banner
 	 * used to be read for. Everything else on that path is dev_dbg now,

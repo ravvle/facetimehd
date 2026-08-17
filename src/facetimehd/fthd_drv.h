@@ -140,6 +140,13 @@ struct fthd_private {
 	 * running, so s_ctrl consults this rather than failing when it isn't. */
 	bool channel_running;
 	int frametime;
+	/* Frame-rate division.  The sensor delivers a fixed rate and the driver
+	 * passes on one frame in @fps_divisor of it, handing the rest straight
+	 * back to the ISP from @requeue_work; @frame_phase counts within the
+	 * current group.  Both are read and written only under buffer_lock. */
+	unsigned int fps_divisor;
+	unsigned int frame_phase;
+	struct work_struct requeue_work;
 	unsigned int sequence;
 	u64 buffer_tag;
 	/* Serialises the hardware up/down transitions and @suspended. Runtime
@@ -158,6 +165,9 @@ struct fthd_private {
 	 * unfreed; the next open() reloads firmware via fthd_pm_up(). */
 	bool wedged;
 	struct dentry *debugfs;
+	/* devm-managed, so it needs no explicit teardown; NULL if registration
+	 * failed, which is not fatal. */
+	struct device *hwmon;
 };
 
 bool fthd_get(struct fthd_private *dev_priv);

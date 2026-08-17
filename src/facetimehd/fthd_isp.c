@@ -1315,6 +1315,22 @@ int fthd_isp_cmd_channel_awb_cct_manual(struct fthd_private *dev_priv, int chann
 	return fthd_isp_cmd(dev_priv, CISP_CMD_CH_AWB_CCT_MANUAL, &cmd, sizeof(cmd), &len);
 }
 
+/*
+ * Deliberately unused, and kept rather than deleted.
+ *
+ * CISP_CMD_CH_AWB_1ST_GAIN_MANUAL is the other way of writing manual white
+ * balance: the per-channel gains rather than the colour temperature.  Exposing
+ * both as V4L2 controls would put two controls describing one piece of ISP
+ * state in the same cluster, and since runtime PM replays the whole handler on
+ * every idle cycle, their replay order - not the user - would decide which one
+ * won.  fthd_set_white_balance() therefore offers only the CCT.
+ *
+ * The helper stays because the choice is between two writable representations
+ * of the same state, not between a working and a broken one: anyone
+ * reconsidering it (say, because hardware shows the CCT command is the one the
+ * firmware ignores) needs this side implemented to compare against.  See
+ * DOWNSTREAM.md, "Manual exposure and white balance".
+ */
 int fthd_isp_cmd_channel_awb_gain_manual(struct fthd_private *dev_priv, int channel,
 					 unsigned int red, unsigned int blue)
 {
@@ -1357,6 +1373,82 @@ int fthd_isp_cmd_channel_test_pattern_config(struct fthd_private *dev_priv, int 
 	cmd.pattern = pattern;
 	len = sizeof(cmd);
 	return fthd_isp_cmd(dev_priv, CISP_CMD_CH_SENSOR_TEST_PATTERN_CONFIG, &cmd, sizeof(cmd), &len);
+}
+
+int fthd_isp_cmd_channel_noise_reduction_set(struct fthd_private *dev_priv, int channel, int strength)
+{
+	struct isp_cmd_channel_noise_reduction_set cmd;
+	int len;
+
+	pr_debug("set noise reduction %d\n", strength);
+
+	memset(&cmd, 0, sizeof(cmd));
+	cmd.channel = channel;
+	cmd.strength = strength;
+	len = sizeof(cmd);
+	return fthd_isp_cmd(dev_priv, CISP_CMD_CH_NOISE_REDUCTION_SET, &cmd, sizeof(cmd), &len);
+}
+
+int fthd_isp_cmd_channel_chroma_suppression_set(struct fthd_private *dev_priv, int channel, int strength)
+{
+	struct isp_cmd_channel_chroma_suppression_set cmd;
+	int len;
+
+	pr_debug("set chroma suppression %d\n", strength);
+
+	memset(&cmd, 0, sizeof(cmd));
+	cmd.channel = channel;
+	cmd.strength = strength;
+	len = sizeof(cmd);
+	return fthd_isp_cmd(dev_priv, CISP_CMD_CH_CHROMA_SUPPRESSION_SET, &cmd, sizeof(cmd), &len);
+}
+
+/*
+ * DRC strength.  fthd_start_channel() issues CISP_CMD_CH_DRC_START, which turns
+ * the block on; this is the separate opcode that says how hard it works.
+ */
+int fthd_isp_cmd_channel_drc_strength_set(struct fthd_private *dev_priv, int channel, int strength)
+{
+	struct isp_cmd_channel_drc_set cmd;
+	int len;
+
+	pr_debug("set drc strength %d\n", strength);
+
+	memset(&cmd, 0, sizeof(cmd));
+	cmd.channel = channel;
+	cmd.strength = strength;
+	len = sizeof(cmd);
+	return fthd_isp_cmd(dev_priv, CISP_CMD_CH_DRC_SET, &cmd, sizeof(cmd), &len);
+}
+
+/*
+ * Sensor die temperature, returned exactly as the firmware reports it.
+ *
+ * The opcode is documented by name only, so the scale is unknown - it could be
+ * celsius, deci-celsius or a raw sensor code.  Rather than guess a conversion
+ * and publish a confidently wrong number, this returns the raw value and the
+ * hwmon layer decides what to do with it; see fthd_hwmon_read().
+ */
+int fthd_isp_cmd_channel_sensor_temperature(struct fthd_private *dev_priv, int channel, s32 *raw)
+{
+	struct isp_cmd_channel_sensor_temperature cmd;
+	int ret, len;
+
+	memset(&cmd, 0, sizeof(cmd));
+	cmd.channel = channel;
+	len = sizeof(cmd);
+	ret = fthd_isp_cmd(dev_priv, CISP_CMD_CH_SENSOR_TEMPERATURE_GET, &cmd, sizeof(cmd), &len);
+	if (ret)
+		return ret;
+
+	/* A response short enough not to contain the field would leave the
+	 * zero from the memset above looking like a real reading. */
+	if (len < (int)sizeof(cmd))
+		return -EIO;
+
+	*raw = cmd.temperature;
+	pr_debug("sensor temperature raw %d\n", *raw);
+	return 0;
 }
 
 int fthd_isp_cmd_channel_brightness_set(struct fthd_private *dev_priv, int channel, int brightness)
@@ -1445,7 +1537,7 @@ int fthd_isp_cmd_channel_ae(struct fthd_private *dev_priv, int channel, int enab
 
 int fthd_start_channel(struct fthd_private *dev_priv, int channel)
 {
-	int ret, x1 = 0, x2 = 0, y2 = 0, pixelformat;
+	int ret, x1 = 0, y1 = 0, x2 = 0, y2 = 0, pixelformat;
 
 	ret = fthd_isp_cmd_channel_camera_config(dev_priv);
 	if (ret)
@@ -1454,23 +1546,25 @@ int fthd_start_channel(struct fthd_private *dev_priv, int channel)
 	if (ret)
 		return ret;
 
-	/* Crop the full sensor array and let the ISP scale it down to whatever
-	 * output size was negotiated.  Cropping to the *output* size is not a
-	 * scale at all: it selects that many pixels starting at (0,0) and hands
-	 * them back 1:1, so every resolution below native came out as a zoom
-	 * into the top-left corner of the image.
+	/* Crop a rectangle of the sensor array and let the ISP scale it to
+	 * whatever output size was negotiated.  Cropping to the *output* size is
+	 * not a scale at all: it selects that many pixels starting at (0,0) and
+	 * hands them back 1:1, so every resolution below native came out as a
+	 * zoom into the top-left corner of the image.
 	 *
-	 * The bounds have to come from the detected sensor geometry rather than
-	 * a constant.  The 12-inch MacBook (MacBook8,1, sensor 1675) reports an
-	 * 848x588 sensor via CISP_CMD_CH_CAMERA_CONFIG_GET, and a hardcoded
-	 * 1280x720 crop exceeds that array and makes the sensor interface throw
-	 * SIF errors - which is what the format size was standing in for here.
-	 * Fall back to it if detection never ran. */
-	x1 = 0;
-	x2 = dev_priv->sensor_width  ? : dev_priv->fmt.fmt.width;
-	y2 = dev_priv->sensor_height ? : dev_priv->fmt.fmt.height;
+	 * The rectangle is whatever S_SELECTION last accepted, which defaults to
+	 * the full array; fthd_v4l2_reset_crop() derives that default from the
+	 * detected sensor geometry rather than a constant, because the 12-inch
+	 * MacBook (MacBook8,1, sensor 1675) reports an 848x588 sensor via
+	 * CISP_CMD_CH_CAMERA_CONFIG_GET and a hardcoded 1280x720 crop exceeds
+	 * that array and makes the sensor interface throw SIF errors. */
+	fthd_v4l2_refresh_crop(dev_priv);
+	x1 = dev_priv->fmt.x1;
+	y1 = dev_priv->fmt.y1;
+	x2 = dev_priv->fmt.x2;
+	y2 = dev_priv->fmt.y2;
 
-	ret = fthd_isp_cmd_channel_crop_set(dev_priv, 0, x1, 0, x2, y2);
+	ret = fthd_isp_cmd_channel_crop_set(dev_priv, 0, x1, y1, x2, y2);
 	if (ret)
 		return ret;
 

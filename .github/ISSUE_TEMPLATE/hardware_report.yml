@@ -1,0 +1,55 @@
+name: Hardware report
+description: Report success or failure on a MacBook model not yet listed
+labels: ["hardware-report"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        This project has been validated in depth on one machine, a
+        MacBookAir7,2. Reports from any other 2013-2015 Intel MacBook are the
+        most useful thing anyone can contribute, whether the camera worked or
+        not.
+
+  - type: input
+    id: model
+    attributes:
+      label: MacBook model
+      description: "`sudo dmidecode -s system-product-name`"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: outcome
+    attributes:
+      label: Outcome
+      options:
+        - "Works"
+        - "Works, with problems"
+        - "Does not work"
+    validations:
+      required: true
+
+  - type: input
+    id: sensor
+    attributes:
+      label: Detected sensor resolution
+      description: >
+        From `dmesg | grep -i 'sensor native resolution'` with
+        `dyndbg` enabled, or the largest size in
+        `v4l2-ctl --list-formats-ext`.
+
+  - type: textarea
+    id: validate
+    attributes:
+      label: Output of tests/hw-validate.sh
+      description: >
+        `sudo ./tests/hw-validate.sh` if you can spare the machine for a few
+        minutes. This is what turns "it works for me" into something that can be
+        recorded in DOWNSTREAM.md.
+      render: text
+
+  - type: textarea
+    id: notes
+    attributes:
+      label: Anything else
+      description: Colour accuracy, suspend behaviour, frame rate, noise.

@@ -30,6 +30,13 @@ ASSUME_YES=0
 FORCE_REBUILD=0
 SKIP_FIRMWARE=0
 SKIP_HW_CHECK=0
+ENROLL_MOK=0
+SHOW_STATUS=0
+RUNTIME_PM=''
+
+# Drop-in that persists the driver's runtime_pm module parameter. Named for the
+# project so uninstall.sh can remove exactly what was added and nothing else.
+RUNTIME_PM_DROPIN=/etc/modprobe.d/facetimehd-runtime-pm.conf
 
 usage() {
     cat <<EOF
@@ -39,6 +46,14 @@ Usage: sudo $0 [OPTIONS]
       --force          Rebuild and reinstall even if already up to date.
       --skip-firmware  Do not touch the firmware (it is already installed).
       --skip-hw-check  Install even if no FaceTime HD camera is detected.
+      --enroll-mok     Under Secure Boot, generate and enrol a Machine Owner
+                       Key so DKMS can sign the module. Asks for a one-time
+                       password, then needs a reboot to finish.
+      --runtime-pm MODE
+                       Persist the driver's runtime power management: 'off'
+                       writes $RUNTIME_PM_DROPIN,
+                       'on' removes it again (the driver's own default).
+      --status         Report what is installed and exit. Needs no root.
   -h, --help           Show this help.
 
 Environment:
@@ -54,11 +69,179 @@ while [ $# -gt 0 ]; do
         --force)         FORCE_REBUILD=1 ;;
         --skip-firmware) SKIP_FIRMWARE=1 ;;
         --skip-hw-check) SKIP_HW_CHECK=1 ;;
+        --enroll-mok)    ENROLL_MOK=1 ;;
+        --status)        SHOW_STATUS=1 ;;
+        --runtime-pm)    shift; [ $# -gt 0 ] || die "--runtime-pm needs on or off"
+                         RUNTIME_PM="$1" ;;
+        --runtime-pm=*)  RUNTIME_PM="${1#*=}" ;;
         -h|--help)       usage; exit 0 ;;
         *)               error "Unknown option: $1"; usage >&2; exit 2 ;;
     esac
     shift
 done
+
+case "$RUNTIME_PM" in
+    ''|on|off) ;;
+    *) die "--runtime-pm takes 'on' or 'off', not '$RUNTIME_PM'." ;;
+esac
+
+# ---------------------------------------------------------------------------
+# Secure Boot and Machine Owner Keys
+# ---------------------------------------------------------------------------
+#
+# Under Secure Boot an unsigned module builds perfectly and then refuses to
+# load, which reads as "the installer worked but the camera is broken". DKMS can
+# sign what it builds, but only if it has a key the firmware trusts, and getting
+# one there is a two-stage dance: enrol the certificate with mokutil, then
+# confirm it in MokManager during the next boot. Neither half can be done for
+# the user without them typing something, so this is opt-in rather than
+# automatic.
+
+secure_boot_enabled() {
+    have mokutil || return 1
+    [ "$(mokutil --sb-state 2>/dev/null || true)" = "SecureBoot enabled" ]
+}
+
+# Where DKMS looks for its signing key. An explicit setting in framework.conf
+# wins; otherwise each family has its own default, and using the same paths the
+# distribution does is what keeps this from creating a second, competing key.
+mok_key_path() {
+    local v
+    v="$(sed -n 's/^[[:space:]]*mok_signing_key=["'"'"']\{0,1\}\([^"'"'"']*\)["'"'"']\{0,1\}[[:space:]]*$/\1/p' \
+             /etc/dkms/framework.conf 2>/dev/null | tail -n1)"
+    if [ -n "$v" ]; then printf '%s\n' "$v"; return 0; fi
+    if is_debian_like; then printf '/var/lib/shim-signed/mok/MOK.priv\n'
+    else printf '/var/lib/dkms/mok.key\n'; fi
+}
+
+mok_cert_path() {
+    local v
+    v="$(sed -n 's/^[[:space:]]*mok_certificate=["'"'"']\{0,1\}\([^"'"'"']*\)["'"'"']\{0,1\}[[:space:]]*$/\1/p' \
+             /etc/dkms/framework.conf 2>/dev/null | tail -n1)"
+    if [ -n "$v" ]; then printf '%s\n' "$v"; return 0; fi
+    if is_debian_like; then printf '/var/lib/shim-signed/mok/MOK.der\n'
+    else printf '/var/lib/dkms/mok.pub\n'; fi
+}
+
+# Is this certificate already trusted by the firmware?
+mok_key_enrolled() {
+    local cert="$1"
+    have mokutil || return 1
+    [ -s "$cert" ] || return 1
+    mokutil --test-key "$cert" 2>/dev/null | grep -q 'is already enrolled'
+}
+
+# ---------------------------------------------------------------------------
+# Status
+# ---------------------------------------------------------------------------
+#
+# One command that answers "is this working, and if not which part is missing".
+# The README used to ask users to run five commands and read the output
+# themselves; this runs the same checks and says what each answer means.
+#
+# Deliberately read-only and root-free. Some of what it reports needs root to
+# see - dkms status is the main one - so anything unreadable is reported as
+# unknown rather than as a failure, which would be worse than saying nothing.
+show_status() {
+    local fw_dir mod_ver cert rc=0
+
+    detect_os
+    step "System"
+    info "Distribution: ${OS_PRETTY:-unknown}"
+    info "Kernel:       $(uname -r)"
+
+    step "Hardware"
+    local hw_rc=0
+    has_facetimehd_hardware || hw_rc=$?
+    case "$hw_rc" in
+        0) ok "FaceTime HD camera present on the PCI bus ($FTHD_PCI_ID)" ;;
+        2) bad "lspci is not installed, so the PCI bus cannot be checked" ;;
+        *) bad "No $FTHD_PCI_ID device - this machine has no PCIe FaceTime HD camera"
+           rc=1 ;;
+    esac
+
+    step "Driver"
+    if ! have dkms; then
+        bad "dkms is not installed"; rc=1
+    elif ! mod_ver="$(dkms status -m "$MODULE_NAME" 2>/dev/null)" || [ -z "$mod_ver" ]; then
+        if [ "$(id -u)" -ne 0 ]; then
+            bad "dkms status returned nothing (re-run with sudo to be sure)"
+        else
+            bad "No $MODULE_NAME version registered with DKMS"; rc=1
+        fi
+    else
+        printf '%s\n' "$mod_ver" | while read -r line; do
+            [ -n "$line" ] && ok "DKMS: $line"
+        done
+    fi
+
+    if lsmod 2>/dev/null | grep -q "^${MODULE_NAME}\b"; then
+        ok "Module loaded"
+    else
+        bad "Module not loaded"; rc=1
+    fi
+
+    step "Firmware"
+    fw_dir="$(firmware_root)/$MODULE_NAME"
+    if [ -s "$fw_dir/firmware.bin" ]; then
+        ok "Firmware: $fw_dir/firmware.bin"
+    else
+        bad "Firmware missing at $fw_dir/firmware.bin - the camera cannot stream"
+        info "    fix: sudo $FIRMWARE_EXTRACTOR"
+        rc=1
+    fi
+    if compgen -G "$fw_dir/*_01XX.dat" >/dev/null; then
+        ok "Sensor calibration files present"
+    else
+        bad "No sensor calibration files - the camera works, its colours are off"
+        info "    fix: sudo $FIRMWARE_EXTRACTOR --calibration-only"
+    fi
+
+    step "Secure Boot"
+    if ! have mokutil; then
+        info "mokutil is not installed, so Secure Boot state is unknown"
+    elif secure_boot_enabled; then
+        cert="$(mok_cert_path)"
+        if mok_key_enrolled "$cert"; then
+            ok "Secure Boot on, and the DKMS signing key is enrolled"
+        else
+            bad "Secure Boot on and no enrolled key at $cert"
+            info "    the module will build and then refuse to load"
+            info "    fix: sudo $0 --enroll-mok"
+            rc=1
+        fi
+    else
+        ok "Secure Boot is off; module signing is not required"
+    fi
+
+    step "Device"
+    if compgen -G '/dev/video*' >/dev/null; then
+        local d
+        for d in /dev/video*; do ok "Present: $d"; done
+    else
+        bad "No /dev/video* device"; rc=1
+    fi
+
+    step "Power management"
+    if [ -f "$RUNTIME_PM_DROPIN" ]; then
+        info "Runtime PM disabled by $RUNTIME_PM_DROPIN"
+    else
+        info "Runtime PM left at the driver's default (on)"
+    fi
+
+    echo
+    if [ "$rc" -eq 0 ]; then
+        info "Everything this can check looks correct."
+    else
+        warn "Some checks did not pass - see the 'fix:' lines above."
+    fi
+    return "$rc"
+}
+
+if [ "$SHOW_STATUS" -eq 1 ]; then
+    show_status
+    exit $?
+fi
 
 require_root
 
@@ -103,11 +286,8 @@ if [ "$SKIP_HW_CHECK" -eq 0 ]; then
     esac
 fi
 
-if have mokutil && [ "$(mokutil --sb-state 2>/dev/null || true)" = "SecureBoot enabled" ]; then
-    warn "Secure Boot is enabled. DKMS will sign the module with your MOK key if"
-    warn "one is enrolled; otherwise the module will build but refuse to load."
-    warn "See README.md -> Troubleshooting and support."
-fi
+# Secure Boot is checked in section 2b, once mokutil is installable and there is
+# something actionable to say about it.
 
 # ---------------------------------------------------------------------------
 # 2. Build dependencies
@@ -291,6 +471,99 @@ if [ ! -d "/lib/modules/$KVER/build" ]; then
 fi
 
 # ---------------------------------------------------------------------------
+# 2b. Machine Owner Key, when asked for
+# ---------------------------------------------------------------------------
+#
+# Must happen before the DKMS build below: DKMS signs at build time, so a key
+# set up afterwards would leave this run's module unsigned.
+
+enroll_mok() {
+    local key cert subj tools=()
+
+    have mokutil || tools+=(mokutil)
+    have openssl || tools+=(openssl)
+    if [ ${#tools[@]} -gt 0 ]; then
+        info "Installing ${tools[*]}"
+        pkg_install "${tools[@]}" || die \
+            "Could not install ${tools[*]}, which --enroll-mok needs."
+    fi
+
+    if ! secure_boot_enabled; then
+        info "Secure Boot is not enabled, so no key is needed. Nothing to do."
+        return 0
+    fi
+
+    key="$(mok_key_path)"
+    cert="$(mok_cert_path)"
+
+    if mok_key_enrolled "$cert"; then
+        ok "A signing key is already enrolled ($cert)"
+        return 0
+    fi
+
+    if [ ! -s "$key" ] || [ ! -s "$cert" ]; then
+        step "Generating a Machine Owner Key"
+        info "$key"
+        mkdir -p -- "$(dirname -- "$key")" "$(dirname -- "$cert")"
+        # 36500 days because a key that expires turns a working camera into a
+        # module that stops loading years later, with nothing to connect the
+        # two. The CN names this project so a user reading MokManager's list
+        # can tell what asked for it.
+        subj="/CN=facetimehd DKMS module signing key/"
+        openssl req -new -x509 -nodes -utf8 -sha256 -days 36500 \
+            -subj "$subj" -outform DER \
+            -newkey rsa:2048 -keyout "$key" -out "$cert" >/dev/null 2>&1 || die \
+            "Could not generate a signing key at $key"
+        chmod 600 -- "$key"
+        ok "Key generated"
+    else
+        info "Using the existing key at $key"
+    fi
+
+    # Point DKMS at the key unless the system already says where its key is.
+    # Appending blindly would give framework.conf two settings for one value.
+    if ! grep -qs '^[[:space:]]*mok_signing_key=' /etc/dkms/framework.conf; then
+        mkdir -p /etc/dkms
+        {
+            printf '\n# Added by facetimehd install.sh --enroll-mok\n'
+            printf 'mok_signing_key="%s"\n' "$key"
+            printf 'mok_certificate="%s"\n' "$cert"
+        } >> /etc/dkms/framework.conf
+        info "Recorded the key in /etc/dkms/framework.conf"
+    fi
+
+    step "Enrolling the key with Secure Boot"
+    cat <<'EOF'
+  mokutil will ask you to choose a password now. It is used once, on the next
+  boot, and then forgotten - it is not an account password and nothing stores
+  it. At that boot the firmware shows a blue MokManager screen:
+
+      Enrol MOK  ->  Continue  ->  Yes  ->  enter the same password
+
+  If you skip that screen the key is not enrolled and the module will still
+  refuse to load.
+
+EOF
+    if ! mokutil --import "$cert"; then
+        die "mokutil could not stage the key for enrolment."
+    fi
+
+    ok "Key staged for enrolment - complete it at the next reboot"
+    MOK_PENDING=1
+}
+
+MOK_PENDING=0
+if [ "$ENROLL_MOK" -eq 1 ]; then
+    enroll_mok
+elif secure_boot_enabled && ! mok_key_enrolled "$(mok_cert_path)"; then
+    # The warning that used to be the whole story, now that there is something
+    # actionable to point at.
+    warn "Secure Boot is enabled and no DKMS signing key is enrolled, so the"
+    warn "module will build and then refuse to load. Re-run with --enroll-mok"
+    warn "to set one up, or see README.md -> Troubleshooting and support."
+fi
+
+# ---------------------------------------------------------------------------
 # 3. Driver source
 # ---------------------------------------------------------------------------
 
@@ -441,6 +714,37 @@ elif [ "$SKIP_FIRMWARE" -eq 0 ]; then
 fi
 
 # ---------------------------------------------------------------------------
+# 4b. Runtime power management, when asked for
+# ---------------------------------------------------------------------------
+#
+# This project configures no power management by default and that has not
+# changed: the drop-in is written only when explicitly asked for. What it does
+# is make the driver's own documented escape hatch survive a reboot, instead of
+# the user having to add facetimehd.runtime_pm=0 to the kernel command line by
+# hand every time. uninstall.sh removes it.
+if [ "$RUNTIME_PM" = off ]; then
+    step "Disabling the driver's runtime power management"
+    cat > "$RUNTIME_PM_DROPIN" <<EOF
+# Written by facetimehd install.sh --runtime-pm off
+# Removed by 'install.sh --runtime-pm on' or by uninstall.sh.
+#
+# The driver's runtime PM powers the camera down when nothing has it open and
+# reloads its firmware on the next use. This turns that off for machines where
+# it proves unreliable.
+options $MODULE_NAME runtime_pm=0
+EOF
+    ok "Wrote $RUNTIME_PM_DROPIN (takes effect on the next module load)"
+elif [ "$RUNTIME_PM" = on ]; then
+    step "Restoring the driver's default runtime power management"
+    if [ -f "$RUNTIME_PM_DROPIN" ]; then
+        rm -f -- "$RUNTIME_PM_DROPIN"
+        ok "Removed $RUNTIME_PM_DROPIN"
+    else
+        info "Nothing to remove; runtime PM was already at its default."
+    fi
+fi
+
+# ---------------------------------------------------------------------------
 # 5. Load and verify
 # ---------------------------------------------------------------------------
 
@@ -462,8 +766,16 @@ if [ "$MODULE_STALE" -eq 1 ]; then
     warn "the next reboot."
 elif modprobe "$MODULE_NAME" 2>/dev/null; then
     ok "Kernel module loaded"
+elif [ "$MOK_PENDING" -eq 1 ]; then
+    # Expected, not a failure: the key is staged but the firmware will not trust
+    # it until MokManager has been through at the next boot.
+    info "The module cannot load until the key is enrolled at the next reboot."
 else
     warn "Could not load the module now; a reboot is usually enough."
+    if secure_boot_enabled && ! mok_key_enrolled "$(mok_cert_path)"; then
+        warn "Secure Boot is on with no enrolled signing key, which is the most"
+        warn "likely reason. Re-run with --enroll-mok."
+    fi
 fi
 
 step "Verifying"
@@ -507,17 +819,33 @@ else
     warn "Installation finished with warnings - see above."
 fi
 
+if [ "$MOK_PENDING" -eq 1 ]; then
+    cat <<'EOF'
+
+  IMPORTANT - the next reboot needs you at the keyboard.
+
+  A blue MokManager screen appears before the system starts. Choose
+
+      Enrol MOK  ->  Continue  ->  Yes
+
+  and enter the password you just set. The camera will not work until this is
+  done; if you miss the screen, re-run this script with --enroll-mok.
+EOF
+fi
+
 cat <<EOF
 
 Next steps:
   1. Reboot:            sudo reboot
-  2. Test the camera:   v4l2-ctl --list-devices   (or open Snapshot/Cheese)
-  3. Camera access:     sudo usermod -aG video \$USER   (then log out and back in)
+  2. Check the install: ./scripts/install.sh --status
+  3. Test the camera:   v4l2-ctl --list-devices   (or open Snapshot/Cheese)
+  4. Camera access:     sudo usermod -aG video \$USER   (then log out and back in)
 
 Optional:
-  Fans and keyboard:    sudo ./scripts/macbook-tune.sh
-                        (makes sure mbpfan and hid_apple are installed and
-                         running - neither is reconfigured)
+  Fan support:          sudo ./scripts/macbook-tune.sh
+                        (makes sure mbpfan is installed and running; it is not
+                         reconfigured)
+  Diagnostics:          ./scripts/collect-diagnostics.sh
   Troubleshooting:      README.md -> Troubleshooting and support
 
 The module rebuilds itself on kernel updates via DKMS; there is nothing to

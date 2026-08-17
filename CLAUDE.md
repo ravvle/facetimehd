@@ -22,12 +22,18 @@ automatically.
 # Lint (exactly what CI runs - see .github/workflows/ci.yml)
 shellcheck -x --source-path=SCRIPTDIR \
     setup.sh \
-    scripts/install.sh scripts/uninstall.sh scripts/macbook-tune.sh scripts/extract-firmware.sh \
-    tests/build-driver.sh tests/smoke-capture.sh
+    scripts/install.sh scripts/uninstall.sh scripts/macbook-tune.sh \
+    scripts/extract-firmware.sh scripts/collect-diagnostics.sh \
+    packaging/build-deb.sh packaging/build-rpm.sh \
+    tests/build-driver.sh tests/smoke-capture.sh \
+    tests/hw-validate.sh tests/script-smoke.sh
 # scripts/lib/common.sh is only sourced, never listed directly - shellcheck -x
-# follows it from whatever sources it. tests/hw-validate.sh needs a MacBook to
-# run and is not part of the CI lint job either; shellcheck it by hand after
-# editing it.
+# follows it from whatever sources it. Every other tracked *.sh must appear in
+# that list; CI has a step that fails if one does not.
+
+# Installer plumbing that shellcheck structurally cannot see. No root, no
+# hardware, no network - safe to run anywhere.
+./tests/script-smoke.sh
 
 # Compile src/facetimehd against every headers tree present
 ./tests/build-driver.sh
@@ -53,6 +59,17 @@ sudo ./tests/hw-validate.sh --reboot          # reboots; re-run after to read th
 ./scripts/extract-firmware.sh --no-install
 sudo ./scripts/extract-firmware.sh [--dest DIR] [-x DRIVER_FILE] [-i]
 
+# Are Apple's downloads still there and still what the checksum tables expect?
+# Installs nothing, needs no root. This is what the weekly CI watchdog runs.
+./scripts/extract-firmware.sh --check-sources
+
+# Distribution packages (both write to packaging/out/)
+./packaging/build-deb.sh
+./packaging/build-rpm.sh
+
+# One-file bug report, redacting the DMI serial and UUID
+./scripts/collect-diagnostics.sh
+
 # Sensor calibration (.dat) files - a separate Apple download, needs unar
 sudo ./scripts/extract-firmware.sh --calibration-only
 sudo ./scripts/extract-firmware.sh --calibration-only --sys /path/AppleCamera.sys
@@ -62,6 +79,9 @@ sudo ./setup.sh [-y]
 
 # Install / uninstall (require root)
 sudo ./scripts/install.sh [-y|--force|--skip-firmware|--skip-hw-check]
+sudo ./scripts/install.sh --enroll-mok          # Secure Boot signing key
+sudo ./scripts/install.sh --runtime-pm off      # persist facetimehd.runtime_pm=0
+./scripts/install.sh --status                   # what is installed; needs no root
 sudo ./scripts/uninstall.sh [--keep-tuning]
 
 # Make sure mbpfan is installed and running (requires root)
@@ -69,7 +89,9 @@ sudo ./scripts/uninstall.sh [--keep-tuning]
 sudo ./scripts/macbook-tune.sh [--revert|--skip-fan]
 ```
 
-CI ([.github/workflows/ci.yml](.github/workflows/ci.yml)) runs shellcheck, an executable-bit check on `setup.sh`, `scripts/*.sh` and `tests/*.sh`, the driver build across Ubuntu 22.04/24.04/26.04 + Fedora 44 + AlmaLinux 10, and strict Clang and Sparse analysis — on every push and weekly on a schedule. The weekly run is the point: it catches kernel breakage with nobody touching the repo.
+CI ([.github/workflows/ci.yml](.github/workflows/ci.yml)) runs shellcheck, an executable-bit check on `setup.sh`, `scripts/*.sh`, `tests/*.sh` and `packaging/*.sh`, the script smoke test, both package builds, the Apple-download watchdog, the driver build across Ubuntu 22.04/24.04/26.04 + Fedora 44 + AlmaLinux 10, and strict Clang and Sparse analysis — on every push and weekly on a schedule. The weekly run is the point: it catches breakage with nobody touching the repo.
+
+**There are two ways this project breaks without anyone touching it, and each has a watchdog.** The build matrix catches a new kernel dropping an API the driver uses. The `apple-sources` job catches the other half: the firmware and calibration both come from Apple-hosted URLs with SHA-256 tables in `extract-firmware.sh`, and if Apple retires or republishes either, every new install breaks and the first anyone would otherwise know is a bug report. It downloads ~4 MB, verifies it, and writes nothing — no Apple content is stored, so it is a checksum comparison rather than a redistribution. It is skipped on pull requests, because a fork's CI has no business hammering Apple's CDN and a failure there is never caused by the diff under review.
 
 Fedora is in the matrix because it carries the newest kernel of anything tested, so kernel API churn lands there first. AlmaLinux 10 is there for the opposite reason: an Enterprise Linux kernel sits on 6.12 for a decade while Red Hat backports into it, so it catches code that assumes an API newer than the oldest supported kernel — and it catches version checks that an EL backport has quietly falsified. Both RPM jobs pass `KDIR=/usr/src/kernels/<ver>` to `build-driver.sh`, because `kernel-devel` unpacks there and a container has no `/lib/modules/<ver>/build` symlink to follow.
 
@@ -114,7 +136,15 @@ every failure here as a warning.
 
 **EPEL, on Enterprise Linux**: `is_enterprise_linux`/`el_major_version`/`dnf_repo_enabled`/`enable_crb`/`ensure_epel` in `common.sh`. Red Hat ships no DKMS, so `install.sh` (dkms) and `macbook-tune.sh` (mbpfan) both need EPEL turned on; `ensure_epel` is the one place that knows how. It is the deliberate exception to "the package layer abstracts verbs, not names" — "enable EPEL" *is* a verb, `epel-release` is spelled the same on every rebuild, and splitting it would put the same three-repository dance in two files. Everything about it is best-effort and advisory: a failure warns and continues, because the `pkg_install` that follows is what actually discovers a missing package and it names the package, which is more useful than anything guessed earlier. `is_enterprise_linux` must exclude Fedora by `ID` *first*, since AlmaLinux sets `ID_LIKE="rhel centos fedora"` and would otherwise match on the `fedora` arm.
 
+**Secure Boot is opt-in, not automatic** ([scripts/install.sh](scripts/install.sh), section 2b). Under Secure Boot an unsigned module builds perfectly and then refuses to load, which reads as "the installer worked and the camera is broken" — so the installer detects it and, with `--enroll-mok`, generates a Machine Owner Key, records it in `/etc/dkms/framework.conf` and hands it to `mokutil`. It cannot be automatic: `mokutil --import` needs a password typed at a prompt and the enrolment is only completed by a human at MokManager on the next boot. The key paths are read from `framework.conf` when set and otherwise default to each family's own (`/var/lib/shim-signed/mok/MOK.*` on Debian, `/var/lib/dkms/mok.*` elsewhere), so this never creates a second key competing with the distribution's. It runs *before* the DKMS build, because DKMS signs at build time.
+
+**`--status` is the diagnostic entry point.** It reports hardware, DKMS, module, firmware, calibration, Secure Boot, device node and runtime-PM state, with a `fix:` line for each failure, and needs no root — so it is dispatched before `require_root`. Anything it cannot read as a normal user is reported as unknown rather than as a failure. `scripts/collect-diagnostics.sh` is its long form: one file to attach to an issue, with the DMI serial and UUID redacted. The redaction is deliberately narrow — a filter aggressive enough to catch anything serial-shaped would eat PCI IDs and kernel versions, which are the point of the report.
+
+**Packaging is a second front door, not a replacement** ([packaging/](packaging/)). `build-deb.sh` (dpkg-deb from a staging tree, no debhelper) and `build-rpm.sh` + `facetimehd-dkms.spec.in` produce a `facetimehd-dkms` package that installs the driver source and registers it with DKMS. They deliberately do not fetch the firmware: a post-install script that reaches the network breaks offline installs and image builds, and the firmware is Apple's and unredistributable either way — so the packages ship `facetimehd-firmware-install`, a wrapper the user runs once, and the post-install script says so loudly. Nor do they touch Secure Boot, which needs a console and a reboot. The package version is `PACKAGE_VERSION` with **no** source fingerprint appended, unlike `install.sh`: the fingerprint exists so a rebuild from an edited working tree cannot reuse a version, and a package is a fixed artefact whose version is already in its filename.
+
 **Fan support is deliberately its own script** ([scripts/macbook-tune.sh](scripts/macbook-tune.sh)), not part of `install.sh`. `mbpfan` is not coupled to the camera — the camera works without it, and it works on a Mac with no camera driver — so the camera installer does not change unrelated system behaviour by default; it only points at the script. The script installs and enables `mbpfan`; it does not configure it, because its own fan curve is reasonable for this hardware. State (whether it enabled `mbpfan.service` itself) lives under `/var/lib/facetimehd/`, so `--revert` only disables the service if this script was the one that turned it on. `uninstall.sh` delegates that to `macbook-tune.sh --revert` rather than reimplementing it. `hid_apple` needs nothing at all: it ships in the kernel and loads itself.
+
+**The runtime-PM drop-in is the one modprobe file this project writes, and only on request.** `install.sh --runtime-pm off` writes `/etc/modprobe.d/facetimehd-runtime-pm.conf` with `options facetimehd runtime_pm=0`; `--runtime-pm on` removes it, and `uninstall.sh` removes it too (it names a module that is going away, so leaving it would apply it to a future reinstall that never asked). This does not contradict "no power management by default" below: the driver's escape hatch already existed, and all this does is stop the user having to re-add a kernel parameter by hand after every reboot. Nothing writes it unprompted.
 
 **Power management is not this project's job.** The driver implements its own runtime PM (see [src/facetimehd/DOWNSTREAM.md](src/facetimehd/DOWNSTREAM.md), "Power management and lifecycle"): real `dev_pm_ops`, a `runtime_pm` module parameter that defaults on, with `facetimehd.runtime_pm=0` as the escape hatch. Every supported distribution already ships a power daemon that never touches PCI runtime PM, USB autosuspend or PCIe ASPM (`power-profiles-daemon` on Ubuntu, TuneD on Fedora), so there is nothing left for this project to configure.
 
@@ -143,6 +173,10 @@ is folded into this section instead; read it before "fixing" any of these:
 - **`install.sh` splits its dependencies into required and best-effort, and the split is not arbitrary.** A compiler, make, dkms, kmod, cpio, curl, gzip, xz, `diffutils` and `elfutils-libelf-devel` are what build and install the driver: failing to get one is fatal. `pciutils`, `v4l-utils` and `unar` are not — they power the hardware check, the closing verification advice and the sensor calibration respectively. Losing one of those costs a diagnostic or the camera's colours, never a working camera, so refusing to install over it would be wrong. This narrows the older "`unar` is required, not optional" rule rather than reversing it: `unar` is still installed wherever it exists, and the calibration step still runs on every install that has it. It is only *available* that changed, because `unar` comes from EPEL on Enterprise Linux and EPEL does not rebuild every Fedora package for every EL release.
 - **`curl` is only named as an RPM dependency when `/usr/bin/curl` is actually missing.** The RPM families' default installs carry `curl-minimal`, which already provides the binary, and `dnf install curl` *conflicts* with it rather than upgrading it. Listing `curl` unconditionally therefore breaks the entire dependency step on a stock AlmaLinux or Fedora system — a whole-install failure caused by a package that was already there.
 - **EPEL is enabled on the way in and left alone on the way out.** `uninstall.sh` does not remove it: by then other packages may depend on it, and tearing out a system-wide repository is a far more surprising thing for a camera uninstaller to do than leaving one enabled.
+- **Frame rates are produced by dropping frames, not by asking the firmware.** The ISP has an AE frame-rate window and `fthd_start_channel()` already programs it, but its units are undocumented and the sensor keeps delivering 30 fps regardless. Reporting a rate the hardware does not deliver is precisely the bug that stalled `pipewiresrc`, so the driver decimates frames it has already received and reports exactly what it passes on. Do not "optimise" this into a firmware call without hardware proving the firmware honours one.
+- **A decimated buffer cannot be resubmitted inline.** `fthd_buffer_return_handler()` runs inside `fthd_irq_work()`, and `fthd_send_h2t_buffer()` waits on the channel whose completions that same work item processes — so it goes through `dev_priv->requeue_work`, which the stop and suspend paths `cancel_work_sync()` after clearing `channel_running` and before reclaiming buffers.
+- **Noise reduction and chroma suppression are private CIDs on purpose.** V4L2 has no standard control for either. `V4L2_CID_IMAGE_STABILIZATION` is the tempting place to put denoising and would be wrong — an application asking for stabilisation would silently get something else. A private control with an honest name beats a standard one with an invented meaning.
+- **The hwmon temperature refuses to guess a scale.** `temp1_input` is millidegrees celsius by definition, and the firmware's scale is undocumented, so the driver publishes a reading only when the raw value can only sensibly be celsius and returns `-EIO` otherwise. The unfiltered number is always in `debugfs/.../sensor_temperature_raw`. Do not "fix" the `-EIO` by picking a multiplier.
 - **The kernel build tree is tested with `-d /lib/modules/<kver>/build`, not `-e` or `-L`.** On Fedora that path is a symlink shipped by `kernel-modules-core` pointing into `/usr/src/kernels/<kver>`, which only exists once `kernel-devel` is installed. The normal "headers missing" state there is a *dangling* symlink, so only a test that resolves it is correct.
 
 ## Conventions

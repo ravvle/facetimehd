@@ -31,9 +31,30 @@
 #define FTHD_NUM_FORMATS 3
 #define FTHD_PROTOCOL_ERROR_LIMIT 4
 
-/* The only rate the sensor delivers.  G_PARM, S_PARM and ENUM_FRAMEINTERVALS
- * must all report this same value or they contradict each other. */
+/* The only rate the sensor delivers.  Everything the driver reports is derived
+ * from it, so G_PARM, S_PARM and ENUM_FRAMEINTERVALS cannot contradict each
+ * other. */
 #define FTHD_FPS 30
+
+/*
+ * Slower capture rates are produced by delivering one sensor frame in N and
+ * handing the rest straight back to the ISP, so the rate the application asks
+ * for is the rate it gets, exactly.
+ *
+ * The firmware route was considered and deliberately not taken.  There is an AE
+ * frame-rate window (CISP_CMD_CH_AE_FRAME_RATE_{MIN,MAX}_SET), which
+ * fthd_start_channel() already programs, but it is the exposure loop's rate
+ * window rather than a sensor mode, its units are undocumented, and the sensor
+ * demonstrably keeps delivering 30 fps with it set to the value used there.  A
+ * rate that the driver reports but the hardware does not deliver is the exact
+ * failure that made GStreamer's pipewiresrc compute negative frame durations
+ * and stall - see the G_PARM comment below.  Dropping frames cannot desync that
+ * way: the divisor is applied to frames the driver has already received.
+ *
+ * The cost is honest and bounded: the ISP still runs at full rate, so this
+ * saves bus and CPU work in the application, not power in the camera.
+ */
+#define FTHD_MAX_FPS_DIVISOR FTHD_FPS
 
 static int fthd_buffer_queue_setup(
     struct vb2_queue *vq,
@@ -334,6 +355,7 @@ void fthd_buffer_return_handler(struct fthd_private *dev_priv, u32 offset,
 	struct vb2_buffer *vb = NULL;
 	struct vb2_v4l2_buffer *vbuf;
 	enum fthd_buffer_state invalid_state = BUF_FREE;
+	bool deliver = true;
 	unsigned long flags;
 	int i;
 
@@ -400,8 +422,23 @@ void fthd_buffer_return_handler(struct fthd_private *dev_priv, u32 offset,
 	if ((ctx->state == BUF_HW_QUEUED || ctx->state == BUF_DRV_QUEUED) &&
 	    ctx->vb) {
 		vb = ctx->vb;
-		ctx->state = BUF_ALLOC;
 		dev_priv->protocol_errors = 0;
+
+		/* Frame-rate division: deliver the first frame of every group of
+		 * @fps_divisor and give the rest straight back.  The phase is
+		 * only ever touched here and at STREAMON, both under this lock. */
+		if (dev_priv->fps_divisor > 1) {
+			deliver = dev_priv->frame_phase == 0;
+			if (++dev_priv->frame_phase >= dev_priv->fps_divisor)
+				dev_priv->frame_phase = 0;
+		}
+
+		if (deliver) {
+			ctx->state = BUF_ALLOC;
+		} else {
+			ctx->state = BUF_DRV_QUEUED;
+			ctx->requeue = true;
+		}
 	} else
 		invalid_state = ctx->state;
 
@@ -414,11 +451,73 @@ void fthd_buffer_return_handler(struct fthd_private *dev_priv, u32 offset,
 		return;
 	}
 
+	if (!deliver) {
+		/* Decimated away.  The buffer never becomes visible to
+		 * userspace: it stays owned by the driver and goes back to the
+		 * ISP from the requeue worker.  The send cannot happen here -
+		 * this runs inside fthd_irq_work(), and fthd_send_h2t_buffer()
+		 * waits on the very channel whose completions that same work
+		 * item is what processes. */
+		schedule_work(&dev_priv->requeue_work);
+		return;
+	}
+
 	vbuf = to_vb2_v4l2_buffer(vb);
 	vbuf->sequence = dev_priv->sequence++;
 	vbuf->vb2_buf.timestamp = ktime_get_ns();
 	vbuf->field = V4L2_FIELD_NONE;
 	vb2_buffer_done(vb, VB2_BUF_STATE_DONE);
+}
+
+/*
+ * Hand back the frames fthd_buffer_return_handler() decided not to deliver.
+ *
+ * Runs in its own work item purely for context: the return handler cannot send
+ * to the h2t channel itself without deadlocking against the IRQ work it runs
+ * inside.  Everything else mirrors the streaming branch of fthd_buffer_queue().
+ */
+static void fthd_requeue_work(struct work_struct *work)
+{
+	struct fthd_private *dev_priv =
+		container_of(work, struct fthd_private, requeue_work);
+	unsigned long flags;
+	int i;
+
+	for (i = 0; i < FTHD_BUFFERS; i++) {
+		struct h2t_buf_ctx *ctx = &dev_priv->h2t_bufs[i];
+		bool send = false;
+
+		spin_lock_irqsave(&dev_priv->buffer_lock, flags);
+		/* channel_running going false means stop_streaming() or a
+		 * suspend is taking the buffers back; leaving this one
+		 * BUF_DRV_QUEUED is what lets fthd_return_all_buffers() find
+		 * it. */
+		if (ctx->requeue && ctx->state == BUF_DRV_QUEUED && ctx->vb &&
+		    dev_priv->channel_running) {
+			ctx->requeue = false;
+			ctx->dma_desc_list.field0 = 1;
+			ctx->state = BUF_HW_QUEUED;
+			send = true;
+		}
+		spin_unlock_irqrestore(&dev_priv->buffer_lock, flags);
+
+		if (!send)
+			continue;
+
+		if (fthd_send_h2t_buffer(dev_priv, ctx)) {
+			fthd_mark_firmware_wedged(dev_priv);
+			spin_lock_irqsave(&dev_priv->buffer_lock, flags);
+			if (ctx->state == BUF_HW_QUEUED) {
+				struct vb2_buffer *vb = ctx->vb;
+
+				ctx->state = BUF_ALLOC;
+				spin_unlock_irqrestore(&dev_priv->buffer_lock, flags);
+				vb2_buffer_done(vb, VB2_BUF_STATE_ERROR);
+				continue;
+			}
+			spin_unlock_irqrestore(&dev_priv->buffer_lock, flags);
+		}
+	}
 }
 
 static void fthd_return_all_buffers(struct fthd_private *dev_priv,
@@ -437,6 +536,7 @@ static void fthd_return_all_buffers(struct fthd_private *dev_priv,
 		     ctx->state == BUF_HW_QUEUED) && ctx->vb) {
 			buffers[count++] = ctx->vb;
 			ctx->state = BUF_ALLOC;
+			ctx->requeue = false;
 		}
 	}
 	spin_unlock_irqrestore(&dev_priv->buffer_lock, flags);
@@ -535,6 +635,9 @@ static int fthd_start_streaming(struct vb2_queue *vq, unsigned int count)
 
 	pr_debug("count = %d\n", count);
 	dev_priv->sequence = 0;
+	/* A new stream starts on a group boundary, so its first frame is always
+	 * delivered whatever rate was selected. */
+	dev_priv->frame_phase = 0;
 
 	return fthd_stream_start(dev_priv, true);
 }
@@ -556,6 +659,12 @@ static void fthd_stop_streaming(struct vb2_queue *vq)
 			dev_warn(&dev_priv->pdev->dev,
 				 "failed to stop firmware channel: %d\n", ret);
 	}
+
+	/* Must happen after channel_running is cleared and before the buffers
+	 * are returned: a requeue worker that got past its state check would
+	 * otherwise hand vb2's buffer back to the ISP just as vb2 reclaims it.
+	 * The worker takes no lock this path holds. */
+	cancel_work_sync(&dev_priv->requeue_work);
 
 	/* stop_streaming must return every buffer owned by the driver.  Never
 	 * wait without a timeout for firmware that has already failed a command. */
@@ -603,6 +712,11 @@ void fthd_v4l2_suspend_stop(struct fthd_private *dev_priv, bool park)
 			dev_warn(&dev_priv->pdev->dev,
 				 "failed to stop firmware channel for suspend\n");
 	}
+
+	/* Same reason as in fthd_stop_streaming(): no decimated buffer may be
+	 * sent to an ISP that is about to lose power, and none may still be in
+	 * flight when the loop below detaches every slot. */
+	cancel_work_sync(&dev_priv->requeue_work);
 
 	dev_priv->parked_count = 0;
 	dev_priv->parked_streaming = false;
@@ -1004,6 +1118,12 @@ static int fthd_v4l2_ioctl_s_fmt_vid_cap(struct file *filp, void *priv,
 		break;
 	}
 
+	/* The crop may no longer be large enough for the new output size, and
+	 * the ISP must never be asked to upscale.  Growing it here is the
+	 * adjustment V4L2 allows a driver to make; the alternative, refusing the
+	 * format, would make S_FMT depend on the order the two were set in. */
+	fthd_v4l2_refresh_crop(dev_priv);
+
 	return 0;
 }
 
@@ -1011,13 +1131,17 @@ static int fthd_v4l2_ioctl_s_fmt_vid_cap(struct file *filp, void *priv,
 static int fthd_v4l2_ioctl_g_parm(struct file *filp, void *priv,
 		struct v4l2_streamparm *parm)
 {
-	/* Report a consistent 30 fps, matching what the sensor actually delivers
-	 * and what enum_frameintervals advertises. The old frametime/1000 value
-	 * (25 fps) disagreed with the real 30 fps rate, which made GStreamer's
-	 * pipewiresrc compute negative frame durations and stall after one frame
-	 * (e.g. GNOME Snapshot froze, while ffplay/v4l2-ctl were unaffected). */
+	struct fthd_private *dev_priv = video_drvdata(filp);
+
+	/* Always the rate actually delivered: the sensor's fixed FTHD_FPS
+	 * divided by the decimation in force.  Reporting anything else is what
+	 * made GStreamer's pipewiresrc compute negative frame durations and
+	 * stall after one frame (e.g. GNOME Snapshot froze, while ffplay and
+	 * v4l2-ctl were unaffected) back when this returned a 25 fps constant
+	 * against a 30 fps stream.  Expressed as divisor/FTHD_FPS so that rates
+	 * like 7.5 fps stay exact rather than rounding into that same trap. */
 	struct v4l2_fract timeperframe = {
-		.numerator = 1,
+		.numerator = dev_priv->fps_divisor,
 		.denominator = FTHD_FPS,
 	};
 
@@ -1033,13 +1157,40 @@ static int fthd_v4l2_ioctl_g_parm(struct file *filp, void *priv,
 static int fthd_v4l2_ioctl_s_parm(struct file *filp, void *priv,
 		struct v4l2_streamparm *parm)
 {
+	struct fthd_private *dev_priv = video_drvdata(filp);
+	struct v4l2_fract *tpf = &parm->parm.capture.timeperframe;
+	unsigned int divisor;
+	unsigned long flags;
+
 	if (parm->type != V4L2_BUF_TYPE_VIDEO_CAPTURE)
 		return -EINVAL;
 
-	/* The sensor runs at one rate, so there is nothing to select: report
-	 * back what will actually be delivered.  Storing the requested interval
-	 * in dev_priv->frametime, as this used to, made S_PARM disagree with
-	 * the G_PARM immediately following it. */
+	/* V4L2 spec: either field zero asks for the default rate. */
+	if (!tpf->numerator || !tpf->denominator) {
+		divisor = 1;
+	} else {
+		/* Round the requested interval to the nearest whole number of
+		 * sensor frames.  64-bit because a caller may legitimately pass
+		 * a large numerator to express a very slow rate. */
+		u64 frames = (u64)tpf->numerator * FTHD_FPS +
+			     tpf->denominator / 2;
+
+		do_div(frames, tpf->denominator);
+		if (frames < 1)
+			frames = 1;
+		if (frames > FTHD_MAX_FPS_DIVISOR)
+			frames = FTHD_MAX_FPS_DIVISOR;
+		divisor = frames;
+	}
+
+	/* Read by the buffer-return handler, which holds only this lock. */
+	spin_lock_irqsave(&dev_priv->buffer_lock, flags);
+	dev_priv->fps_divisor = divisor;
+	dev_priv->frame_phase = 0;
+	spin_unlock_irqrestore(&dev_priv->buffer_lock, flags);
+
+	/* Report back what was actually selected, which is what distinguishes
+	 * an accepted rate from a silently ignored one. */
 	return fthd_v4l2_ioctl_g_parm(filp, priv, parm);
 }
 
@@ -1092,21 +1243,118 @@ static int fthd_v4l2_ioctl_enum_frameintervals(struct file *filp, void *priv,
 	    || interval->height > max_h)
 		return -EINVAL;
 
-	interval->type = V4L2_FRMIVAL_TYPE_DISCRETE;
-	interval->discrete.numerator = 1;
-	interval->discrete.denominator = FTHD_FPS;
+	/* Stepwise, because the rates the driver can deliver are exactly the
+	 * sensor rate divided by a whole number of frames: k/FTHD_FPS for k in
+	 * 1..FTHD_MAX_FPS_DIVISOR.  A discrete list would either omit rates
+	 * S_PARM accepts or advertise ones it cannot hit exactly. */
+	interval->type = V4L2_FRMIVAL_TYPE_STEPWISE;
+	interval->stepwise.min.numerator = 1;
+	interval->stepwise.min.denominator = FTHD_FPS;
+	interval->stepwise.max.numerator = FTHD_MAX_FPS_DIVISOR;
+	interval->stepwise.max.denominator = FTHD_FPS;
+	interval->stepwise.step.numerator = 1;
+	interval->stepwise.step.denominator = FTHD_FPS;
 
 	return 0;
 }
 
 /*
- * The ISP crops the full sensor array and scales the result to the negotiated
- * format (see fthd_start_channel()), so the crop rectangle is fixed at the
- * sensor's native size and there is nothing for S_SELECTION to select.  It is
- * still worth reporting: without G_SELECTION an application cannot learn the
- * sensor's real dimensions or pixel aspect, and v4l2-compliance flags a
- * capture device that answers neither G_SELECTION nor the legacy CROPCAP.
+ * The ISP crops a rectangle of the sensor array and scales it to the negotiated
+ * format (see fthd_start_channel()).  Making that rectangle settable is digital
+ * zoom and pan: the same output size taken from a smaller part of the array.
+ *
+ * Two rules keep it from asking the hardware for something it may not do.  The
+ * crop is never smaller than the current output size, so the scaler is only
+ * ever asked to shrink - upscaling is a separate capability that nothing here
+ * can confirm the ISP has.  And the crop is only settable while the channel is
+ * down, because the rectangle is programmed once during the channel-start
+ * sequence and there is no evidence the firmware accepts a new one mid-stream.
  */
+static void fthd_v4l2_default_crop(struct fthd_private *dev_priv,
+				   struct v4l2_rect *r)
+{
+	r->left = 0;
+	r->top = 0;
+	r->width  = dev_priv->sensor_width  ? : FTHD_MAX_WIDTH;
+	r->height = dev_priv->sensor_height ? : FTHD_MAX_HEIGHT;
+}
+
+static void fthd_v4l2_get_crop(struct fthd_private *dev_priv,
+			       struct v4l2_rect *r)
+{
+	r->left   = dev_priv->fmt.x1;
+	r->top    = dev_priv->fmt.y1;
+	r->width  = dev_priv->fmt.x2 - dev_priv->fmt.x1;
+	r->height = dev_priv->fmt.y2 - dev_priv->fmt.y1;
+}
+
+/*
+ * Fit @r inside the sensor array, keeping it at least as large as the output
+ * format, and store it.  Shared by S_SELECTION and by the sensor-geometry
+ * fixups, so a crop can never survive into a state the ISP would reject: the
+ * sensor's real size is only learned at channel start, and on the 12-inch
+ * MacBook (848x588) it is smaller than the fallback this starts out with.
+ */
+static void fthd_v4l2_set_crop(struct fthd_private *dev_priv,
+			       struct v4l2_rect *r)
+{
+	unsigned int max_w = dev_priv->sensor_width  ? : FTHD_MAX_WIDTH;
+	unsigned int max_h = dev_priv->sensor_height ? : FTHD_MAX_HEIGHT;
+	unsigned int min_w = max(FTHD_MIN_WIDTH, dev_priv->fmt.fmt.width);
+	unsigned int min_h = max(FTHD_MIN_HEIGHT, dev_priv->fmt.fmt.height);
+
+	/* The output can never exceed the array, so neither can the floor. */
+	min_w = min(min_w, max_w);
+	min_h = min(min_h, max_h);
+
+	r->width  = clamp_t(unsigned int, r->width,  min_w, max_w);
+	r->height = clamp_t(unsigned int, r->height, min_h, max_h);
+
+	/* Same eight-pixel width alignment the output format uses; the sensor
+	 * interface is fed in the same units either way. */
+	r->width = ALIGN(r->width, 8);
+	if (r->width > max_w)
+		r->width = round_down(max_w, 8);
+
+	/* left and top are signed in struct v4l2_rect and userspace may pass a
+	 * negative one.  Clamped before the unsigned clamps below, which would
+	 * otherwise turn -1 into a very large offset and push the rectangle to
+	 * the far edge instead of to the origin. */
+	if (r->left < 0)
+		r->left = 0;
+	if (r->top < 0)
+		r->top = 0;
+
+	r->left = clamp_t(unsigned int, r->left, 0, max_w - r->width);
+	r->top  = clamp_t(unsigned int, r->top,  0, max_h - r->height);
+	r->left = ALIGN(r->left, 8);
+	if (r->left + r->width > max_w)
+		r->left = round_down(max_w - r->width, 8);
+
+	dev_priv->fmt.x1 = r->left;
+	dev_priv->fmt.y1 = r->top;
+	dev_priv->fmt.x2 = r->left + r->width;
+	dev_priv->fmt.y2 = r->top + r->height;
+}
+
+/*
+ * Re-fit the stored crop after something it depends on changed - a new output
+ * format, or the sensor geometry becoming known for the first time.  Called
+ * from fthd_start_channel() before the rectangle is handed to the firmware.
+ */
+void fthd_v4l2_refresh_crop(struct fthd_private *dev_priv)
+{
+	struct v4l2_rect r;
+
+	if (dev_priv->fmt.x2 <= dev_priv->fmt.x1 ||
+	    dev_priv->fmt.y2 <= dev_priv->fmt.y1)
+		fthd_v4l2_default_crop(dev_priv, &r);
+	else
+		fthd_v4l2_get_crop(dev_priv, &r);
+
+	fthd_v4l2_set_crop(dev_priv, &r);
+}
+
 static int fthd_v4l2_ioctl_g_selection(struct file *filp, void *priv,
 		struct v4l2_selection *sel)
 {
@@ -1117,16 +1365,43 @@ static int fthd_v4l2_ioctl_g_selection(struct file *filp, void *priv,
 
 	switch (sel->target) {
 	case V4L2_SEL_TGT_CROP:
+		fthd_v4l2_get_crop(dev_priv, &sel->r);
+		return 0;
 	case V4L2_SEL_TGT_CROP_DEFAULT:
 	case V4L2_SEL_TGT_CROP_BOUNDS:
-		sel->r.left = 0;
-		sel->r.top = 0;
-		sel->r.width  = dev_priv->sensor_width  ? : FTHD_MAX_WIDTH;
-		sel->r.height = dev_priv->sensor_height ? : FTHD_MAX_HEIGHT;
+		fthd_v4l2_default_crop(dev_priv, &sel->r);
 		return 0;
 	default:
 		return -EINVAL;
 	}
+}
+
+static int fthd_v4l2_ioctl_s_selection(struct file *filp, void *priv,
+		struct v4l2_selection *sel)
+{
+	struct fthd_private *dev_priv = video_drvdata(filp);
+
+	if (sel->type != V4L2_BUF_TYPE_VIDEO_CAPTURE)
+		return -EINVAL;
+
+	if (sel->target != V4L2_SEL_TGT_CROP)
+		return -EINVAL;
+
+	/* The rectangle only reaches the firmware in the channel-start sequence,
+	 * so accepting one now would silently do nothing until the next
+	 * STREAMON.  Same reasoning as S_FMT refusing while buffers exist. */
+	if (vb2_is_busy(&dev_priv->vb2_queue))
+		return -EBUSY;
+
+	/* V4L2_SEL_FLAG_GE/_LE ask for a rectangle no smaller/larger than the
+	 * one given.  This driver rounds in both directions, so it cannot honour
+	 * either promise and must say so rather than return a rectangle that
+	 * breaks it. */
+	if (sel->flags & (V4L2_SEL_FLAG_GE | V4L2_SEL_FLAG_LE))
+		return -ERANGE;
+
+	fthd_v4l2_set_crop(dev_priv, &sel->r);
+	return 0;
 }
 
 static int fthd_v4l2_ioctl_subscribe_event(struct v4l2_fh *fh,
@@ -1178,6 +1453,7 @@ static const struct v4l2_ioctl_ops fthd_ioctl_ops = {
 	.vidioc_enum_frameintervals = fthd_v4l2_ioctl_enum_frameintervals,
 
 	.vidioc_g_selection     = fthd_v4l2_ioctl_g_selection,
+	.vidioc_s_selection     = fthd_v4l2_ioctl_s_selection,
 
 	.vidioc_subscribe_event	= fthd_v4l2_ioctl_subscribe_event,
 	.vidioc_unsubscribe_event = v4l2_event_unsubscribe,
@@ -1202,6 +1478,11 @@ enum {
 	FTHD_WB_TEMPERATURE,
 	FTHD_WB_NUM,
 };
+
+/* Driver-private control IDs; see the fthd_ctrl_config definitions below for
+ * why these two are not mapped onto standard CIDs. */
+#define FTHD_CID_NOISE_REDUCTION    (V4L2_CID_USER_BASE | 0x1001)
+#define FTHD_CID_CHROMA_SUPPRESSION (V4L2_CID_USER_BASE | 0x1002)
 
 /* Exposure compensation offered as +/-2 EV in thirds, in milli-EV. */
 static const s64 fthd_exposure_bias_menu[] = {
@@ -1333,6 +1614,19 @@ static int fthd_s_ctrl(struct v4l2_ctrl *ctrl)
 	case V4L2_CID_TEST_PATTERN:
 		ret = fthd_isp_cmd_channel_test_pattern_config(dev_priv, 0, ctrl->val);
 		break;
+	case V4L2_CID_BACKLIGHT_COMPENSATION:
+		/* Dynamic range compression: fthd_start_channel() turns the DRC
+		 * block on unconditionally, and this is how hard it pulls the
+		 * shadows up.  That is what backlight compensation means on a
+		 * camera with no backlight-specific hardware of its own. */
+		ret = fthd_isp_cmd_channel_drc_strength_set(dev_priv, 0, ctrl->val);
+		break;
+	case FTHD_CID_NOISE_REDUCTION:
+		ret = fthd_isp_cmd_channel_noise_reduction_set(dev_priv, 0, ctrl->val);
+		break;
+	case FTHD_CID_CHROMA_SUPPRESSION:
+		ret = fthd_isp_cmd_channel_chroma_suppression_set(dev_priv, 0, ctrl->val);
+		break;
 	default:
 		return -EINVAL;
 	}
@@ -1351,6 +1645,37 @@ static const struct v4l2_ctrl_ops fthd_ctrl_ops = {
 	.s_ctrl = fthd_s_ctrl,
 };
 
+/*
+ * Both noise-reduction blocks are driver-private controls because V4L2 has no
+ * standard CID for either.  Inventing a meaning for a standard control that
+ * does not have one - V4L2_CID_IMAGE_STABILIZATION was the tempting mistake
+ * here - would make an application asking for stabilisation silently get
+ * denoising instead, so they take user-base IDs and say what they are in their
+ * names.  Defaults are mid-scale, which is the same convention the ISP's other
+ * 0..255 knobs use and leaves out-of-the-box behaviour to the firmware.
+ */
+static const struct v4l2_ctrl_config fthd_ctrl_noise_reduction = {
+	.ops  = &fthd_ctrl_ops,
+	.id   = FTHD_CID_NOISE_REDUCTION,
+	.name = "Noise Reduction",
+	.type = V4L2_CTRL_TYPE_INTEGER,
+	.min  = 0,
+	.max  = 0xff,
+	.step = 1,
+	.def  = 0x80,
+};
+
+static const struct v4l2_ctrl_config fthd_ctrl_chroma_suppression = {
+	.ops  = &fthd_ctrl_ops,
+	.id   = FTHD_CID_CHROMA_SUPPRESSION,
+	.name = "Chroma Noise Suppression",
+	.type = V4L2_CTRL_TYPE_INTEGER,
+	.min  = 0,
+	.max  = 0xff,
+	.step = 1,
+	.def  = 0x80,
+};
+
 static void fthd_video_device_release(struct video_device *vdev)
 {
 	struct fthd_private *dev_priv = video_get_drvdata(vdev);
@@ -1367,6 +1692,14 @@ int fthd_v4l2_register(struct fthd_private *dev_priv)
 	struct video_device *vdev;
 	struct vb2_queue *q;
 	int ret;
+
+	/* Before anything that can fail: the teardown and suspend paths call
+	 * cancel_work_sync() on this unconditionally. */
+	INIT_WORK(&dev_priv->requeue_work, fthd_requeue_work);
+
+	/* Full rate until S_PARM asks for less. */
+	dev_priv->fps_divisor = 1;
+	dev_priv->frame_phase = 0;
 
 	ret = v4l2_device_register(&dev_priv->pdev->dev, v4l2_dev);
 	if (ret) {
@@ -1407,7 +1740,7 @@ int fthd_v4l2_register(struct fthd_private *dev_priv)
 	if (ret)
 		goto fail_vdev_alloc;
 
-	v4l2_ctrl_handler_init(&dev_priv->v4l2_ctrl_handler, 14);
+	v4l2_ctrl_handler_init(&dev_priv->v4l2_ctrl_handler, 17);
 	v4l2_ctrl_new_std(&dev_priv->v4l2_ctrl_handler, &fthd_ctrl_ops,
 			  V4L2_CID_BRIGHTNESS, 0, 0xff, 1, 0x80);
 	v4l2_ctrl_new_std(&dev_priv->v4l2_ctrl_handler, &fthd_ctrl_ops,
@@ -1440,6 +1773,14 @@ int fthd_v4l2_register(struct fthd_private *dev_priv)
 				     V4L2_CID_TEST_PATTERN,
 				     ARRAY_SIZE(fthd_test_pattern_menu) - 1, 0, 0,
 				     fthd_test_pattern_menu);
+	/* DRC strength.  The block is already started by fthd_start_channel();
+	 * this is how hard it works. */
+	v4l2_ctrl_new_std(&dev_priv->v4l2_ctrl_handler, &fthd_ctrl_ops,
+			  V4L2_CID_BACKLIGHT_COMPENSATION, 0, 0xff, 1, 0x80);
+	v4l2_ctrl_new_custom(&dev_priv->v4l2_ctrl_handler,
+			     &fthd_ctrl_noise_reduction, NULL);
+	v4l2_ctrl_new_custom(&dev_priv->v4l2_ctrl_handler,
+			     &fthd_ctrl_chroma_suppression, NULL);
 
 	/* SHUTTER_PRIORITY and APERTURE_PRIORITY are not offered: this sensor
 	 * has neither a controllable shutter nor an aperture, only AE
@@ -1500,6 +1841,10 @@ int fthd_v4l2_register(struct fthd_private *dev_priv)
 	dev_priv->fmt.fmt.pixelformat = V4L2_PIX_FMT_YUYV;
 	dev_priv->fmt.planes = 1;
 	fthd_v4l2_adjust_format(dev_priv, &dev_priv->fmt.fmt);
+	/* After the format, because the crop's lower bound is the output size.
+	 * G_SELECTION is answerable from the first open either way; the channel
+	 * start re-fits this once the real sensor geometry is known. */
+	fthd_v4l2_refresh_crop(dev_priv);
 
 	ret = video_register_device(vdev, VFL_TYPE_VIDEO, -1);
 	if (ret) {
