@@ -680,6 +680,59 @@ struct isp_cmd_channel_ae_flicker_freq_set {
 	u32 freq;
 };
 
+/*
+ * The payloads below follow the same inference as the flicker-frequency
+ * command above: the opcodes are real, taken from the ISP's own command
+ * enumeration, but Apple documents none of their argument layouts.  Each one
+ * uses the shape every other per-channel setter uses - a u32 channel followed
+ * by the value - and a wrong guess is refused by the firmware, so it surfaces
+ * as an error from S_CTRL rather than as a wedged ISP.  Every one of these is
+ * a hardware-validation target; see DOWNSTREAM.md.
+ */
+
+/* Signed exposure compensation applied while AE is running, in millis of an
+ * EV step (so -1000 is -1 EV). */
+struct isp_cmd_channel_ae_bias_set {
+	u32 channel;
+	s32 bias;
+};
+
+/* Manual sensor integration time, in microseconds. */
+struct isp_cmd_channel_ae_integration_time_set {
+	u32 channel;
+	u32 time;
+};
+
+/* Manual sensor gain.  Sent to both the min and max gain-cap opcodes, which
+ * is how an AE engine is pinned to one fixed gain. */
+struct isp_cmd_channel_ae_gain_set {
+	u32 channel;
+	u32 gain;
+};
+
+/* Manual white-balance correlated colour temperature, in kelvin. */
+struct isp_cmd_channel_awb_cct_manual {
+	u32 channel;
+	u32 cct;
+};
+
+/* Manual white-balance channel gains, Q10 fixed point (1024 is unity). */
+struct isp_cmd_channel_awb_gain_manual {
+	u32 channel;
+	u32 red;
+	u32 blue;
+};
+
+struct isp_cmd_channel_sharpness_set {
+	u32 channel;
+	u32 sharpness;
+};
+
+struct isp_cmd_channel_test_pattern_config {
+	u32 channel;
+	u32 pattern;
+};
+
 struct isp_cmd_channel_start {
 	u32 channel;
 };
@@ -772,6 +825,13 @@ extern int fthd_isp_cmd_channel_motion_history_start(struct fthd_private *dev_pr
 extern int fthd_isp_cmd_channel_motion_history_stop(struct fthd_private *dev_priv, int channel);
 extern int fthd_isp_cmd_channel_ae_metering_mode_set(struct fthd_private *dev_priv, int channel, int mode);
 extern int fthd_isp_cmd_channel_ae_flicker_freq_set(struct fthd_private *dev_priv, int channel, int freq);
+extern int fthd_isp_cmd_channel_ae_bias_set(struct fthd_private *dev_priv, int channel, int bias);
+extern int fthd_isp_cmd_channel_ae_integration_time_set(struct fthd_private *dev_priv, int channel, unsigned int usec);
+extern int fthd_isp_cmd_channel_ae_gain_set(struct fthd_private *dev_priv, int channel, unsigned int gain);
+extern int fthd_isp_cmd_channel_awb_cct_manual(struct fthd_private *dev_priv, int channel, unsigned int cct);
+extern int fthd_isp_cmd_channel_awb_gain_manual(struct fthd_private *dev_priv, int channel, unsigned int red, unsigned int blue);
+extern int fthd_isp_cmd_channel_sharpness_set(struct fthd_private *dev_priv, int channel, int sharpness);
+extern int fthd_isp_cmd_channel_test_pattern_config(struct fthd_private *dev_priv, int channel, int pattern);
 extern int fthd_isp_cmd_channel_brightness_set(struct fthd_private *dev_priv, int channel, int brightness);
 extern int fthd_isp_cmd_channel_contrast_set(struct fthd_private *dev_priv, int channel, int contrast);
 extern int fthd_isp_cmd_channel_saturation_set(struct fthd_private *dev_priv, int channel, int saturation);

@@ -1237,6 +1237,128 @@ int fthd_isp_cmd_channel_ae_flicker_freq_set(struct fthd_private *dev_priv, int 
 	return fthd_isp_cmd(dev_priv, CISP_CMD_APPLE_CH_AE_FLICKER_FREQ_SET, &cmd, sizeof(cmd), &len);
 }
 
+/*
+ * Exposure compensation, applied while AE keeps running.  This is the useful
+ * half of manual exposure on a laptop: it is what pulls a backlit face out of
+ * silhouette without handing the whole exposure loop to userspace.
+ */
+int fthd_isp_cmd_channel_ae_bias_set(struct fthd_private *dev_priv, int channel, int bias)
+{
+	struct isp_cmd_channel_ae_bias_set cmd;
+	int len;
+
+	pr_debug("set ae bias %d milli-EV\n", bias);
+
+	memset(&cmd, 0, sizeof(cmd));
+	cmd.channel = channel;
+	cmd.bias = bias;
+	len = sizeof(cmd);
+	return fthd_isp_cmd(dev_priv, CISP_CMD_CH_AE_BIAS_EXPOSURE_SET, &cmd, sizeof(cmd), &len);
+}
+
+int fthd_isp_cmd_channel_ae_integration_time_set(struct fthd_private *dev_priv, int channel,
+						 unsigned int usec)
+{
+	struct isp_cmd_channel_ae_integration_time_set cmd;
+	int len;
+
+	pr_debug("set integration time %u us\n", usec);
+
+	memset(&cmd, 0, sizeof(cmd));
+	cmd.channel = channel;
+	cmd.time = usec;
+	len = sizeof(cmd);
+	return fthd_isp_cmd(dev_priv, CISP_CMD_CH_AE_INTEGRATION_TIME_SET, &cmd, sizeof(cmd), &len);
+}
+
+/*
+ * There is no "set the gain" opcode: the ISP exposes a gain *cap* pair, and
+ * collapsing the two onto one value is what pins AE to a fixed gain.  Both
+ * halves are sent because setting only the maximum would still let AE choose
+ * anything below it.
+ */
+int fthd_isp_cmd_channel_ae_gain_set(struct fthd_private *dev_priv, int channel,
+				     unsigned int gain)
+{
+	struct isp_cmd_channel_ae_gain_set cmd;
+	int len, ret;
+
+	pr_debug("set gain %u\n", gain);
+
+	memset(&cmd, 0, sizeof(cmd));
+	cmd.channel = channel;
+	cmd.gain = gain;
+	len = sizeof(cmd);
+	ret = fthd_isp_cmd(dev_priv, CISP_CMD_CH_AE_GAIN_CAP_MIN_SET, &cmd, sizeof(cmd), &len);
+	if (ret)
+		return ret;
+
+	memset(&cmd, 0, sizeof(cmd));
+	cmd.channel = channel;
+	cmd.gain = gain;
+	len = sizeof(cmd);
+	return fthd_isp_cmd(dev_priv, CISP_CMD_CH_AE_GAIN_CAP_SET, &cmd, sizeof(cmd), &len);
+}
+
+int fthd_isp_cmd_channel_awb_cct_manual(struct fthd_private *dev_priv, int channel,
+					unsigned int cct)
+{
+	struct isp_cmd_channel_awb_cct_manual cmd;
+	int len;
+
+	pr_debug("set awb cct %u K\n", cct);
+
+	memset(&cmd, 0, sizeof(cmd));
+	cmd.channel = channel;
+	cmd.cct = cct;
+	len = sizeof(cmd);
+	return fthd_isp_cmd(dev_priv, CISP_CMD_CH_AWB_CCT_MANUAL, &cmd, sizeof(cmd), &len);
+}
+
+int fthd_isp_cmd_channel_awb_gain_manual(struct fthd_private *dev_priv, int channel,
+					 unsigned int red, unsigned int blue)
+{
+	struct isp_cmd_channel_awb_gain_manual cmd;
+	int len;
+
+	pr_debug("set awb gains red %u blue %u\n", red, blue);
+
+	memset(&cmd, 0, sizeof(cmd));
+	cmd.channel = channel;
+	cmd.red = red;
+	cmd.blue = blue;
+	len = sizeof(cmd);
+	return fthd_isp_cmd(dev_priv, CISP_CMD_CH_AWB_1ST_GAIN_MANUAL, &cmd, sizeof(cmd), &len);
+}
+
+int fthd_isp_cmd_channel_sharpness_set(struct fthd_private *dev_priv, int channel, int sharpness)
+{
+	struct isp_cmd_channel_sharpness_set cmd;
+	int len;
+
+	pr_debug("set sharpness %d\n", sharpness);
+
+	memset(&cmd, 0, sizeof(cmd));
+	cmd.channel = channel;
+	cmd.sharpness = sharpness;
+	len = sizeof(cmd);
+	return fthd_isp_cmd(dev_priv, CISP_CMD_CH_SHARPNESS_SET, &cmd, sizeof(cmd), &len);
+}
+
+int fthd_isp_cmd_channel_test_pattern_config(struct fthd_private *dev_priv, int channel, int pattern)
+{
+	struct isp_cmd_channel_test_pattern_config cmd;
+	int len;
+
+	pr_debug("set test pattern %d\n", pattern);
+
+	memset(&cmd, 0, sizeof(cmd));
+	cmd.channel = channel;
+	cmd.pattern = pattern;
+	len = sizeof(cmd);
+	return fthd_isp_cmd(dev_priv, CISP_CMD_CH_SENSOR_TEST_PATTERN_CONFIG, &cmd, sizeof(cmd), &len);
+}
+
 int fthd_isp_cmd_channel_brightness_set(struct fthd_private *dev_priv, int channel, int brightness)
 {
 	struct isp_cmd_channel_brightness_set cmd;
@@ -1379,9 +1501,12 @@ int fthd_start_channel(struct fthd_private *dev_priv, int channel)
 	ret = fthd_isp_cmd_channel_recycle_start(dev_priv, 0);
 	if (ret)
 		return ret;
-	ret = fthd_isp_cmd_channel_ae_metering_mode_set(dev_priv, 0, 3);
-	if (ret)
-		return ret;
+	/* AE metering mode is not pinned here any more.  It used to be forced to
+	 * 3 on every channel start, which would have discarded whatever
+	 * V4L2_CID_EXPOSURE_METERING was set to; fthd_start_streaming() replays
+	 * the whole control handler right after this returns, and that control's
+	 * default is the same mode 3.  Same reasoning as brightness and contrast
+	 * below. */
 	ret = fthd_isp_cmd_channel_drc_start(dev_priv, 0);
 	if (ret)
 		return ret;

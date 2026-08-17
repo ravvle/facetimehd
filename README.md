@@ -71,6 +71,10 @@ The downstream driver retains the original hardware support while adding:
   V4L2 frame-size, frame-rate, selection and status reporting;
 - controls that are restored when streaming starts, plus optional 50/60 Hz
   anti-banding and automatic/manual exposure controls;
+- manual exposure time, gain and white-balance temperature, which the automatic
+  switches previously offered no way to set, alongside exposure compensation,
+  metering mode, sharpness and a sensor test pattern;
+- `NV16` offered next to `YUYV` and `YVYU`;
 - correct MacBook Air sensor-calibration selection and complete
   `MODULE_FIRMWARE` declarations; and
 - current Linux 5.15+ APIs, quieter diagnostics, Clang builds, Sparse checks

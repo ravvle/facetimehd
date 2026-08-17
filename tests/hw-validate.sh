@@ -42,7 +42,7 @@ SUSPEND_SECS="${SUSPEND_SECS:-20}"
 LID_TIMEOUT="${LID_TIMEOUT:-180}"
 DEVICE="${DEVICE:-}"
 
-ALL_SECTIONS="probe timing controls runtimepm suspend wedged"
+ALL_SECTIONS="probe timing controls newctrls formats runtimepm suspend wedged"
 SECTIONS="$ALL_SECTIONS"
 DO_REBOOT=0
 INTERACTIVE=1
@@ -598,6 +598,242 @@ if wants controls; then
         else
             result SKIP controls.ae "V4L2_CID_EXPOSURE_AUTO (0x009a0901) not exposed"
         fi
+    fi
+fi
+
+# ============================================================================
+# Section: newctrls
+# DOWNSTREAM.md - "Manual exposure and white balance"
+#
+# Every control here is wired to an opcode whose payload layout is inferred,
+# exactly like power_line_frequency above. The stated failure mode is the same:
+# the firmware refuses the command and S_CTRL returns an error. So a FAIL here
+# names the one control to revert, not the whole change set.
+#
+# The clustered controls carry a second question the flicker control does not:
+# V4L2 marks a manual control inactive while its auto leader owns the hardware,
+# so setting one is only expected to succeed after the leader is in manual.
+# Getting that order wrong looks identical to a bad payload, hence the explicit
+# switch to manual before each cluster member is touched.
+# ============================================================================
+if wants newctrls; then
+    step "newctrls: manual exposure, white balance, bias, metering, sharpness, test pattern"
+    log_section "SECTION newctrls"
+
+    [ -n "$DEVICE" ] || wait_for_device || true
+    if [ -z "$DEVICE" ]; then
+        result SKIP newctrls "no video node"
+    else
+        CTRLS="$(v4l2-ctl --device "$DEVICE" --list-ctrls 2>/dev/null || true)"
+        printf '%s\n' "$CTRLS" >>"$REPORT"
+
+        # v4l-utils has renamed several of these over the years, so accept
+        # either spelling rather than pinning one release's vocabulary.
+        ctrl_name() {
+            for n in "$@"; do
+                if printf '%s\n' "$CTRLS" | grep -qE "^[[:space:]]*${n}[[:space:]]+0x"; then
+                    printf '%s' "$n"
+                    return 0
+                fi
+            done
+            return 1
+        }
+
+        # set_ctrl <report-label> <control> <value...>
+        # Reports one PASS/FAIL per value, and reads the value back where the
+        # control is not write-only, because a set that silently does nothing
+        # is the failure this whole section exists to catch.
+        set_ctrl() {
+            _label="$1"; _ctrl="$2"; shift 2
+            for _v in "$@"; do
+                dmesg_mark
+                if v4l2-ctl --device "$DEVICE" \
+                        --set-ctrl "$_ctrl=$_v" >>"$REPORT" 2>&1; then
+                    _got="$(v4l2-ctl --device "$DEVICE" --get-ctrl "$_ctrl" \
+                            2>/dev/null | sed -n "s/^$_ctrl: //p")"
+                    if [ -z "$_got" ] || [ "$_got" = "$_v" ]; then
+                        result PASS "newctrls.$_label.$_v" "accepted"
+                    else
+                        result FAIL "newctrls.$_label.$_v" \
+                            "set succeeded but reads back '$_got'"
+                    fi
+                else
+                    result FAIL "newctrls.$_label.$_v" \
+                        "S_CTRL failed - inferred payload for this control is likely wrong"
+                fi
+                dmesg_driver >>"$REPORT"
+            done
+        }
+
+        # --- exposure cluster ----------------------------------------------
+        AE_NAME="$(ctrl_name auto_exposure exposure_auto || true)"
+        EXP_NAME="$(ctrl_name exposure_time_absolute exposure_absolute || true)"
+        GAIN_NAME="$(ctrl_name gain || true)"
+        if [ -n "$AE_NAME" ] && [ -n "$EXP_NAME" ]; then
+            # 1 = MANUAL. The cluster members are inactive until this lands.
+            v4l2-ctl --device "$DEVICE" --set-ctrl "$AE_NAME=1" >>"$REPORT" 2>&1 || true
+            set_ctrl exposure "$EXP_NAME" 50 150 300
+            [ -n "$GAIN_NAME" ] && set_ctrl gain "$GAIN_NAME" 0 64 255
+
+            if capture_ok 10; then
+                result PASS newctrls.exposure.stream "capture works with manual exposure"
+            else
+                result FAIL newctrls.exposure.stream "capture broke under manual exposure"
+            fi
+            v4l2-ctl --device "$DEVICE" --set-ctrl "$AE_NAME=0" >>"$REPORT" 2>&1 || true
+        else
+            result SKIP newctrls.exposure "manual exposure controls not exposed"
+        fi
+
+        # --- white balance cluster -----------------------------------------
+        AWB_NAME="$(ctrl_name white_balance_automatic auto_white_balance || true)"
+        WBT_NAME="$(ctrl_name white_balance_temperature || true)"
+        if [ -n "$AWB_NAME" ] && [ -n "$WBT_NAME" ]; then
+            v4l2-ctl --device "$DEVICE" --set-ctrl "$AWB_NAME=0" >>"$REPORT" 2>&1 || true
+            set_ctrl wbtemp "$WBT_NAME" 2800 5000 8000
+
+            if capture_ok 10; then
+                result PASS newctrls.wbtemp.stream "capture works with manual white balance"
+            else
+                result FAIL newctrls.wbtemp.stream "capture broke under manual white balance"
+            fi
+            v4l2-ctl --device "$DEVICE" --set-ctrl "$AWB_NAME=1" >>"$REPORT" 2>&1 || true
+        else
+            result SKIP newctrls.wbtemp "manual white balance controls not exposed"
+        fi
+
+        # --- standalone controls -------------------------------------------
+        BIAS_NAME="$(ctrl_name auto_exposure_bias || true)"
+        if [ -n "$BIAS_NAME" ]; then
+            set_ctrl bias "$BIAS_NAME" 0 6 12
+        else
+            result SKIP newctrls.bias "auto_exposure_bias not exposed"
+        fi
+
+        MET_NAME="$(ctrl_name exposure_metering || true)"
+        if [ -n "$MET_NAME" ]; then
+            set_ctrl metering "$MET_NAME" 0 1 2 3
+            # Mode 3 is what the driver used to pin unconditionally, so it is
+            # the one value that must still work.
+            v4l2-ctl --device "$DEVICE" --set-ctrl "$MET_NAME=3" >>"$REPORT" 2>&1 || true
+        else
+            result SKIP newctrls.metering "exposure_metering not exposed"
+        fi
+
+        SHARP_NAME="$(ctrl_name sharpness || true)"
+        if [ -n "$SHARP_NAME" ]; then
+            set_ctrl sharpness "$SHARP_NAME" 0 128 255
+            v4l2-ctl --device "$DEVICE" --set-ctrl "$SHARP_NAME=128" >>"$REPORT" 2>&1 || true
+        else
+            result SKIP newctrls.sharpness "sharpness not exposed"
+        fi
+
+        # Only "Disabled" is claimed to work. The other indices are guesses and
+        # a failure on them is the expected result, not a regression - so they
+        # are probed separately and reported as INFO either way.
+        TP_NAME="$(ctrl_name test_pattern || true)"
+        if [ -n "$TP_NAME" ]; then
+            set_ctrl testpattern "$TP_NAME" 0
+            for tp in 1 2 3; do
+                if v4l2-ctl --device "$DEVICE" \
+                        --set-ctrl "$TP_NAME=$tp" >>"$REPORT" 2>&1; then
+                    result INFO "newctrls.testpattern.$tp" \
+                        "accepted - this index is implemented, keep it in the menu"
+                else
+                    result INFO "newctrls.testpattern.$tp" \
+                        "refused - drop this index from fthd_test_pattern_menu[]"
+                fi
+            done
+            v4l2-ctl --device "$DEVICE" --set-ctrl "$TP_NAME=0" >>"$REPORT" 2>&1 || true
+        else
+            result SKIP newctrls.testpattern "test_pattern not exposed"
+        fi
+
+        if capture_ok 10; then
+            result PASS newctrls.stream "capture still works after exercising every new control"
+        else
+            result FAIL newctrls.stream "capture broke after exercising the new controls"
+        fi
+    fi
+fi
+
+# ============================================================================
+# Section: formats
+# DOWNSTREAM.md - "Pixel formats"
+#
+# NV16 is offered as a single-planar format whose chroma plane sits at
+# bytesperline * height inside the same buffer. Two things need confirming that
+# only hardware can answer: that the ISP accepts output format code 0 at all,
+# and that the frame it writes is exactly sizeimage bytes. A short frame means
+# the offset is wrong; an over-long one means the ISP is writing past the
+# mapping, which is the reason NV12 was left out entirely.
+# ============================================================================
+if wants formats; then
+    step "formats: does NV16 negotiate and capture at the expected size?"
+    log_section "SECTION formats"
+
+    [ -n "$DEVICE" ] || wait_for_device || true
+    if [ -z "$DEVICE" ]; then
+        result SKIP formats "no video node"
+    else
+        v4l2-ctl --device "$DEVICE" --list-formats-ext >>"$REPORT" 2>&1 || true
+
+        for fourcc in YUYV YVYU NV16; do
+            if v4l2-ctl --device "$DEVICE" --list-formats 2>/dev/null |
+                    grep -q "'$fourcc'"; then
+                result PASS "formats.enum.$fourcc" "advertised by ENUM_FMT"
+            else
+                result FAIL "formats.enum.$fourcc" "missing from ENUM_FMT"
+            fi
+        done
+
+        # Capture one frame of each and check its size against what G_FMT says
+        # sizeimage is. v4l2-ctl writes exactly the payload vb2 reports.
+        for fourcc in YUYV NV16; do
+            raw="/tmp/facetimehd-fmt-$fourcc.raw"
+            rm -f "$raw"
+            dmesg_mark
+            if ! v4l2-ctl --device "$DEVICE" \
+                    --set-fmt-video="width=1280,height=720,pixelformat=$fourcc" \
+                    >>"$REPORT" 2>&1; then
+                result FAIL "formats.$fourcc.sfmt" "S_FMT rejected $fourcc"
+                continue
+            fi
+
+            want="$(v4l2-ctl --device "$DEVICE" --get-fmt-video 2>/dev/null |
+                    sed -n 's/.*Size Image *: *\([0-9]*\).*/\1/p' | head -1)"
+            # Both formats are two bytes per pixel: YUYV packs them, NV16
+            # splits them into a W*H luma plane and a W*H chroma plane. The
+            # buffer is the same size either way, which is also why NV16 buys
+            # no bandwidth over YUYV - it is offered for consumers that want
+            # semi-planar, not to move fewer bytes.
+            expect=$(( 1280 * 720 * 2 ))
+            if [ "$want" = "$expect" ]; then
+                result PASS "formats.$fourcc.sizeimage" "sizeimage=$want as expected"
+            else
+                result FAIL "formats.$fourcc.sizeimage" \
+                    "sizeimage=$want, expected $expect"
+            fi
+
+            if v4l2-ctl --device "$DEVICE" --stream-mmap --stream-count=1 \
+                    --stream-to="$raw" >>"$REPORT" 2>&1 && [ -s "$raw" ]; then
+                got="$(wc -c <"$raw" | tr -d ' ')"
+                if [ "$got" = "$want" ]; then
+                    result PASS "formats.$fourcc.capture" "one frame, $got bytes"
+                else
+                    result FAIL "formats.$fourcc.capture" \
+                        "frame is $got bytes, G_FMT says $want - plane offset is wrong"
+                fi
+            else
+                result FAIL "formats.$fourcc.capture" "no frame captured as $fourcc"
+            fi
+            dmesg_driver >>"$REPORT"
+            rm -f "$raw"
+        done
+
+        v4l2-ctl --device "$DEVICE" \
+            --set-fmt-video="width=1280,height=720,pixelformat=YUYV" \
+            >/dev/null 2>&1 || true
     fi
 fi
 

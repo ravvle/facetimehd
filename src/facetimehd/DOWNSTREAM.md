@@ -105,6 +105,67 @@ after they are changed. Their visible effect has not yet been proven under
 controlled lighting, so they should still be treated as hardware-validation
 targets.
 
+## Manual exposure and white balance
+
+`V4L2_CID_EXPOSURE_AUTO` and `V4L2_CID_AUTO_WHITE_BALANCE` each used to
+advertise only half a feature: both could be switched to manual, and neither
+had anything to set once they were. Selecting manual exposure simply froze the
+picture wherever the automatic loop had last left it.
+
+- `V4L2_CID_EXPOSURE_ABSOLUTE` and `V4L2_CID_GAIN` now sit in a
+  `v4l2_ctrl_auto_cluster()` led by `V4L2_CID_EXPOSURE_AUTO`, so they are
+  marked inactive while the ISP owns the exposure and become settable when it
+  does not. The ISP has no "set the gain" command, only a gain-cap pair;
+  collapsing its minimum and maximum onto one value is what pins a fixed gain.
+- `V4L2_CID_WHITE_BALANCE_TEMPERATURE` is clustered against
+  `V4L2_CID_AUTO_WHITE_BALANCE` the same way.
+- `V4L2_CID_AUTO_EXPOSURE_BIAS` offers ±2 EV in thirds. Unlike the cluster
+  above it applies with automatic exposure still running, which makes it the
+  control that actually helps a backlit subject.
+- `V4L2_CID_EXPOSURE_METERING` replaces the metering mode `fthd_start_channel()`
+  used to pin to 3 on every channel start. The control's default is that same
+  mode, so out-of-the-box behaviour is unchanged; the hardcoded call was removed
+  for the reason the brightness and contrast ones were, namely that
+  `v4l2_ctrl_handler_setup()` replays the handler immediately afterwards and
+  would otherwise be overridden.
+- `V4L2_CID_SHARPNESS` and a `V4L2_CID_TEST_PATTERN` menu are exposed.
+  The test pattern is worth having as a diagnostic: it is the only way to
+  separate "the sensor or firmware is not producing frames" from "the ring, the
+  IOMMU mapping or buffer return is broken" without a lit room or a subject.
+
+`CISP_CMD_CH_AWB_1ST_GAIN_MANUAL` is deliberately **not** exposed as
+`V4L2_CID_RED_BALANCE`/`BLUE_BALANCE`. The colour temperature and the
+per-channel gains are two ways of writing the same white-balance state, so
+putting both in one cluster would make the replay order decide which wins —
+and runtime PM replays the whole handler on every idle cycle. One unambiguous
+control is better than two that quietly fight.
+
+As with the anti-banding command, the opcodes above are real but Apple
+documents none of their argument layouts, so each payload follows the shape
+every other per-channel setter uses. A wrong guess is refused by the firmware
+and surfaces as an error from `S_CTRL` rather than as a wedged ISP. All of
+them are hardware-validation targets.
+
+## Pixel formats
+
+- `V4L2_PIX_FMT_NV16` is offered again, as a **single-planar** format. It was
+  disabled upstream pending multiplanar support, but V4L2 defines NV16 as one
+  buffer holding a luma plane followed by an interleaved CbCr plane of the same
+  size, so no multiplanar queue is needed — only a second address for the ISP.
+  `iommu_allocate_sgtable()` maps each buffer into one contiguous run of S2 IOVA
+  pages, so that address is a byte offset from the start of the same mapping.
+- The vb2 queue is therefore always single-planar. `struct fthd_fmt.planes`
+  counts the addresses handed to the ISP, not vb2 planes; `queue_setup()` used
+  to return it directly, which would have asked a `V4L2_BUF_TYPE_VIDEO_CAPTURE`
+  queue for two planes.
+- `V4L2_PIX_FMT_NV12` is **not** offered. The ISP's output-format codes are
+  known only for the three formats the driver enumerates (NV16 is 0, YUYV 1,
+  YVYU 2) and nothing identifies a 4:2:0 code. This is not a guess of the same
+  kind as a command payload, where a wrong value is simply refused: sizing a
+  buffer for 4:2:0 at 1.5 bytes per pixel while the ISP still writes 4:2:2 at 2
+  would have the hardware DMA past the end of the mapping. It stays out until
+  hardware can confirm a code.
+
 ## Kernel integration, diagnostics and testing
 
 - Compatibility branches older than the supported Linux 5.15 CI floor were
@@ -152,8 +213,18 @@ This validates one machine, model and kernel rather than the complete
 2013–2015 Mac range. Still untested or unproven are:
 
 - the visible effect of anti-banding and exposure mode under controlled light;
-- orderly reboot or kexec while actively streaming; and
-- recovery from a real firmware command timeout, which has not been reproduced.
+- orderly reboot or kexec while actively streaming;
+- recovery from a real firmware command timeout, which has not been reproduced;
+- every command backing the manual exposure, white balance, exposure bias,
+  metering, sharpness and test-pattern controls. The opcodes are real but their
+  payload layouts are inferred, so each needs confirming that the firmware
+  accepts it and that the picture changes as expected. The test pattern menu
+  lists four entries; only "Disabled" is known to be implemented, and the
+  indices that are not should be removed once hardware says which those are;
+- NV16 capture: that the ISP accepts output format code 0 through the current
+  `S_FMT` path, that the chroma plane really does land at
+  `bytesperline * height` into the buffer, and that no frame is written past
+  `sizeimage`.
 
 Remove entries from this document when the corresponding fixes are accepted
 upstream.
