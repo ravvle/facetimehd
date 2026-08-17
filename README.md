@@ -63,6 +63,8 @@ The downstream driver retains the original hardware support while adding:
   of open file descriptors during unbind;
 - runtime camera suspend/resume, reliable system sleep while streaming, safe
   shutdown and PCI error handling;
+- a stream that survives suspend: an application capturing when the lid closes
+  keeps capturing when it opens, without being restarted;
 - wider DDR memory verification and removal of unfinished, unused calibration
   code containing ineffective timeouts and unbounded paths;
 - correct full-sensor scaling at lower resolutions instead of a zoomed crop

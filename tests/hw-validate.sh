@@ -926,9 +926,12 @@ fi
 # Section: suspend
 # DOWNSTREAM.md - "Suspending mid-stream"
 #
-# Expected: the machine sleeps instead of refusing to, the running viewer sees
-# a broken stream, and a restarted viewer gets a picture back. Before the fix
-# the machine would refuse to suspend with the camera open.
+# Expected: the machine sleeps instead of refusing to, and the viewer that was
+# streaming when the lid closed is still streaming when it opens - the driver
+# parks the stream and puts it back itself. Two earlier behaviours this is
+# meant to catch a regression to: refusing to suspend at all with the camera
+# open, and coming back with the queue errored so the viewer had to be
+# restarted.
 # ============================================================================
 if wants suspend; then
     step "suspend: system sleep with the camera streaming"
@@ -948,8 +951,12 @@ if wants suspend; then
 
     if wants suspend && [ "$INTERACTIVE" = 1 ] && [ -n "$DEVICE" ]; then
         dmesg_mark
+        # Its own log, not $REPORT: v4l2-ctl prints a character per captured
+        # frame, so the file growing is the evidence that frames are still
+        # arriving. Nothing else may write to it or that measurement is noise.
+        STREAM_LOG="$(mktemp)"
         v4l2-ctl --device "$DEVICE" --stream-mmap --stream-count=100000 \
-                 --stream-to=/dev/null >>"$REPORT" 2>&1 &
+                 --stream-to=/dev/null >"$STREAM_LOG" 2>&1 &
         STREAM_PID=$!
         sleep 3
 
@@ -1033,16 +1040,30 @@ if wants suspend; then
                     "resume seen but no 'PM: suspend entry' - suspend never started"
             fi
 
+            # The point of the whole section: the viewer that was running
+            # before the lid closed must still be capturing now, without
+            # anybody restarting it. Alive is necessary but not sufficient - a
+            # viewer sitting in a poll() that never completes is also alive -
+            # so measure whether its output is still growing.
+            frames_before="$(wc -c <"$STREAM_LOG" 2>/dev/null || echo 0)"
             sleep 3
-            if kill -0 "$STREAM_PID" 2>/dev/null; then
-                result INFO suspend.viewer "viewer still running after resume"
-                kill "$STREAM_PID" 2>/dev/null || true
-            else
+            frames_after="$(wc -c <"$STREAM_LOG" 2>/dev/null || echo 0)"
+
+            if ! kill -0 "$STREAM_PID" 2>/dev/null; then
+                result FAIL suspend.viewer \
+                    "viewer exited across the suspend - the stream was not resumed"
+            elif [ "$frames_after" -gt "$frames_before" ]; then
                 result PASS suspend.viewer \
-                    "viewer exited on resume (expected: broken stream, not a hang)"
+                    "viewer kept capturing across the suspend without restarting"
+            else
+                result FAIL suspend.viewer \
+                    "viewer alive but no new frames after resume (stalled, not resumed)"
             fi
+            kill "$STREAM_PID" 2>/dev/null || true
             wait "$STREAM_PID" 2>/dev/null || true
             STREAM_PID=""
+            tail -n 20 "$STREAM_LOG" >>"$REPORT" 2>/dev/null || true
+            rm -f "$STREAM_LOG"
 
             # The half that matters: a picture must come back afterwards.
             sleep 2

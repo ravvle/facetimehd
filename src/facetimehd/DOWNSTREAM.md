@@ -40,9 +40,10 @@ This directory is the driver built and installed by this project. It is a
 - `facetimehd.runtime_pm=0` remains available as an escape hatch for machines
   where runtime PM is unreliable.
 - System suspend no longer fails with `-EBUSY` when the camera is streaming.
-  Streaming is stopped, buffers and stale ISP mappings are invalidated, and
-  blocked applications receive `-EIO`; they can recover with `STREAMOFF` and a
-  new `STREAMON` after resume.
+  Streaming is stopped and the stale ISP mappings are invalidated before the
+  hardware goes down.
+- A stream that was running when the machine went to sleep is **resumed**
+  rather than failed. See "Suspending mid-stream" below.
 - Forced runtime suspend/resume preserves whether the camera was already idle,
   avoiding an unnecessary firmware reload during system resume.
 - Debugfs entries survive suspend and take runtime-PM references when accessed.
@@ -53,6 +54,53 @@ This directory is the driver built and installed by this project. It is a
   error instead of leaving them hung.
 - MSI setup uses `pci_alloc_irq_vectors()`/`pci_free_irq_vectors()` and no
   longer incorrectly requests a shared IRQ.
+
+## Suspending mid-stream
+
+Closing the lid on a video call and opening it again used to leave the
+application looking at a dead camera until it was restarted: suspend errored
+the vb2 queue, so `DQBUF` and `poll()` returned `-EIO` and only a `STREAMOFF`
+plus a fresh `STREAMON` could recover. Most applications do not attempt that —
+they report a camera failure instead — which made "the camera stops working
+after suspend" the visible behaviour.
+
+Nothing about the hardware requires it. Suspend has to give up the ISP-side
+resources, because the power cycle destroys them: the firmware image, the
+channel, the S2 IOMMU mapping of every buffer and the descriptor objects that
+point at them all go away. But the vb2 buffers themselves are ordinary memory
+and survive untouched, and the descriptors are cheap to rebuild — which is
+exactly what a `QBUF` does on every frame anyway.
+
+So the driver now parks the stream instead of failing it:
+
+- `fthd_v4l2_suspend_stop()` stops the channel and frees the ISP-side objects
+  as before, but records the buffers vb2 has handed to the driver and leaves
+  them owned by it. The queue is not errored and no buffer is returned, so
+  userspace — frozen for the whole transition — has nothing to observe.
+- `fthd_v4l2_resume_start()` runs from the system resume callback, after the
+  firmware is back and before userspace is thawed. It re-prepares each parked
+  buffer through the same `buf_prepare()` path a `QBUF` uses, restarts the
+  channel, replays the control values and resubmits the buffers. Capture
+  continues into the same buffers the application was already reading.
+- Frame sequence numbers continue across the sleep rather than restarting at
+  zero. `STREAMON` still resets them; the resume path deliberately does not,
+  because the application never asked for a new stream.
+- If any part of that fails, the old behaviour is the fallback: the parked
+  buffers come back with an error, the queue is marked, and the application can
+  recover with `STREAMOFF`/`STREAMON`. The failure is logged as
+  `could not resume capture`.
+- The shutdown and kexec path deliberately keeps the old behaviour, because
+  there is no resume coming: a reader blocked in `DQBUF` is better told with
+  `-EIO` than left waiting for frames that will never arrive.
+
+The work happens in the `.resume` callback rather than a work item, because
+that is the one place where userspace is guaranteed to be frozen: no `STREAMOFF`,
+`close()` or `REQBUFS` can race the rebuild, and the parked buffer pointers
+cannot go stale. The cost is that the channel-start command sequence sits in
+the device-resume phase — a dozen firmware commands, each bounded by the usual
+2 s command timeout — and it is paid only when something actually held the
+camera streaming. No firmware is loaded there that a resume with an open camera
+was not already loading.
 
 ## Image geometry
 
@@ -205,7 +253,8 @@ Ubuntu kernel 7.0.0-29-generic. They confirmed:
 - repeated runtime suspend, firmware reload and capture recovery;
 - debugfs access waking a suspended camera;
 - successful system suspend while streaming, with the application receiving
-  `-EIO` and capture working again after restart;
+  `-EIO` and capture working again after restart — the behaviour of the time,
+  since replaced by the resumed stream described under "Suspending mid-stream";
 - the widened DDR probe check, with total module load around 640 ms; and
 - firmware acceptance of all anti-banding and exposure-auto values.
 
@@ -213,6 +262,11 @@ This validates one machine, model and kernel rather than the complete
 2013–2015 Mac range. Still untested or unproven are:
 
 - the visible effect of anti-banding and exposure mode under controlled light;
+- the resumed stream: that an application capturing when the lid closes is
+  still receiving frames after it opens, without restarting and without an
+  error, and that the firmware accepts the channel restart and the resubmitted
+  buffers on the resume path. `tests/hw-validate.sh --only suspend` checks
+  exactly this — its `suspend.viewer` result is the verdict;
 - orderly reboot or kexec while actively streaming;
 - recovery from a real firmware command timeout, which has not been reproduced;
 - every command backing the manual exposure, white balance, exposure bias,

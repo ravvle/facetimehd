@@ -113,21 +113,34 @@ static void fthd_release_buffer_ctx(struct fthd_private *dev_priv,
 		iommu_free(dev_priv, planes[i]);
 }
 
+/*
+ * The hardware slot a vb2 buffer owns, or NULL if it has none.  Call with
+ * buffer_lock held, and keep holding it for as long as the returned slot is
+ * used: only that lock keeps the state and the vb pointer consistent with the
+ * interrupt handler.
+ */
+static struct h2t_buf_ctx *fthd_ctx_for_vb(struct fthd_private *dev_priv,
+					   struct vb2_buffer *vb)
+{
+	int i;
+
+	for (i = 0; i < FTHD_BUFFERS; i++) {
+		if (dev_priv->h2t_bufs[i].vb == vb)
+			return dev_priv->h2t_bufs + i;
+	}
+
+	return NULL;
+}
+
 static void fthd_buffer_cleanup(struct vb2_buffer *vb)
 {
 	struct fthd_private *dev_priv = vb2_get_drv_priv(vb->vb2_queue);
-	struct h2t_buf_ctx *ctx = NULL;
+	struct h2t_buf_ctx *ctx;
 	unsigned long flags;
-	int i;
 
 	pr_debug("%p\n", vb);
 	spin_lock_irqsave(&dev_priv->buffer_lock, flags);
-	for (i = 0; i < FTHD_BUFFERS; i++) {
-		if (dev_priv->h2t_bufs[i].vb == vb) {
-			ctx = dev_priv->h2t_bufs + i;
-			break;
-		};
-	}
+	ctx = fthd_ctx_for_vb(dev_priv, vb);
 	spin_unlock_irqrestore(&dev_priv->buffer_lock, flags);
 
 	if (ctx)
@@ -159,19 +172,13 @@ static void fthd_buffer_queue(struct vb2_buffer *vb)
 {
 	struct fthd_private *dev_priv = vb2_get_drv_priv(vb->vb2_queue);
 	struct dma_descriptor_list *list;
-	struct h2t_buf_ctx *ctx = NULL;
+	struct h2t_buf_ctx *ctx;
 	unsigned long flags;
 	bool send = false;
 
-	int i;
 	pr_debug("vb = %p\n", vb);
 	spin_lock_irqsave(&dev_priv->buffer_lock, flags);
-	for (i = 0; i < FTHD_BUFFERS; i++) {
-		if (dev_priv->h2t_bufs[i].vb == vb) {
-			ctx = dev_priv->h2t_bufs + i;
-			break;
-		};
-	}
+	ctx = fthd_ctx_for_vb(dev_priv, vb);
 
 	if (!ctx || ctx->state != BUF_ALLOC)
 		goto out_unlock;
@@ -183,7 +190,8 @@ static void fthd_buffer_queue(struct vb2_buffer *vb)
 		list->field0 = 1;
 		ctx->state = BUF_HW_QUEUED;
 		wmb();
-		pr_debug("%d: field0: %d, count %d, pool %d, addr0 0x%08x, addr1 0x%08x tag 0x%08llx vb = %p\n", i, list->field0,
+		pr_debug("%td: field0: %d, count %d, pool %d, addr0 0x%08x, addr1 0x%08x tag 0x%08llx vb = %p\n",
+			 ctx - dev_priv->h2t_bufs, list->field0,
 			 list->desc[0].count, list->desc[0].pool,
 			 list->desc[0].addr0, list->desc[0].addr1,
 			 list->desc[0].tag, ctx->vb);
@@ -437,15 +445,25 @@ static void fthd_return_all_buffers(struct fthd_private *dev_priv,
 		vb2_buffer_done(buffers[i], state);
 }
 
-static int fthd_start_streaming(struct vb2_queue *vq, unsigned int count)
+/*
+ * Bring the ISP channel up and hand it every buffer already sitting in a
+ * hardware slot.
+ *
+ * Shared by STREAMON and by the system-resume path, which has to redo exactly
+ * this once the firmware is back.  Two things are deliberately left to the
+ * caller.  The frame counter is not reset here, because a resume continues the
+ * stream the application is already reading and must not restart its sequence
+ * numbers.  And @require_buffers separates the two callers: vb2 guarantees at
+ * least one queued buffer at STREAMON, so nothing to submit there means
+ * something is wrong, while a resume can legitimately find every buffer sitting
+ * in userspace.
+ */
+static int fthd_stream_start(struct fthd_private *dev_priv, bool require_buffers)
 {
-	struct fthd_private *dev_priv = vb2_get_drv_priv(vq);
 	struct h2t_buf_ctx *ctx;
 	unsigned int submitted = 0;
 	int i, ret;
 
-	pr_debug("count = %d\n", count);
-	dev_priv->sequence = 0;
 	spin_lock_irq(&dev_priv->buffer_lock);
 	dev_priv->protocol_errors = 0;
 	spin_unlock_irq(&dev_priv->buffer_lock);
@@ -497,7 +515,7 @@ static int fthd_start_streaming(struct vb2_queue *vq, unsigned int count)
 		}
 		submitted++;
 	}
-	if (!submitted) {
+	if (!submitted && require_buffers) {
 		ret = -ENOBUFS;
 		goto fail_channel;
 	}
@@ -511,14 +529,25 @@ fail_buffers:
 	return ret;
 }
 
+static int fthd_start_streaming(struct vb2_queue *vq, unsigned int count)
+{
+	struct fthd_private *dev_priv = vb2_get_drv_priv(vq);
+
+	pr_debug("count = %d\n", count);
+	dev_priv->sequence = 0;
+
+	return fthd_stream_start(dev_priv, true);
+}
+
 static void fthd_stop_streaming(struct vb2_queue *vq)
 {
 	struct fthd_private *dev_priv = vb2_get_drv_priv(vq);
 	int ret;
 
-	/* A system suspend that arrived mid-stream already stopped the channel
-	 * and errored the queue; the STREAMOFF that clears the error then lands
-	 * here with nothing left to stop. */
+	/* A system suspend that arrived mid-stream already stopped the channel,
+	 * and a resume that could not restart it errored the queue; the
+	 * STREAMOFF that clears that error then lands here with nothing left to
+	 * stop. */
 	if (dev_priv->channel_running) {
 		dev_priv->channel_running = false;
 
@@ -537,23 +566,35 @@ static void fthd_stop_streaming(struct vb2_queue *vq)
  * Give the hardware up for a system suspend that arrived with buffers
  * allocated - usually with an app streaming.  Unlike a runtime suspend this
  * cannot be refused: returning an error from the system sleep callback aborts
- * the whole transition and the machine stays awake, so the stream has to be
- * torn down under userspace instead.
+ * the whole transition and the machine stays awake, so the stream has to come
+ * down under userspace instead.
  *
  * Everything the buffers own lives in ISP memory that fthd_pm_down() is about
  * to destroy, so it is all released here while the registers are still mapped.
- * That leaves the vb2 buffers prepared but with no hardware behind them, which
- * is why the queue is errored: vb2 only re-runs buf_prepare() after a
- * STREAMOFF, and marking the queue is what makes an app notice it has to do
- * one.  DQBUF and poll() then fail with -EIO, the STREAMOFF clears the error,
- * and a STREAMON re-prepares the buffers against the resumed hardware.
+ *
+ * With @park set that is the *only* thing userspace loses.  The buffers vb2 has
+ * handed to the driver are recorded and left owned by it - not returned, not
+ * errored - so fthd_v4l2_resume_start() can rebuild their mappings, restart the
+ * channel and let the application's feed simply continue.  Holding raw vb2
+ * pointers across the sleep is safe because only userspace can free a buffer,
+ * and it is frozen for the whole transition.
+ *
+ * @park is false on the shutdown path, where nothing will ever resume.  There
+ * the buffers are returned with an error and the queue is marked, so an
+ * application blocked in DQBUF or poll() gets -EIO instead of waiting for
+ * frames that are not coming.  That is also the fallback the resume path takes
+ * if it cannot get the stream going again: vb2 only re-runs buf_prepare() after
+ * a STREAMOFF, so marking the queue is what tells an app it has to do one
+ * before its STREAMON.
  *
  * Runs under ioctl_lock, with the hardware still powered: buffers can only be
  * allocated while /dev/videoN is open, and an open fd holds a runtime-PM
  * reference.
  */
-void fthd_v4l2_suspend_stop(struct fthd_private *dev_priv)
+void fthd_v4l2_suspend_stop(struct fthd_private *dev_priv, bool park)
 {
+	unsigned int parked = 0;
+	unsigned long flags;
 	int i;
 
 	if (dev_priv->channel_running) {
@@ -563,11 +604,136 @@ void fthd_v4l2_suspend_stop(struct fthd_private *dev_priv)
 				 "failed to stop firmware channel for suspend\n");
 	}
 
-	fthd_return_all_buffers(dev_priv, VB2_BUF_STATE_ERROR);
+	dev_priv->parked_count = 0;
+	dev_priv->parked_streaming = false;
+
+	if (park) {
+		/* Slot order, not queue order: which buffer the firmware fills
+		 * first is its choice either way, and every one of these goes
+		 * back to it before a single frame is produced. */
+		spin_lock_irqsave(&dev_priv->buffer_lock, flags);
+		for (i = 0; i < FTHD_BUFFERS; i++) {
+			struct h2t_buf_ctx *ctx = &dev_priv->h2t_bufs[i];
+
+			if ((ctx->state == BUF_DRV_QUEUED ||
+			     ctx->state == BUF_HW_QUEUED) && ctx->vb) {
+				dev_priv->parked_bufs[parked++] = ctx->vb;
+				/* Detach the buffer from its slot under the
+				 * same lock that records it, so a buffer return
+				 * racing this suspend cannot also complete one
+				 * the resume has already promised to resubmit.
+				 * Such a return finds an unowned slot and is
+				 * reported as the protocol error it is. */
+				ctx->state = BUF_ALLOC;
+				ctx->vb = NULL;
+			}
+		}
+		spin_unlock_irqrestore(&dev_priv->buffer_lock, flags);
+
+		dev_priv->parked_count = parked;
+		dev_priv->parked_streaming = vb2_is_streaming(&dev_priv->vb2_queue);
+	} else {
+		fthd_return_all_buffers(dev_priv, VB2_BUF_STATE_ERROR);
+	}
 
 	for (i = 0; i < FTHD_BUFFERS; i++)
 		fthd_release_buffer_ctx(dev_priv, &dev_priv->h2t_bufs[i]);
 
+	if (!park)
+		vb2_queue_error(&dev_priv->vb2_queue);
+}
+
+/*
+ * Put back what fthd_v4l2_suspend_stop() parked, so an application that was
+ * capturing when the lid closed keeps capturing when it opens - no -EIO, no
+ * STREAMOFF/STREAMON dance, nothing for it to notice beyond the gap in
+ * timestamps.
+ *
+ * The ISP has just been reloaded from scratch, so every buffer vb2 still
+ * considers the driver's needs its descriptor and its S2 mapping built again.
+ * fthd_buffer_prepare() is exactly that work and all four slots are free by
+ * now, so each one lands where a fresh QBUF would put it; the channel then
+ * comes back up and takes them, replaying the control values on the way.
+ *
+ * @powered says whether the force-resume actually brought the hardware back.
+ * It does so exactly when something still held the camera open, which is also
+ * the only way buffers can exist - so a false here means something is wrong,
+ * not that the camera is merely idle.
+ *
+ * Runs under ioctl_lock from the system resume callback, with userspace still
+ * frozen.  If any of it fails there is nothing better to do than what the
+ * driver did before it learned to resume: hand the buffers back with an error
+ * and mark the queue.
+ */
+void fthd_v4l2_resume_start(struct fthd_private *dev_priv, bool powered)
+{
+	unsigned int i = 0, parked = dev_priv->parked_count;
+	unsigned long flags;
+	int ret = 0;
+
+	if (!parked && !dev_priv->parked_streaming)
+		return;
+
+	dev_priv->parked_count = 0;
+
+	/* Nothing below may touch the hardware if it did not come back up - and
+	 * the channel restart at the end would do so even with no buffers to
+	 * restore. */
+	if (!powered) {
+		ret = -ENODEV;
+		goto fail;
+	}
+
+	for (i = 0; i < parked; i++) {
+		struct vb2_buffer *vb = dev_priv->parked_bufs[i];
+		struct h2t_buf_ctx *ctx;
+
+		ret = fthd_buffer_prepare(vb);
+		if (ret)
+			break;
+
+		/* The state a QBUF before STREAMON leaves behind, which is what
+		 * the submit loop in fthd_stream_start() looks for. */
+		spin_lock_irqsave(&dev_priv->buffer_lock, flags);
+		ctx = fthd_ctx_for_vb(dev_priv, vb);
+		if (ctx && ctx->state == BUF_ALLOC)
+			ctx->state = BUF_DRV_QUEUED;
+		else
+			ctx = NULL;
+		spin_unlock_irqrestore(&dev_priv->buffer_lock, flags);
+
+		if (!ctx) {
+			/* Cannot happen - the prepare above just claimed a slot
+			 * for this buffer.  Drop whatever it did claim so the
+			 * error path below finds no slot owning this buffer and
+			 * hands it back itself, rather than either path assuming
+			 * the other did. */
+			fthd_buffer_cleanup(vb);
+			ret = -ENOBUFS;
+			break;
+		}
+	}
+
+	if (!ret && dev_priv->parked_streaming)
+		ret = fthd_stream_start(dev_priv, false);
+
+	if (!ret) {
+		dev_priv->parked_streaming = false;
+		return;
+	}
+
+fail:
+	dev_priv->parked_streaming = false;
+	dev_warn(&dev_priv->pdev->dev,
+		 "could not resume capture (%d); failing the queue\n", ret);
+
+	/* Buffers that never made it back into a slot are still the driver's as
+	 * far as vb2 is concerned and have to be handed over explicitly.  The
+	 * ones that did are reachable through their slots. */
+	for (; i < parked; i++)
+		vb2_buffer_done(dev_priv->parked_bufs[i], VB2_BUF_STATE_ERROR);
+
+	fthd_return_all_buffers(dev_priv, VB2_BUF_STATE_ERROR);
 	vb2_queue_error(&dev_priv->vb2_queue);
 }
 

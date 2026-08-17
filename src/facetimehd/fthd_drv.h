@@ -122,6 +122,18 @@ struct fthd_private {
 	struct h2t_buf_ctx h2t_bufs[FTHD_BUFFERS];
 	unsigned int protocol_errors;
 
+	/* The buffers vb2 had handed to the driver when a system suspend
+	 * arrived, and whether the queue was streaming at the time. The resume
+	 * callback uses them to rebuild the ISP-side mappings the power cycle
+	 * destroyed and put the stream back on the air, so that an application
+	 * capturing across a suspend never sees an error. Only touched under
+	 * ioctl_lock, and only between fthd_v4l2_suspend_stop() and
+	 * fthd_v4l2_resume_start(); userspace is frozen for that whole window,
+	 * so the buffers cannot be freed under them. */
+	struct vb2_buffer *parked_bufs[FTHD_BUFFERS];
+	unsigned int parked_count;
+	bool parked_streaming;
+
 	struct v4l2_ctrl_handler v4l2_ctrl_handler;
 	/* True between a successful fthd_start_channel() and fthd_stop_channel().
 	 * The ISP only accepts the image-quality commands while the channel is

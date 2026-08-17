@@ -398,6 +398,8 @@ static void fthd_stop_firmware(struct fthd_private *dev_priv)
  * to stay valid for whatever remains of this boot.  Shares fthd_suspend()'s
  * hardware transition rather than reimplementing a partial one - the same
  * "drop the stream, then power down" sequence is exactly what's needed here.
+ * It does not park the stream for a resume the way fthd_suspend() does: this
+ * boot has no resume left, so a reader waiting on frames has to be told.
  */
 static void fthd_pci_shutdown(struct pci_dev *pdev)
 {
@@ -409,7 +411,7 @@ static void fthd_pci_shutdown(struct pci_dev *pdev)
 	mutex_lock(&dev_priv->ioctl_lock);
 
 	if (vb2_is_busy(&dev_priv->vb2_queue))
-		fthd_v4l2_suspend_stop(dev_priv);
+		fthd_v4l2_suspend_stop(dev_priv, false);
 
 	mutex_lock(&dev_priv->pm_lock);
 	fthd_pm_down(dev_priv);
@@ -779,6 +781,20 @@ static int fthd_runtime_resume(struct device *dev)
 	return ret;
 }
 
+/* Whether the ISP is up right now.  The sleep callbacks need it to tell "put
+ * the stream back" apart from "the camera is parked and nothing may talk to
+ * it"; @suspended is pm_lock's to answer. */
+static bool fthd_is_powered(struct fthd_private *dev_priv)
+{
+	bool powered;
+
+	mutex_lock(&dev_priv->pm_lock);
+	powered = !dev_priv->suspended;
+	mutex_unlock(&dev_priv->pm_lock);
+
+	return powered;
+}
+
 /*
  * System sleep.  Same hardware transition as the runtime path, but a system
  * suspend can arrive with the device open, so it takes the V4L2 ioctl lock to
@@ -790,7 +806,8 @@ static int fthd_runtime_resume(struct device *dev)
  * returns -EBUSY is just deferred, while an error here aborts the entire sleep
  * transition and leaves the machine awake.  A camera left streaming - by an
  * app the user forgot about, or one that had not noticed the lid closing - is
- * an ordinary thing to suspend with, so the stream is dropped instead.
+ * an ordinary thing to suspend with, so the stream is parked instead, and
+ * fthd_resume() puts it back.
  */
 static int __maybe_unused fthd_suspend(struct device *dev)
 {
@@ -803,7 +820,7 @@ static int __maybe_unused fthd_suspend(struct device *dev)
 	mutex_lock(&dev_priv->ioctl_lock);
 
 	if (vb2_is_busy(&dev_priv->vb2_queue))
-		fthd_v4l2_suspend_stop(dev_priv);
+		fthd_v4l2_suspend_stop(dev_priv, true);
 
 	/* The force helpers use the runtime-PM usage count to remember whether
 	 * the camera was actually in use.  In particular, an idle camera still
@@ -811,8 +828,13 @@ static int __maybe_unused fthd_suspend(struct device *dev)
 	 * needlessly reloading its firmware and immediately tearing it down. */
 	dev_priv->system_suspending = true;
 	ret = pm_runtime_force_suspend(dev);
-	if (ret)
+	if (ret) {
 		dev_priv->system_suspending = false;
+		/* The PM core does not resume a device whose suspend failed, so
+		 * fthd_resume() will not run and nothing else would ever unpark
+		 * the stream stopped above. */
+		fthd_v4l2_resume_start(dev_priv, fthd_is_powered(dev_priv));
+	}
 
 	mutex_unlock(&dev_priv->ioctl_lock);
 	return ret;
@@ -832,6 +854,15 @@ static int __maybe_unused fthd_resume(struct device *dev)
 	 * the next open(). */
 	ret = pm_runtime_force_resume(dev);
 	dev_priv->system_suspending = false;
+
+	/* Restart the stream fthd_suspend() parked, before userspace is thawed.
+	 * Only a stream can have parked anything, and one cannot exist without
+	 * an open fd holding a runtime-PM reference, so the force-resume above
+	 * has necessarily powered the hardware back up by the time this matters.
+	 * It reloads no firmware of its own; the cost is the channel-start
+	 * command sequence, paid only when something was actually capturing. */
+	fthd_v4l2_resume_start(dev_priv, fthd_is_powered(dev_priv));
+
 	mutex_unlock(&dev_priv->ioctl_lock);
 	return ret;
 }
