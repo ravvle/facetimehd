@@ -735,17 +735,22 @@ rectangle after a load starves". And the right edge alone is not it: the full
 array ends at `1280` and streams while a 640-wide crop ending at `1280`
 starves.
 
-`320` is `(1280 - 640) / 2` - exactly the centred position, and every rectangle
-that streamed sits at or left of centre. So either the limit is *centre* for
-the crop's width, or a fixed offset that happens to land near it; every
-rectangle tested so far was 640 wide, which makes the two indistinguishable. A
-320-wide crop centres at `480`, past anything a 640-wide crop could stream, and
-separates them. The `crop-geometry` section now does exactly that in two
-phases.
+**The rule is `left <= (sensor_width - crop_width) / 2`**: the crop may sit at
+or left of centre, never right of it. At 640 wide the boundary is exactly
+centre - `320` streams, `328` starves - and at 320 wide, whose centre is `480`,
+left `480` streams while `560` starves. That `480` is what rules out a fixed
+offset limit. Across every rectangle measured, three crop widths and the exact
+eight-pixel boundary at two different centres, it predicts 16 of 16 outcomes.
 
-No driver-side clamp is added on this. The rule is not yet known, and refusing
-or nudging rectangles on a guess would silently change what the application
-asked for - the same objection recorded when this was first found.
+The vertical axis is not covered by that evidence: every rectangle used to
+derive it had `top = 0`. Whether `top` faces the matching limit against
+`(sensor_height - crop_height) / 2` is what the section's third phase asks.
+
+No driver-side clamp is added yet. The horizontal rule is now measured rather
+than guessed, but it is measured on one sensor, the vertical half is open, and
+silently moving a rectangle the application asked for is its own harm - so the
+shape of any fix is a decision to take deliberately, not a side effect of
+learning the rule.
 
 Crop GET narrows it further from the other side: in both starving cases the ISP
 returned *exactly* the rectangle it was given. It is not rejecting the geometry

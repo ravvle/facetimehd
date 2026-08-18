@@ -2559,6 +2559,23 @@ CGEOF
                          "narrow_past$(( cg_centre2 + 80 ))"
             fi
 
+            # -- phase 3: the vertical axis. Phases 1 and 2 established
+            # left <= (sensor_w - crop_w) / 2 across three crop widths, but
+            # every one of those rectangles had top = 0, so nothing yet says
+            # whether top carries the same constraint. Left is held at 0 - well
+            # inside the known-good range - so any starvation here is the
+            # vertical axis and not a horizontal violation leaking in. Note the
+            # driver rounds left to eight pixels but not top, so a one-pixel
+            # step past centre is expressible here and is worth asking.
+            cg_set_output "$CROP_WIDTH" "$CROP_HEIGHT"
+            cg_centre_y=$(( (cg_sensor_h - cg_out_h) / 2 ))
+            result INFO crop-geometry.phase3 \
+                "vertical axis at left 0: ${cg_out_w}x${cg_out_h} crop, centred top is $cg_centre_y"
+            cg_probe 0 "$cg_centre_y" "$cg_out_w" "$cg_out_h" "vcentre$cg_centre_y"
+            cg_probe 0 $(( cg_centre_y + 1 )) "$cg_out_w" "$cg_out_h" \
+                     "vpast$(( cg_centre_y + 1 ))"
+            cg_probe 0 $(( cg_sensor_h - cg_out_h )) "$cg_out_w" "$cg_out_h" vfar
+
             if [ -n "$cg_default" ]; then
                 IFS=, read -r cd_l cd_t cd_w cd_h <<<"$cg_default"
                 v4l2-ctl --device "$DEVICE" \

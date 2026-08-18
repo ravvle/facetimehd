@@ -522,12 +522,42 @@ sits right of it. So:
 - **B.** `left` may not exceed a fixed limit somewhere in `320..400`,
   independent of the crop width.
 
-Both fit every measurement so far, because every rectangle tested has been 640
-wide, which makes the two coincide. A *narrower* crop separates them: a
-320-wide crop centres at left `480`, past anything a 640-wide crop could
-stream. Under A it streams there; under B it starves. The section now runs two
-phases - a fine walk just past centre at 640 wide, then the same probe at 320
-wide - which decides it and pins the boundary at the same time.
+The two-phase run decided it
+(`/tmp/facetimehd-hw-validate-20260818-210209.log`). At 640 wide the boundary
+is exactly the centred position - `320` streams and `328`, one alignment step
+past it, starves. Then at 320 wide, whose centre is `480`:
+
+| crop width | left | centre | Result |
+|---:|---:|---:|---|
+| 640 | `320` | `320` | streaming |
+| 640 | `328` | `320` | starved |
+| 320 | `320` | `480` | streaming |
+| 320 | `480` | `480` | **streaming** |
+| 320 | `560` | `480` | starved |
+
+`480` streaming at 320 wide kills reading B: no fixed limit in `320..400`
+admits it. **Reading A holds:**
+
+```text
+left <= (sensor_width - crop_width) / 2
+```
+
+The crop may sit at or left of centre and never right of it. Checked against
+every rectangle measured across all runs - three crop widths (`1280`, `640`,
+`320`), offsets from `0` to `640`, and the exact eight-pixel boundary at two
+different centres - it predicts **16 of 16** outcomes with no exceptions.
+
+This is a rule about the requested geometry, not about firmware state: the
+`crop_raw` readback showed firmware storing every one of these rectangles
+exactly, including the ones that then delivered nothing.
+
+What it does *not* yet cover is the vertical axis. Every rectangle in phases 1
+and 2 had `top = 0`, so whether `top` carries the matching constraint against
+`(sensor_height - crop_height) / 2` is untested. The one rectangle that varied
+it, `+640+360`, also violated the horizontal rule, so it says nothing. Phase 3
+holds `left` at `0` and walks `top` across its centred position, including a
+one-pixel step past it - expressible because the driver rounds `left` to eight
+pixels but not `top`.
 
 That run also exposed a defect in the harness rather than the driver. The
 section judged channel health with `capture_ok()`, which tests only
