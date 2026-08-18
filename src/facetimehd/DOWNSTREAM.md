@@ -761,11 +761,17 @@ widths, three crop heights, offsets `0` to `640`, and the exact boundary at
 eight-pixel resolution horizontally and one-pixel vertically - it predicts 20
 of 20 outcomes.
 
-No driver-side clamp is added yet, and that is now a deliberate open decision
-rather than a lack of evidence. The rule is measured on one sensor, and
-silently moving a rectangle the application asked for is its own harm - a
-`S_SELECTION` that quietly returns different geometry is the same class of
-surprise as the zoomed, off-centre picture under "Image geometry".
+**The driver deliberately does not clamp, adjust or refuse such a rectangle**,
+and that is a settled decision rather than missing evidence. Silently moving a
+rectangle the application asked for is its own harm - an `S_SELECTION` that
+quietly returns different geometry is the same class of surprise as the zoomed,
+off-centre picture under "Image geometry" - and the rule is measured on exactly
+one sensor, so a clamp derived from it would restrict valid rectangles anywhere
+it turned out to differ. The rule is documented instead: in README's
+"Troubleshooting and support" for anyone who hits the hang, and here for anyone
+working on the driver. Reconsider only with the same rule confirmed on other
+models, and even then prefer clamping over refusing, since `S_SELECTION` is an
+adjusting call.
 
 Crop GET narrows it further from the other side: in both starving cases the ISP
 returned *exactly* the rectangle it was given. It is not rejecting the geometry
