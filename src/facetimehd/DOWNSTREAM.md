@@ -761,17 +761,38 @@ widths, three crop heights, offsets `0` to `640`, and the exact boundary at
 eight-pixel resolution horizontally and one-pixel vertically - it predicts 20
 of 20 outcomes.
 
-**The driver deliberately does not clamp, adjust or refuse such a rectangle**,
-and that is a settled decision rather than missing evidence. Silently moving a
-rectangle the application asked for is its own harm - an `S_SELECTION` that
-quietly returns different geometry is the same class of surprise as the zoomed,
-off-centre picture under "Image geometry" - and the rule is measured on exactly
-one sensor, so a clamp derived from it would restrict valid rectangles anywhere
-it turned out to differ. The rule is documented instead: in README's
-"Troubleshooting and support" for anyone who hits the hang, and here for anyone
-working on the driver. Reconsider only with the same rule confirmed on other
-models, and even then prefer clamping over refusing, since `S_SELECTION` is an
-adjusting call.
+**`fthd_v4l2_set_crop()` clamps the origin to that maximum.** The deciding
+argument was reachability rather than tidiness: `S_SELECTION` is available to
+any local user who can open the video node, so leaving this unhandled let an
+ordinary application - buggy or hostile - deny the camera to every other
+process until it closed the device. It is not a kernel fault; across 25
+deliberate wedges there was no oops, no call trace and no IOMMU or DMAR fault,
+and with runtime PM enabled every one of them recovered on its own once the
+device went idle. But "recovers when the offender lets go" is a poor contract
+for a shared device.
+
+It clamps rather than refusing because `S_SELECTION` is an adjusting call, and
+because this function already adjusts: it rounds the width, aligns `left` to
+eight pixels, and enforces a floor at the output size. `G_SELECTION` reports
+what was programmed, so an application can see exactly what it got. Refusing
+with `-ERANGE` would have been louder but would break callers that correctly
+expect adjustment.
+
+The `ALIGN`-then-cap order in that function is load-bearing. `ALIGN` rounds
+**up**, the centred maximum is not necessarily a multiple of eight - `(848 -
+648) / 2` is `100` on the 12-inch MacBook's array - and rounding `100` up to
+`104` would produce precisely the past-centre rectangle the clamp exists to
+prevent. `tests/script-smoke.sh` asserts the ordering, not just the presence of
+a clamp.
+
+An earlier revision of this section recorded the opposite decision: document
+the rule and add no code, on the grounds that altering a requested rectangle is
+its own harm. That objection was weaker than it looked, since the driver
+already alters crop rectangles, and it did not account for the denial of
+service. The rule is still one sensor's, so the clamp is written against
+measured geometry rather than a magic constant: it derives from
+`sensor_width`/`sensor_height` and the requested crop size, so a model with a
+different array gets its own limit.
 
 Crop GET narrows it further from the other side: in both starving cases the ISP
 returned *exactly* the rectangle it was given. It is not rejecting the geometry

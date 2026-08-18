@@ -2196,13 +2196,14 @@ if wants crop; then
 
             # left top width height, and whether an exact readback is expected.
             #
-            # cornerflush is a regression case, not an exploratory one. On the
-            # MacBookAir7,2 a rectangle at left = sensor_w - out_w with top = 0
-            # - the top-right corner, flush to both edges, unscaled - is
-            # accepted by S_SELECTION and then produces no buffers at all on its
-            # first use, leaving the capture in vb2_wait_for_done_vb. Moving the
-            # top to 8, or the left to 632, makes it stream normally, so this
-            # exact pair is the reproducer and belongs in the suite.
+            # The two corner cases are regression cases, not exploratory ones.
+            # A crop origin past the array centre used to be accepted and then
+            # deliver no buffers at all, wedging the channel; the driver now
+            # clamps the origin to the centred maximum, so these rectangles
+            # come back adjusted and stream. They are marked 'rounded' for
+            # that reason - an exact readback would mean the clamp is gone.
+            # A starvation here now means the clamp failed, which is why the
+            # starved branch below is still a FAIL.
             far_left=$(( sensor_w - out_w ))
             far_top=$(( sensor_h - out_h ))
             crop_sig_tl=""
@@ -2221,8 +2222,8 @@ if wants crop; then
                         "8 8 $out_w $out_h exact topleft" \
                         "$mid_left $mid_top $out_w $out_h exact midoffset" \
                         "4 5 $out_w $out_h rounded misaligned" \
-                        "$far_left $far_top $out_w $out_h exact bottomright" \
-                        "$far_left 0 $out_w $out_h exact cornerflush"; do
+                        "$far_left $far_top $out_w $out_h rounded bottomright" \
+                        "$far_left 0 $out_w $out_h rounded cornerflush"; do
                 read -r want_l want_t want_w want_h exactness label <<<"$spec"
 
                 dmesg_mark
@@ -2376,23 +2377,25 @@ fi
 # Section: crop-geometry (opt-in)
 # FIRMWARE-REVERSE-ENGINEERING.md - "Complete dispatcher table sweep"
 #
-# Two jobs. It reads CISP_CMD_CH_CROP_GET while a stream is live, which is how
-# the command's two rectangles were identified as the active crop and the
-# sensor array. And it locates the crop rectangle that starves the stream.
+# This section found the crop starvation rule and now guards the fix for it.
 #
-# What the sweep established: with a 640-wide crop on a 1280-wide array, left
-# 0/8/240/320 stream and 400/480/560/632/640 starve, so the boundary sits
-# between 320 and 400. Five rectangles streamed consecutively on one firmware
-# load before one starved, which killed the "first far-offset rectangle after a
-# load starves" reading. The right edge alone is not it either: the full array
-# ends at 1280 and streams, while a 640-wide crop ending at 1280 starves.
+# It reads CISP_CMD_CH_CROP_GET while a stream is live, which is how the
+# command's two rectangles were identified as the active crop and the sensor
+# array. Walking the origin then established that firmware starves whenever it
+# passes the centred position on either axis:
 #
-# Two readings survive, and phase 2 separates them:
-#   A. left may not exceed the centred position, (sensor_w - crop_w) / 2.
-#      For a 640-wide crop that is exactly 320 - the last offset that streamed.
-#   B. left may not exceed a fixed limit near 320-400, whatever the crop width.
-# A 320-wide crop centres at left 480. Under A it streams there; under B it
-# starves. Phase 2 asks exactly that.
+#     left <= (sensor_width  - crop_width)  / 2
+#     top  <= (sensor_height - crop_height) / 2
+#
+# measured across crop widths 1280/640/320 and heights 720/360/240, exact to
+# eight pixels horizontally and to one pixel vertically (top 180 streams, 181
+# starves). The driver clamps the origin to that maximum, so every rectangle
+# below should now come back adjusted and stream.
+#
+# The probes deliberately ask for origins past centre. Each one is therefore a
+# test that the clamp caught it: a rectangle that delivers no frames means the
+# clamp regressed, and is reported as a failure. The wedge-recovery machinery
+# is kept as a safety net for exactly that case.
 #
 # It changes no firmware state: crop and format go through the ordinary
 # S_SELECTION/S_FMT paths, and every firmware command sent is a GET.
@@ -2491,7 +2494,13 @@ CGEOF
                 if [ "$bytes" -ge "$cg_frame_size" ]; then
                     flow="streaming"
                 else
+                    # Since the driver clamps the origin to the centred
+                    # maximum, no rectangle reachable through S_SELECTION
+                    # should starve any more. One that does means the clamp
+                    # regressed, so this is a failure rather than a datum.
                     flow="no frames delivered"
+                    result FAIL "crop-geometry.$label.starved" \
+                        "$want delivered no frames; the centred-origin clamp should have prevented this"
                 fi
 
                 if [ -z "$raw" ]; then
@@ -2526,7 +2535,7 @@ CGEOF
                 fi
             }
 
-            # -- phase 1: 640-wide crop, locate the boundary between 320 and 400
+            # -- phase 1: 640-wide crop, origins at and past the centred maximum
             cg_set_output "$CROP_WIDTH" "$CROP_HEIGHT"
             cg_centre=$(( (cg_sensor_w - cg_out_w) / 2 ))
             cg_far_left=$(( cg_sensor_w - cg_out_w ))
@@ -2535,16 +2544,17 @@ CGEOF
 
             cg_probe 0 0 "$cg_sensor_w" "$cg_sensor_h" full
             cg_probe "$cg_centre" 0 "$cg_out_w" "$cg_out_h" "atcentre$cg_centre"
-            # Just past centre. Under reading A this is the first to starve.
+            # Past centre: each of these is clamped back to the centred maximum.
             for cg_step in 8 24 56 80; do
                 cg_probe $(( cg_centre + cg_step )) 0 "$cg_out_w" "$cg_out_h" \
                          "past$(( cg_centre + cg_step ))"
             done
             cg_probe "$cg_far_left" 0 "$cg_out_w" "$cg_out_h" cornerflush
 
-            # -- phase 2: narrower crop. Its centred left is further right than
-            # anything phase 1 could stream, so a stream there is reading A and
-            # a starve is reading B.
+            # -- phase 2: narrower crop, whose centred left (480 on a 1280 array)
+            # is further right than anything a 640-wide crop may use. This is
+            # what proved the limit tracks the crop width rather than being a
+            # fixed offset, and it checks the clamp scales with the width too.
             cg_set_output $(( CROP_WIDTH / 2 )) $(( CROP_HEIGHT / 2 ))
             if [ "$cg_out_w" -ge "$CROP_WIDTH" ]; then
                 result SKIP crop-geometry.phase2 \
@@ -2559,14 +2569,11 @@ CGEOF
                          "narrow_past$(( cg_centre2 + 80 ))"
             fi
 
-            # -- phase 3: the vertical axis. Phases 1 and 2 established
-            # left <= (sensor_w - crop_w) / 2 across three crop widths, but
-            # every one of those rectangles had top = 0, so nothing yet says
-            # whether top carries the same constraint. Left is held at 0 - well
-            # inside the known-good range - so any starvation here is the
-            # vertical axis and not a horizontal violation leaking in. Note the
-            # driver rounds left to eight pixels but not top, so a one-pixel
-            # step past centre is expressible here and is worth asking.
+            # -- phase 3: the vertical axis, which is symmetric. Left is held at
+            # 0 so anything seen here is the vertical limit and not a
+            # horizontal violation leaking in. The driver rounds left to eight
+            # pixels but not top, which is why a one-pixel step past centre is
+            # expressible on this axis - and it starved, before the clamp.
             cg_set_output "$CROP_WIDTH" "$CROP_HEIGHT"
             cg_centre_y=$(( (cg_sensor_h - cg_out_h) / 2 ))
             result INFO crop-geometry.phase3 \

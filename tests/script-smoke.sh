@@ -403,6 +403,21 @@ else
     result bad "a swept-table readback is writable or exposed through V4L2"
 fi
 
+# A crop origin past the array centre starves the stream and wedges the channel
+# on this firmware, so the driver clamps it. The ALIGN-then-cap order matters:
+# ALIGN rounds up, and rounding up past the centred maximum would recreate the
+# rectangle the clamp exists to prevent.
+if grep -q 'max_left = (max_w - r->width)  / 2;' "$v4l2_c" &&
+   grep -q 'max_top  = (max_h - r->height) / 2;' "$v4l2_c" &&
+   grep -q 'r->left = clamp_t(unsigned int, r->left, 0, max_left);' "$v4l2_c" &&
+   grep -q 'r->top  = clamp_t(unsigned int, r->top,  0, max_top);' "$v4l2_c" &&
+   grep -A 2 'r->left = ALIGN(r->left, 8);' "$v4l2_c" |
+        grep -q 'r->left = round_down(max_left, 8);'; then
+    result ok "crop origin is clamped to the array centre, and aligned before capping"
+else
+    result bad "the centred-origin crop clamp is missing or can round past its maximum"
+fi
+
 if grep -q 'strcmp(strim(buf), "same")' "$debugfs" &&
    grep -q 'debugfs_create_file("roundtrip_ae_bias", 0200' "$debugfs" &&
    grep -q 'debugfs_create_file("roundtrip_ae_gain_cap_min", 0200' "$debugfs" &&

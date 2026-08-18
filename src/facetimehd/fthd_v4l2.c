@@ -1332,7 +1332,7 @@ static void fthd_v4l2_get_crop(struct fthd_private *dev_priv,
 
 /*
  * Fit @r inside the sensor array, keeping it at least as large as the output
- * format, and store it.  Shared by S_SELECTION and by the sensor-geometry
+ * format and its origin at or before the array centre, and store it.  Shared by S_SELECTION and by the sensor-geometry
  * fixups, so a crop can never survive into a state the ISP would reject: the
  * sensor's real size is only learned at channel start, and on the 12-inch
  * MacBook (848x588) it is smaller than the fallback this starts out with.
@@ -1344,6 +1344,7 @@ static void fthd_v4l2_set_crop(struct fthd_private *dev_priv,
 	unsigned int max_h = dev_priv->sensor_height ? : FTHD_MAX_HEIGHT;
 	unsigned int min_w = max(FTHD_MIN_WIDTH, dev_priv->fmt.fmt.width);
 	unsigned int min_h = max(FTHD_MIN_HEIGHT, dev_priv->fmt.fmt.height);
+	unsigned int max_left, max_top;
 
 	/* The output can never exceed the array, so neither can the floor. */
 	min_w = min(min_w, max_w);
@@ -1367,11 +1368,35 @@ static void fthd_v4l2_set_crop(struct fthd_private *dev_priv,
 	if (r->top < 0)
 		r->top = 0;
 
-	r->left = clamp_t(unsigned int, r->left, 0, max_w - r->width);
-	r->top  = clamp_t(unsigned int, r->top,  0, max_h - r->height);
+	/*
+	 * The origin may not pass the centred position on either axis.  A
+	 * rectangle beyond it is accepted by firmware and stored exactly - the
+	 * crop_raw readback confirms that - and then delivers no buffers at
+	 * all, wedging the channel until the firmware is reloaded.  Measured on
+	 * a MacBookAir7,2 across crop widths 1280/640/320 and heights
+	 * 720/360/240: streaming at or left of centre and starved past it,
+	 * exact to eight pixels horizontally and to a single pixel vertically
+	 * (top 180 streams, 181 starves).  Equivalently left + right must not
+	 * exceed the array width, nor top + bottom its height.
+	 *
+	 * Clamping rather than refusing, because S_SELECTION is an adjusting
+	 * call and this driver already rounds the rectangle: G_SELECTION
+	 * reports what was programmed, so an application can see what it got.
+	 * See DOWNSTREAM.md, "Frame-rate decimation and cropping".
+	 */
+	max_left = (max_w - r->width)  / 2;
+	max_top  = (max_h - r->height) / 2;
+
+	r->left = clamp_t(unsigned int, r->left, 0, max_left);
+	r->top  = clamp_t(unsigned int, r->top,  0, max_top);
+	/*
+	 * ALIGN rounds up, so it has to be capped again afterwards: the centred
+	 * maximum is not necessarily a multiple of eight, and rounding up past
+	 * it would produce exactly the rectangle this is here to prevent.
+	 */
 	r->left = ALIGN(r->left, 8);
-	if (r->left + r->width > max_w)
-		r->left = round_down(max_w - r->width, 8);
+	if (r->left > max_left)
+		r->left = round_down(max_left, 8);
 
 	dev_priv->fmt.x1 = r->left;
 	dev_priv->fmt.y1 = r->top;

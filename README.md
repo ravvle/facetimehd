@@ -463,16 +463,15 @@ Common answers:
 | Camera unreliable when idle | Driver runtime PM explicitly enabled | `sudo ./scripts/install.sh --runtime-pm off` |
 | Live reload freezes the machine | Kernel-driver regression | Reinstall with `--no-load --runtime-pm off`, then reboot deliberately |
 | Install fails at the Apple download | Apple's URL moved | `./scripts/extract-firmware.sh --check-sources` and open an issue |
-| Capture hangs after setting a crop, and every later start fails | Crop origin past the sensor centre | Keep `left`/`top` at or before centre (see below); reload the driver to clear it |
+| Cropped picture is not where you asked for it | Crop origin clamped to the array centre | Expected; read the rectangle back with `G_SELECTION` (see below) |
 
-### Cropping past the centre hangs the camera
+### The crop origin is limited to the array centre
 
-Asking for a crop rectangle whose origin sits past the middle of the sensor
-makes the ISP accept it and then deliver no frames at all. The capture blocks,
-and every later attempt to start the stream fails until the driver is reloaded.
-It is a firmware behaviour, measured on a MacBookAir7,2, and the driver
-deliberately does not second-guess the rectangle you asked for. Keep the origin
-at or before the centred position on both axes:
+If you set a crop rectangle, the driver may move its origin left or up. That is
+deliberate. On this firmware a crop whose origin sits past the middle of the
+sensor is accepted and then produces no frames at all, and the camera stays
+unusable — for every application, not just yours — until the driver reloads. So
+the origin is clamped to:
 
 ```text
 left <= (sensor_width  - crop_width)  / 2
@@ -480,10 +479,13 @@ top  <= (sensor_height - crop_height) / 2
 ```
 
 Equivalently, the crop's centre may not pass the sensor's centre. Landing
-exactly on the limit is fine — a centred rectangle is the furthest you can go.
-Most applications never set a crop and are unaffected. If you hit it,
-`sudo modprobe -r facetimehd && sudo modprobe facetimehd` clears the wedged
-channel.
+exactly on the limit is fine — a centred rectangle is the furthest right and
+furthest down you can go, and a smaller crop can start further along than a
+larger one. `left` is also rounded to a multiple of eight pixels.
+
+`VIDIOC_G_SELECTION` always reports the rectangle that was actually programmed,
+so read it back if the framing matters. Most applications never set a crop and
+are unaffected.
 
 ### Opening an issue
 
