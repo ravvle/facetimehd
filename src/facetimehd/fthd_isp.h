@@ -713,6 +713,33 @@ struct isp_cmd_channel_u32 {
 	u32 value;
 };
 
+/*
+ * Crop GET (CISP_CMD_CH_CROP_GET) response, recovered from firmware handler
+ * 0x478a2: it writes eight consecutive words at command offsets +0x0c..+0x28,
+ * copied straight out of two groups of channel-context fields (0xd0..0xdc then
+ * 0xb0..0xbc).  CISP_CMD_CH_CROP_SET sends a single four-word rectangle, so
+ * this returns two of them.  Which group is the rectangle the host asked for
+ * and which is the geometry the ISP actually latched is NOT established, so
+ * they are named by position rather than by meaning.  Do not rename these to
+ * "requested"/"effective" without hardware evidence that says which is which.
+ */
+struct isp_cmd_channel_crop_get {
+	u32 channel;
+	u32 rect1[4];
+	u32 rect2[4];
+};
+
+/*
+ * AWB second-gain GET (CISP_CMD_CH_AWB_2ND_GAIN_GET) response.  Handler
+ * 0x4a9b4 loads three destination pointers - +0x0c, +0x10 and +0x14 - and
+ * calls a channel-context vtable entry to fill them.  Three words, not the two
+ * an R/B reading would predict, so no channel is named here.
+ */
+struct isp_cmd_channel_awb_2nd_gain_get {
+	u32 channel;
+	u32 gain[3];
+};
+
 /* Apple AE metering-mode GET writes one byte at command offset +0x0c. */
 struct isp_cmd_channel_ae_metering_mode_get {
 	u32 channel;
@@ -896,6 +923,10 @@ extern int fthd_isp_cmd_channel_ae_sensor_integration_time_max_get(struct fthd_p
 extern int fthd_isp_cmd_channel_ae_integration_time_set(struct fthd_private *dev_priv, int channel, unsigned int usec);
 extern int fthd_isp_cmd_channel_ae_gain_set(struct fthd_private *dev_priv, int channel, unsigned int gain);
 extern int fthd_isp_cmd_channel_awb_cct_get(struct fthd_private *dev_priv, int channel, u32 *value);
+extern int fthd_isp_cmd_channel_awb_2nd_gain_get(struct fthd_private *dev_priv, int channel, u32 gain[3]);
+extern int fthd_isp_cmd_channel_ae_frame_rate_max_get(struct fthd_private *dev_priv, int channel, u32 *value);
+extern int fthd_isp_cmd_channel_ae_frame_rate_min_get(struct fthd_private *dev_priv, int channel, u32 *value);
+extern int fthd_isp_cmd_channel_crop_get(struct fthd_private *dev_priv, int channel, u32 rect1[4], u32 rect2[4]);
 extern int fthd_isp_cmd_channel_awb_cct_manual(struct fthd_private *dev_priv, int channel, unsigned int cct);
 extern int fthd_isp_cmd_channel_sharpness_set(struct fthd_private *dev_priv, int channel, int sharpness);
 extern int fthd_isp_cmd_channel_test_pattern_config(struct fthd_private *dev_priv, int channel, int pattern);

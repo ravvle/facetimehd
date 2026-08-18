@@ -1372,8 +1372,60 @@ FTHD_DEFINE_CHANNEL_U32_GET(fthd_isp_cmd_channel_ae_sensor_integration_time_max_
 			    CISP_CMD_CH_AE_SENSOR_INTEGRATION_TIME_MAX_GET)
 FTHD_DEFINE_CHANNEL_U32_GET(fthd_isp_cmd_channel_awb_cct_get,
 			    CISP_CMD_CH_AWB_CCT_GET)
+/*
+ * Frame-rate limits.  Handlers 0x49a7c and 0x49ac2 store a single word at
+ * +0x0c through a shared helper picked by its third argument (1 maximum, 0
+ * minimum), so the plain scalar layout is right.  Both first compare a
+ * channel-context field against 0xffff and take a path that does not write
+ * +0x0c when it matches, which is a not-set sentinel: in that case the caller
+ * reads back the zero it submitted rather than a rate.  A zero here therefore
+ * means "firmware wrote nothing", not "zero fps"; the readback says so.
+ */
+FTHD_DEFINE_CHANNEL_U32_GET(fthd_isp_cmd_channel_ae_frame_rate_max_get,
+			    CISP_CMD_CH_AE_FRAME_RATE_MAX_GET)
+FTHD_DEFINE_CHANNEL_U32_GET(fthd_isp_cmd_channel_ae_frame_rate_min_get,
+			    CISP_CMD_CH_AE_FRAME_RATE_MIN_GET)
 
 #undef FTHD_DEFINE_CHANNEL_U32_GET
+
+int fthd_isp_cmd_channel_awb_2nd_gain_get(struct fthd_private *dev_priv,
+					  int channel, u32 gain[3])
+{
+	struct isp_cmd_channel_awb_2nd_gain_get cmd;
+	int ret, len = sizeof(cmd);
+
+	memset(&cmd, 0, sizeof(cmd));
+	cmd.channel = channel;
+	ret = fthd_isp_cmd(dev_priv, CISP_CMD_CH_AWB_2ND_GAIN_GET,
+			   &cmd, sizeof(cmd), &len);
+	if (ret)
+		return ret;
+	if (len != sizeof(cmd))
+		return -EIO;
+
+	memcpy(gain, cmd.gain, sizeof(cmd.gain));
+	return 0;
+}
+
+int fthd_isp_cmd_channel_crop_get(struct fthd_private *dev_priv, int channel,
+				  u32 rect1[4], u32 rect2[4])
+{
+	struct isp_cmd_channel_crop_get cmd;
+	int ret, len = sizeof(cmd);
+
+	memset(&cmd, 0, sizeof(cmd));
+	cmd.channel = channel;
+	ret = fthd_isp_cmd(dev_priv, CISP_CMD_CH_CROP_GET,
+			   &cmd, sizeof(cmd), &len);
+	if (ret)
+		return ret;
+	if (len != sizeof(cmd))
+		return -EIO;
+
+	memcpy(rect1, cmd.rect1, sizeof(cmd.rect1));
+	memcpy(rect2, cmd.rect2, sizeof(cmd.rect2));
+	return 0;
+}
 
 static int fthd_isp_cmd_channel_u32_set(struct fthd_private *dev_priv,
 					enum fthd_isp_cmds opcode, int channel,

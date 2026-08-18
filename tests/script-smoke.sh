@@ -384,6 +384,25 @@ else
     result bad "firmware readbacks bypass their stream or opcode safety boundary"
 fi
 
+# The readbacks added from the dispatcher table sweep. Each is a GET recovered
+# from a firmware handler, so each is mode 0400 and none may reach V4L2: a
+# control would put it back in the v4l2_ctrl_handler_setup() replay path that
+# caused the lockups, and none of these has an established meaning anyway.
+isp_c="$REPO_DIR/src/facetimehd/fthd_isp.c"
+v4l2_c="$REPO_DIR/src/facetimehd/fthd_v4l2.c"
+if grep -q 'debugfs_create_file("ae_frame_rate_max_raw", 0400' "$debugfs" &&
+   grep -q 'debugfs_create_file("ae_frame_rate_min_raw", 0400' "$debugfs" &&
+   grep -q 'debugfs_create_file("awb_2nd_gain_raw", 0400' "$debugfs" &&
+   grep -q 'debugfs_create_file("crop_raw", 0400' "$debugfs" &&
+   grep -q 'CISP_CMD_CH_AWB_2ND_GAIN_GET' "$isp_c" &&
+   grep -q 'CISP_CMD_CH_CROP_GET' "$isp_c" &&
+   ! grep -q 'CISP_CMD_CH_AWB_2ND_GAIN_MANUAL' "$isp_c" &&
+   ! grep -qE 'awb_2nd_gain|frame_rate_(max|min)_get|crop_get' "$v4l2_c"; then
+    result ok "swept-table readbacks are 0400 and reach no V4L2 control"
+else
+    result bad "a swept-table readback is writable or exposed through V4L2"
+fi
+
 if grep -q 'strcmp(strim(buf), "same")' "$debugfs" &&
    grep -q 'debugfs_create_file("roundtrip_ae_bias", 0200' "$debugfs" &&
    grep -q 'debugfs_create_file("roundtrip_ae_gain_cap_min", 0200' "$debugfs" &&

@@ -67,7 +67,7 @@ NV12_FRAMES="${NV12_FRAMES:-10}"
 # default; profiling, same-value setter round trips, metering semantics and the
 # still-unadvertised NV16 format remain explicit hardware work.
 DEFAULT_SECTIONS="probe timing controls decimation crop nv12 runtimepm suspend wedged readbacks"
-ALL_SECTIONS="$DEFAULT_SECTIONS readback-profile roundtrips metering-modes"
+ALL_SECTIONS="$DEFAULT_SECTIONS readback-profile roundtrips metering-modes crop-geometry"
 SECTIONS="$DEFAULT_SECTIONS"
 DO_REBOOT=0
 INTERACTIVE=1
@@ -1318,6 +1318,9 @@ if wants readbacks; then
             while read -r node; do
                 [ -n "$node" ] || continue
                 if value="$(cat "$DEBUGFS_DEVICE/$node" 2>>"$REPORT")"; then
+                    # crop_raw returns two rectangles on two lines; the summary
+                    # is one line per result, so flatten before reporting.
+                    value="$(printf '%s' "$value" | tr '\n' ' ' | sed 's/ *$//')"
                     result PASS "readbacks.$node" "$value"
                 else
                     result FAIL "readbacks.$node" "GET failed"
@@ -1334,7 +1337,39 @@ ae_integration_time_max_raw
 ae_sensor_integration_time_min_raw
 ae_sensor_integration_time_max_raw
 ae_metering_mode_raw
+ae_frame_rate_max_raw
+ae_frame_rate_min_raw
+awb_2nd_gain_raw
+crop_raw
 EOF
+
+            # Crop GET against the rectangle the driver actually asked for.
+            # This is the point of the node: CISP_CMD_CH_CROP_GET returns two
+            # four-word rectangles and it is not established which is which, so
+            # the check is that *some* returned rectangle matches the request.
+            # The driver sends (left, top, left+width, top+height), so the
+            # expected tuple is derived that way and not from width/height.
+            crop_now="$(current_crop)"
+            if [ -z "$crop_now" ]; then
+                result WARN readbacks.crop_geometry \
+                    "could not read the current crop rectangle to compare against"
+            else
+                read -r c_l c_t c_w c_h <<CROPEOF
+$crop_now
+CROPEOF
+                want="$c_l $c_t $((c_l + c_w)) $((c_t + c_h))"
+                if grep -qx -- "$want" "$DEBUGFS_DEVICE/crop_raw" 2>/dev/null; then
+                    result PASS readbacks.crop_geometry \
+                        "a returned rectangle matches the requested $want"
+                else
+                    # Not a failure: the firmware may hold this geometry in a
+                    # different encoding, and nothing about the two groups'
+                    # meaning is established yet. Record both so the next run
+                    # has the raw evidence to interpret.
+                    result WARN readbacks.crop_geometry \
+                        "requested $want, firmware returned $(tr '\n' '/' < "$DEBUGFS_DEVICE/crop_raw" 2>/dev/null)"
+                fi
+            fi
 
             # The same AWB CCT value through its V4L2 control, which is what a
             # normal application sees. It is read-only and volatile, so this
@@ -2333,6 +2368,200 @@ if wants crop; then
             v4l2-ctl --device "$DEVICE" \
                 --set-selection="target=crop,left=$d_l,top=$d_t,width=$d_w,height=$d_h" \
                 >>"$REPORT" 2>&1 || true
+        fi
+    fi
+fi
+
+# ============================================================================
+# Section: crop-geometry (opt-in)
+# FIRMWARE-REVERSE-ENGINEERING.md - "Complete dispatcher table sweep"
+#
+# CISP_CMD_CH_CROP_GET returns two four-word rectangles and it is not
+# established which is the geometry the host asked for and which is what the
+# ISP latched. At the default rectangle they are identical, so the readbacks
+# section cannot separate them. Separating them needs a rectangle the ISP does
+# not honour verbatim - which is the far-corner case that starves the stream.
+#
+# So this samples crop_raw while a stream is actually running, across a set of
+# rectangles ordered safe-first, with the two known pathological corners last
+# because a starved rectangle wedges the channel. A starving rectangle is the
+# most interesting sample here, not a failure: the channel still starts, so the
+# GET still answers, and that answer is the point of the section.
+#
+# It changes no firmware state: crop is set through the ordinary S_SELECTION
+# path the crop section already uses, and every command sent is a GET.
+# ============================================================================
+if wants crop-geometry; then
+    step "crop-geometry: reading the ISP's own crop rectangles per geometry"
+    log_section "SECTION crop-geometry"
+
+    [ -n "$DEVICE" ] || wait_for_device || true
+    DEBUGFS_DEVICE="/sys/kernel/debug/facetimehd/${SLOT}"
+    if [ -z "$DEVICE" ]; then
+        result SKIP crop-geometry "no video node"
+    elif [ ! -r "$DEBUGFS_DEVICE/crop_raw" ]; then
+        result SKIP crop-geometry.debugfs \
+            "crop_raw is unreadable (mount debugfs and run as root)"
+    else
+        cg_bounds="$(v4l2-ctl --device "$DEVICE" \
+                     --get-selection=target=crop_bounds 2>/dev/null |
+                     sed -n 's/.*Width \([0-9]*\), Height \([0-9]*\).*/\1 \2/p' | head -1)"
+        cg_default="$(v4l2-ctl --device "$DEVICE" \
+                      --get-selection=target=crop_default 2>/dev/null |
+                      sed -n 's/.*Left \([0-9-]*\), Top \([0-9-]*\), Width \([0-9]*\), Height \([0-9]*\).*/\1,\2,\3,\4/p' | head -1)"
+        if [ -z "$cg_bounds" ]; then
+            result SKIP crop-geometry.bounds "G_SELECTION did not report crop bounds"
+        else
+            cg_sensor_w="${cg_bounds%% *}"
+            cg_sensor_h="${cg_bounds##* }"
+            v4l2-ctl --device "$DEVICE" \
+                --set-fmt-video="width=$CROP_WIDTH,height=$CROP_HEIGHT,pixelformat=YUYV" \
+                >>"$REPORT" 2>&1 || true
+            cg_wh="$(fmt_field 'Width\/Height')"
+            cg_out_w="${cg_wh%%/*}"
+            cg_out_h="${cg_wh##*/}"
+            cg_frame_size=$(( cg_out_w * 2 * cg_out_h ))
+            cg_far_left=$(( cg_sensor_w - cg_out_w ))
+            cg_far_top=$(( cg_sensor_h - cg_out_h ))
+            cg_mid_left="$(( ((cg_sensor_w - cg_out_w) / 2) & ~7 ))"
+            cg_mid_top=$(( (cg_sensor_h - cg_out_h) / 2 ))
+            cg_wedged=0
+
+            # capture_ok() judges by v4l2-ctl's exit status, and v4l2-ctl exits
+            # 0 even when VIDIOC_STREAMON fails - which is exactly what a
+            # wedged channel does. The first run of this section used it and
+            # silently reported no wedge while the channel was plainly dead,
+            # so health is judged by whether a whole frame arrived.
+            cg_capture_ok() {
+                local f="/tmp/facetimehd-cropgeom-probe.raw" bytes
+                rm -f "$f"
+                timeout -s TERM "$(capture_timeout_secs 5 30)" \
+                    v4l2-ctl --device "$DEVICE" --stream-mmap --stream-count=5 \
+                             --stream-to="$f" >>"$REPORT" 2>&1 || true
+                bytes="$(stat -c %s "$f" 2>/dev/null || echo 0)"
+                rm -f "$f"
+                [ "$bytes" -ge "$cg_frame_size" ]
+            }
+
+            # A left-offset sweep, because the two readings that survived the
+            # earlier runs are "beyond some left offset it starves" and "the
+            # first far-offset rectangle after a firmware load starves". Both
+            # far corners starved, and so did left = 632, whose right edge is
+            # NOT flush with the array - so a flush right edge is not the
+            # trigger. What is known is that left 0, 8 and 320 streamed while
+            # 632 and 640 starved, so the boundary lies between 320 and 632.
+            #
+            # Each sweep step is tested after the previous one's recovery, so a
+            # step that streams is a step that did not starve as the first
+            # far-offset rectangle on its own firmware load. One that streams
+            # therefore falsifies the "first far-offset" reading outright and
+            # leaves a plain positional threshold, which the sweep also locates.
+            # The tops are held at 0 so left is the only variable.
+            cg_sweep=""
+            for cg_frac in 3 4 5 6 7; do
+                cg_sweep="$cg_sweep $(( (cg_far_left * cg_frac / 8) & ~7 ))"
+            done
+            cg_specs="0 0 $cg_sensor_w $cg_sensor_h full
+8 8 $cg_out_w $cg_out_h topleft
+$cg_mid_left $cg_mid_top $cg_out_w $cg_out_h midoffset"
+            for cg_off in $cg_sweep; do
+                cg_specs="$cg_specs
+$cg_off 0 $cg_out_w $cg_out_h sweep$cg_off"
+            done
+            cg_specs="$cg_specs
+$(( cg_far_left - 8 )) 0 $cg_out_w $cg_out_h nearcorner
+$cg_far_left $cg_far_top $cg_out_w $cg_out_h bottomright
+$cg_far_left 0 $cg_out_w $cg_out_h cornerflush"
+
+            while IFS= read -r cg_spec; do
+                [ -n "$cg_spec" ] || continue
+                read -r cg_l cg_t cg_w cg_h cg_label <<<"$cg_spec"
+
+                dmesg_mark
+                if ! v4l2-ctl --device "$DEVICE" \
+                        --set-selection="target=crop,left=$cg_l,top=$cg_t,width=$cg_w,height=$cg_h" \
+                        >>"$REPORT" 2>&1; then
+                    result FAIL "crop-geometry.$cg_label.set" \
+                        "S_SELECTION rejected ${cg_w}x${cg_h}+${cg_l}+${cg_t}"
+                    continue
+                fi
+                cg_got="$(current_crop)"
+                read -r g_l g_t g_w g_h <<CGEOF
+$cg_got
+CGEOF
+                cg_want="$g_l $g_t $((g_l + g_w)) $((g_t + g_h))"
+
+                # A background stream so the channel is running while the GET
+                # goes out. The process merely being alive is enough for that -
+                # a starved rectangle sits in vb2_wait_for_done_vb with the
+                # channel started, which is precisely the case worth sampling -
+                # so frames are counted separately to say which happened.
+                cg_cap="/tmp/facetimehd-cropgeom-$cg_label.raw"
+                rm -f "$cg_cap"
+                v4l2-ctl --device "$DEVICE" --stream-mmap --stream-count=100000 \
+                         --stream-to="$cg_cap" >>"$REPORT" 2>&1 &
+                cg_pid=$!
+                sleep 3
+                cg_raw=""
+                if kill -0 "$cg_pid" 2>/dev/null; then
+                    cg_raw="$(tr '\n' '/' < "$DEBUGFS_DEVICE/crop_raw" 2>/dev/null | sed 's|/$||')"
+                fi
+                kill "$cg_pid" 2>/dev/null || true
+                wait "$cg_pid" 2>/dev/null || true
+                cg_bytes="$(stat -c %s "$cg_cap" 2>/dev/null || echo 0)"
+                rm -f "$cg_cap"
+                if [ "$cg_bytes" -ge "$cg_frame_size" ]; then
+                    cg_flow="streaming"
+                else
+                    cg_flow="no frames delivered"
+                fi
+
+                if [ -z "$cg_raw" ]; then
+                    result WARN "crop-geometry.$cg_label" \
+                        "requested $cg_want, but the channel was not running to read crop_raw"
+                elif [ "$cg_raw" = "$cg_want/$cg_want" ]; then
+                    result PASS "crop-geometry.$cg_label" \
+                        "both rectangles are $cg_want, matching the request ($cg_flow)"
+                else
+                    # The interesting outcome: the two groups disagree, which
+                    # is what tells them apart. Not a failure - it is the
+                    # measurement this section exists to take.
+                    result INFO "crop-geometry.$cg_label" \
+                        "requested $cg_want, firmware returned $cg_raw ($cg_flow)"
+                fi
+
+                # Restore a rectangle known to stream before testing recovery,
+                # so this measures the channel's health and not the geometry
+                # that was just set.
+                v4l2-ctl --device "$DEVICE" \
+                    --set-selection="target=crop,left=0,top=0,width=$cg_sensor_w,height=$cg_sensor_h" \
+                    >>"$REPORT" 2>&1 || true
+                if ! cg_capture_ok; then
+                    cg_wedged=1
+                    result INFO "crop-geometry.$cg_label.wedged" \
+                        "the channel stopped delivering after this rectangle"
+                    if [ "$(cat /sys/module/$MODULE_NAME/parameters/runtime_pm 2>/dev/null)" = Y ]; then
+                        sleep "$IDLE_WAIT"
+                        cg_capture_ok && cg_wedged=0
+                    fi
+                    if [ "$cg_wedged" -eq 0 ]; then
+                        result INFO "crop-geometry.$cg_label.recovered" \
+                            "a runtime-PM cycle reloaded firmware for the next rectangle"
+                    else
+                        result WARN "crop-geometry.$cg_label.recovered" \
+                            "the channel did not come back; later rectangles are not trustworthy"
+                    fi
+                fi
+            done <<CGSPECS
+$cg_specs
+CGSPECS
+
+            if [ -n "$cg_default" ]; then
+                IFS=, read -r cd_l cd_t cd_w cd_h <<<"$cg_default"
+                v4l2-ctl --device "$DEVICE" \
+                    --set-selection="target=crop,left=$cd_l,top=$cd_t,width=$cd_w,height=$cd_h" \
+                    >>"$REPORT" 2>&1 || true
+            fi
         fi
     fi
 fi

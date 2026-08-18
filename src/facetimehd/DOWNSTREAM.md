@@ -316,6 +316,88 @@ sampled while streaming rather than failing or powering the ISP up — a
 diagnostic read is not a reason to retrain DDR and re-upload firmware, and
 returning an error there would fail `v4l2-compliance` for no gain.
 
+## Readbacks recovered from the dispatcher sweep
+
+Decoding all twelve of the firmware's dispatcher jump tables (see
+`FIRMWARE-REVERSE-ENGINEERING.md`, "Complete dispatcher table sweep") settled
+which commands this firmware actually implements, rather than which ones
+upstream's enum has names for. Four implemented GETs are now exposed as
+mode-`0400` debugfs files alongside the existing readbacks:
+`ae_frame_rate_max_raw`, `ae_frame_rate_min_raw`, `awb_2nd_gain_raw` and
+`crop_raw`.
+
+They follow the rule that has governed everything since the lockups: **GET
+first, and a recovered value reaches V4L2 only as a read-only control once its
+meaning is established.** None of these has an established meaning yet, so none
+is a V4L2 control — `tests/script-smoke.sh` asserts both the `0400` mode and
+the absence of any V4L2 path. Each read takes `ioctl_lock`, requires a running
+channel, holds a runtime-PM reference for exactly one command, and adds nothing
+to `STREAMON` or resume.
+
+**`crop_raw` returns the active crop and the sensor array.**
+`CISP_CMD_CH_CROP_GET` is implemented, and its handler returns *eight* words —
+two four-word rectangles — where `CISP_CMD_CH_CROP_SET` sends only one.
+Hardware has now identified both: the first group tracks the crop in effect
+exactly, and the second stayed at `0 0 1280 720` across every rectangle tested,
+which is the full sensor array. Both are in the `(left, top, right, bottom)`
+form the setter uses.
+
+This was initially pitched here as the cheap route to root-causing the
+far-corner rectangle that starves the stream, on the reading that the two
+groups might be "requested" and "what the ISP latched". **That was wrong.** The
+first group only echoes the geometry in effect and the second is a constant, so
+neither can reveal a rectangle being silently adjusted, and the command says
+nothing about why one rectangle starves. The firmware log at `dyndbg=+p`
+remains the route to that. What the readback does give is confirmation from the
+ISP's side that a crop took effect, and the array bounds without inferring
+them. The struct still names them `rect1`/`rect2` by position rather than by
+meaning, because "active crop" and "sensor array" are what one machine showed
+and the names would be a claim about all of them. The opt-in `crop-geometry`
+section is what separated them: it samples `crop_raw` from a live stream across
+several rectangles, ending with the far corners, where a starving rectangle is
+the most informative sample rather than a failure — the channel still starts,
+so the GET still answers, and the bottom-right corner did exactly that while
+delivering no frames.
+
+**`ae_frame_rate_max_raw`/`ae_frame_rate_min_raw` come with a caveat that is
+part of the interface.** Both handlers compare a channel-context field against
+`0xffff` first and take a path that never writes the response word when it
+matches. Since `fthd_isp_cmd()` leaves the caller's buffer alone in that case,
+an unwritten field reads back as the zero the driver submitted. A zero here
+therefore means "firmware wrote nothing", not "zero frames per second", and the
+file says so on the line rather than leaving the next reader to assume a rate.
+These read the AE frame-rate window whose setters `fthd_start_channel()`
+already programs, and which "Frame-rate selection" above rejected as a rate
+mechanism because the sensor kept delivering 30 fps with it set. Hardware has
+now supplied the missing half of that observation: both read `7672`, which is
+`29.97` fps in Q8.8 (`7672 / 256 = 29.96875`; NTSC `30000/1001` truncates to
+`7672`), and minimum equal to maximum means the window is clamped to the
+sensor's single rate. The behavioural conclusion was right, and there is now a
+readable reason for it. It also corroborates the Q8.8 encoding on a quantity
+whose true value was measured independently, which the gain values alone could
+only suggest. No setter is added here.
+
+**`awb_2nd_gain_raw` returns three words, not two.** The handler loads three
+destination pointers and fills them through a channel-context vtable entry. An
+R/B reading would have predicted two, so the values are printed positionally
+and no colour is named. Hardware then closed it as a control candidate: all
+three read exactly `4096` while the CCT estimate reported `2785`, markedly warm
+light in which a live gain triple cannot be equal on all three channels. It is
+a manual stage sitting at unity, which the sweep independently supports -
+`0x30c` 2nd-gain manual is implemented while `0x30b` its adaptive thresholds is
+not. Unlike `awb_cct_estimate` there is no evidence it measures anything, so it
+stays a debugfs readback and gets no CID.
+
+Note what the same sweep ruled *out*, because it closes off work that looked
+available: AE and AWB metering-*window* configuration (`0x21d`/`0x21e`,
+`0x302`/`0x303`) is not implemented on this firmware at all, so the metering
+harness's spatial-weighting question cannot be answered by programming a
+window. And `0xa08` scaler-sharpness GET is unimplemented too, which means every
+image-processing setter this firmware has — sharpness, noise reduction, chroma
+suppression, DRC, scaler sharpness — is write-only, with no way to read a
+default back and therefore no way to restore one except by reloading firmware.
+Any future harness for those has to be built around that.
+
 ## Sensor temperature
 
 Firmware disassembly confirms that `CISP_CMD_CH_SENSOR_TEMPERATURE_GET` returns
@@ -628,13 +710,36 @@ stays runtime-active. Worse, the channel does not recover on its own - every
 subsequent `STREAMON` returns `-EIO` until the firmware is reloaded, so one bad
 rectangle invalidates every rectangle tested after it in the same run.
 
-Which rectangle triggers it is **not** yet pinned down. An earlier reading of
-this - that it needed `left == sensor_width - width` together with `top == 0` -
-was wrong, and the root run falsified it: there `+640+360` starved while
-`+640+0` streamed, the opposite pairing. Every observation so far is consistent
-with "the first far-offset rectangle used after a firmware load starves, and the
-wedged channel then explains the rest", but that has not been tested directly.
-The `crop` section now arms both corners as named cases, forces a runtime-PM
+Which rectangle triggers it is **not** yet fully pinned down, but the
+`crop-geometry` run of 2026-08-18 narrowed it. With a runtime-PM firmware
+reload forced between rectangles - so each corner was tested on a healthy
+channel rather than after a wedge - **both** far corners starved: `+640+360`
+and `+640+0` alike. They share `left == sensor_width - output_width` and differ
+in `top`, so the top is not the variable. That contradicts the earlier record
+here, taken from a run without recovery between cases, that `+640+0` streamed
+while `+640+360` starved; the recovered run is the more trustworthy.
+
+A flush right edge looked like the trigger and was tested directly: `left =
+632`, whose right edge at `1272` clears the `1280` array, **starved as well**.
+So the flush edge is not it, and the older note here that a left eight pixels
+lower streams normally does not survive either - it too came from a run without
+recovery between rectangles.
+
+What is established is a bracket: left `0`, `8` and `320` stream; left `632`
+and `640` starve at either top. The boundary is between `320` and `632`. And
+because three rectangles streamed on the same firmware load before one starved,
+"the first rectangle after a load starves" is dead; only "the first *far-offset*
+rectangle after a load" still competes with a plain positional threshold. The
+`crop-geometry` section now sweeps left offsets `240 320 400 480 560` at a fixed
+top ahead of the corners, each after the previous one's recovery, which
+separates the two: a sweep step that streams is a far-offset rectangle that did
+not starve as the first one on its own firmware load.
+
+Crop GET narrows it further from the other side: in both starving cases the ISP
+returned *exactly* the rectangle it was given. It is not rejecting the geometry
+and not silently adjusting it, so the fault lies downstream of crop programming.
+
+The `crop` section arms both corners as named cases, forces a runtime-PM
 recovery after a starvation, and marks later rectangles untrustworthy if the
 channel does not come back.
 
@@ -674,8 +779,11 @@ over its actual extent the chroma reads Cb 122.3 / Cr 135.3 against the YUYV
 reference's 122.5 / 135.4, and luma 93.1 against 92.9 - the same picture, to
 within a fifth of a luma level.
 
-The driver now advertises NV12 with `sizeimage = width * height * 3 / 2` under
-`facetimehd.nv12=1`. NV16 is removed: no output-format code produces it.
+The driver now advertises NV12 with `sizeimage = width * height * 3 / 2`. It was
+behind `facetimehd.nv12=1` while that sizing was still unproven; the run above
+proved it, so the parameter is gone and the format is enumerated unconditionally
+(last, after YUYV and YVYU, so first-format applications are unaffected). NV16
+is removed: no output-format code produces it.
 
 This validates one machine, model and kernel rather than the complete
 2013–2015 Mac range. Still untested or unproven are:
@@ -692,6 +800,10 @@ This validates one machine, model and kernel rather than the complete
   and buffer work remains enabled;
 
 - the visible effect of anti-banding and exposure mode under controlled light;
+- whether `CISP_CMD_CH_CROP_GET`'s second rectangle is the sensor array on any
+  machine other than the MacBookAir7,2. There it was constant at `0 0 1280 720`
+  across four crops while the first tracked each one, which identifies both on
+  that sensor and no other;
 - that `awb_cct_estimate` reads kelvin on any machine other than the
   MacBookAir7,2. The warm-to-cool tracking there is strong evidence, and the
   control is read-only so a wrong unit misinforms rather than misconfigures,

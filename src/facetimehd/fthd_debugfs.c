@@ -251,6 +251,10 @@ enum fthd_fw_readback {
 	FTHD_FW_AE_SENSOR_INTEGRATION_TIME_MIN,
 	FTHD_FW_AE_SENSOR_INTEGRATION_TIME_MAX,
 	FTHD_FW_AE_METERING_MODE,
+	FTHD_FW_AE_FRAME_RATE_MAX,
+	FTHD_FW_AE_FRAME_RATE_MIN,
+	FTHD_FW_AWB_2ND_GAIN,
+	FTHD_FW_CROP,
 };
 
 enum fthd_fw_roundtrip {
@@ -272,6 +276,8 @@ static int seq_firmware_readback(struct seq_file *seq,
 {
 	struct fthd_private *dev_priv = seq->private;
 	u32 value, tag;
+	u32 gain[3];
+	u32 rect1[4], rect2[4];
 	s32 signed_value;
 	u16 bias;
 	u8 mode;
@@ -367,6 +373,46 @@ static int seq_firmware_readback(struct seq_file *seq,
 		if (!ret)
 			seq_printf(seq, "%u\n", mode);
 		break;
+	case FTHD_FW_AE_FRAME_RATE_MAX:
+	case FTHD_FW_AE_FRAME_RATE_MIN:
+		ret = readback == FTHD_FW_AE_FRAME_RATE_MAX ?
+			fthd_isp_cmd_channel_ae_frame_rate_max_get(dev_priv, 0,
+								   &value) :
+			fthd_isp_cmd_channel_ae_frame_rate_min_get(dev_priv, 0,
+								   &value);
+		/*
+		 * Firmware skips writing the value when its internal limit is
+		 * unset, leaving the zero this driver submitted.  Say that
+		 * rather than reporting a rate of zero, which is not what it
+		 * means.  See fthd_isp.c for the sentinel evidence.
+		 */
+		if (!ret)
+			seq_printf(seq, "%u%s\n", value,
+				   value ? "" : " (not written by firmware)");
+		break;
+	case FTHD_FW_AWB_2ND_GAIN:
+		ret = fthd_isp_cmd_channel_awb_2nd_gain_get(dev_priv, 0, gain);
+		/*
+		 * Three words whose individual meanings are unrecovered, so
+		 * they are printed positionally and not as named colour gains.
+		 */
+		if (!ret)
+			seq_printf(seq, "%u %u %u\n",
+				   gain[0], gain[1], gain[2]);
+		break;
+	case FTHD_FW_CROP:
+		ret = fthd_isp_cmd_channel_crop_get(dev_priv, 0, rect1, rect2);
+		/*
+		 * Two four-word rectangles.  Which one the ISP actually
+		 * latched is unestablished, so neither is labelled; a reader
+		 * comparing them against the rectangle S_SELECTION requested
+		 * is the point of the file.
+		 */
+		if (!ret)
+			seq_printf(seq, "%u %u %u %u\n%u %u %u %u\n",
+				   rect1[0], rect1[1], rect1[2], rect1[3],
+				   rect2[0], rect2[1], rect2[2], rect2[3]);
+		break;
 	default:
 		ret = -EINVAL;
 		break;
@@ -403,6 +449,12 @@ FTHD_FW_READBACK_SHOW(seq_ae_sensor_integration_time_max_raw_read,
 			  FTHD_FW_AE_SENSOR_INTEGRATION_TIME_MAX);
 FTHD_FW_READBACK_SHOW(seq_ae_metering_mode_raw_read,
 			  FTHD_FW_AE_METERING_MODE);
+FTHD_FW_READBACK_SHOW(seq_ae_frame_rate_max_raw_read,
+			  FTHD_FW_AE_FRAME_RATE_MAX);
+FTHD_FW_READBACK_SHOW(seq_ae_frame_rate_min_raw_read,
+			  FTHD_FW_AE_FRAME_RATE_MIN);
+FTHD_FW_READBACK_SHOW(seq_awb_2nd_gain_raw_read, FTHD_FW_AWB_2ND_GAIN);
+FTHD_FW_READBACK_SHOW(seq_crop_raw_read, FTHD_FW_CROP);
 
 #undef FTHD_FW_READBACK_SHOW
 
@@ -732,6 +784,10 @@ FTHD_DEBUGFS_SEQ_FOPS(seq_ae_integration_time_max_raw_read);
 FTHD_DEBUGFS_SEQ_FOPS(seq_ae_sensor_integration_time_min_raw_read);
 FTHD_DEBUGFS_SEQ_FOPS(seq_ae_sensor_integration_time_max_raw_read);
 FTHD_DEBUGFS_SEQ_FOPS(seq_ae_metering_mode_raw_read);
+FTHD_DEBUGFS_SEQ_FOPS(seq_ae_frame_rate_max_raw_read);
+FTHD_DEBUGFS_SEQ_FOPS(seq_ae_frame_rate_min_raw_read);
+FTHD_DEBUGFS_SEQ_FOPS(seq_awb_2nd_gain_raw_read);
+FTHD_DEBUGFS_SEQ_FOPS(seq_crop_raw_read);
 
 static const struct file_operations fops_debug = {
 	.write = fthd_store_debug,
@@ -805,6 +861,14 @@ int fthd_debugfs_init(struct fthd_private *dev_priv)
 			    &seq_ae_sensor_integration_time_max_raw_read_fops);
 	debugfs_create_file("ae_metering_mode_raw", 0400, d, dev_priv,
 			    &seq_ae_metering_mode_raw_read_fops);
+	debugfs_create_file("ae_frame_rate_max_raw", 0400, d, dev_priv,
+			    &seq_ae_frame_rate_max_raw_read_fops);
+	debugfs_create_file("ae_frame_rate_min_raw", 0400, d, dev_priv,
+			    &seq_ae_frame_rate_min_raw_read_fops);
+	debugfs_create_file("awb_2nd_gain_raw", 0400, d, dev_priv,
+			    &seq_awb_2nd_gain_raw_read_fops);
+	debugfs_create_file("crop_raw", 0400, d, dev_priv,
+			    &seq_crop_raw_read_fops);
 	debugfs_create_file("roundtrip_ae_bias", 0200, d, dev_priv,
 			    &roundtrip_ae_bias_fops);
 	debugfs_create_file("roundtrip_ae_metering_mode", 0200, d, dev_priv,

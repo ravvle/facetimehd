@@ -140,8 +140,9 @@ submitting a fixed-size internal message.
 
 ## Confirmed read-only command surface
 
-The standard dispatcher jump table at `0x4826e` and the Apple-private table at
-`0x7910` provide a closed, non-exploratory GET list. The driver exposes these
+The standard dispatcher's `0x2xx` jump table at `0x4826e` and the Apple-private
+table at `0x7910` provide a closed, non-exploratory GET list. `0x4826e` is one
+of twelve such tables; see "Complete dispatcher table sweep" below. The driver exposes these
 only as mode-`0400` debugfs files while channel zero is already streaming:
 
 | Opcode | Readback | Dispatcher evidence | Response after `u32 channel` |
@@ -222,6 +223,304 @@ ten minutes of streaming, making an unavailable/not-supported sentinel much
 more likely than an unknown physical scale on this sensor. Capture ran at about
 29.97 and 14.98 fps and teardown remained free of firmware, channel, IOMMU and
 DMAR faults.
+
+## Complete dispatcher table sweep
+
+The `0x4826e` table used above is not the dispatcher's only one. The dispatcher
+is a binary-search compare tree over the opcode that routes each *dense* opcode
+class to its own `tbh [pc, rN, lsl #1]` table and handles sparse or low opcodes
+by explicit comparison. Every one of those tables is guarded by the same
+range check and the same default target -- the unsupported-command block at
+`0x4996c`:
+
+```text
+subw  rN, r2, #<class base>
+cmp   rN, #<count - 1>
+bhi.w 0x4996c              ; unsupported
+tbh   [pc, rN, lsl #1]     ; table base = this address + 4
+```
+
+Entries are little-endian halfwords; the target is `table_base + 2 * entry`.
+An entry resolving to `0x4996c` is a command this firmware does **not**
+implement. Scanning the image for `E8DF F0.x` and keeping the sites whose
+preamble branches to `0x4996c` finds exactly twelve, and they are complete in
+the sense that no thirteenth table shares that default:
+
+| Table | Opcodes | Entries | Implemented | Unsupported |
+|---|---|---:|---:|---:|
+| `0x47644` | `0x104`--`0x126` | 35 | 34 | 1 |
+| `0x48272` | `0x200`--`0x23a` | 59 | 50 | 9 |
+| `0x4993a` | `0x300`--`0x311` | 18 | 13 | 5 |
+| `0x4990a` | `0x400`--`0x40d` | 14 | 12 | 2 |
+| `0x47fae` | `0x500`--`0x50c` | 13 | 13 | 0 |
+| `0x47de6` | `0x602`--`0x608` | 7 | 7 | 0 |
+| `0x47aa2` | `0x700`--`0x707` | 8 | 8 | 0 |
+| `0x4788c` | `0x800`--`0x80a` | 11 | 11 | 0 |
+| `0x4780c` | `0xa01`--`0xa2c` | 44 | 38 | 6 |
+| `0x47746` | `0xb00`--`0xb05` | 6 | 6 | 0 |
+| `0x47720` | `0xc00`--`0xc04` | 5 | 5 | 0 |
+| `0x476e8` | `0xd00`--`0xd0d` | 14 | 14 | 0 |
+
+234 opcodes, 211 implemented, 23 unsupported.
+
+**Scope.** This settles only opcodes that fall inside a table range. An opcode
+*outside* every range is resolved by the compare tree and is not decided by this
+sweep -- `0x100` `CH_START` and `0x101` `CH_STOP` are outside every table and are
+obviously implemented, since the driver starts a channel with them on every
+stream. Do not read "absent from the tables" as "unsupported"; trace the tree.
+Traced individually, `0xa00` `COLOR_SATURATION_GET` *is* unsupported: for it the
+tree falls through to the `0x800` preamble at `0x4787e`, where
+`0xa00 - 0x800 = 0x200` exceeds the count and branches to `0x4996c`. The Apple
+`0x8xxx`/`0xcxxx` commands the driver uses are likewise compare-tree cases, not
+table entries.
+
+### Why this sweep can be trusted
+
+It reproduces the hand-derived results already in this file, and it agrees with
+hardware:
+
+- all four GETs previously found unsupported -- `0xa0a` sharpness, `0xa0c` noise
+  reduction, `0xa0e` chroma suppression, `0xa1a` DRC -- come out unsupported;
+- all ten standard-dispatcher GETs in "Confirmed read-only command surface"
+  come out implemented, at the exact handler addresses recorded there
+  (`0x499ec`, `0x49b06`, `0x49b58`, `0x49ede`, `0x49f40`, `0x49f7c`, `0x49fbe`,
+  `0x4a000`, `0x4a7ae`, `0x497a6`) -- fourteen independent agreements;
+- of the 68 `CISP_CMD_*` opcodes `fthd_isp.c` actually sends, every one that
+  falls inside a table is marked implemented. Zero contradictions. These are
+  commands that demonstrably work on the MacBookAir7,2, so a table entry
+  claiming otherwise would have falsified the method.
+
+### Newly settled: unsupported on this firmware
+
+These carry upstream names but reach `0x4996c`. Sending one gets an
+unsupported-command response, so none is a candidate for anything:
+
+`0x113` `RAW_FRAME_PROCESS_GO`; `0x210`/`0x211` AE noise-reduction control
+param GET/SET; `0x213`/`0x214` AE pre-frame-rate GET/SET; `0x215`/`0x216` AE
+red-eye param GET/SET; `0x21b` AE strobe param GET; `0x21d`/`0x21e` AE window
+param GET/SET; `0x302`/`0x303` AWB window param GET/SET; `0x309`/`0x30a` AWB
+CCM warmup matrix SET/GET; `0x30b` AWB 2nd-gain adaptive thresholds SET;
+`0x408`/`0x409` AF window param GET/SET; `0xa02` tone-curve custom GET;
+`0xa08` scaler sharpness GET; `0xa0a`, `0xa0c`, `0xa0e`, `0xa1a` as above.
+
+Two consequences worth stating. AE and AWB metering-*window* configuration does
+not exist on this firmware at all, so the spatial-weighting question left open
+by the metering-mode harness cannot be answered by programming a window --
+`0x8206` mode selection is the only lever. And `0xa07` scaler sharpness joins
+`0xa09`/`0xa0b`/`0xa0d`/`0xa19` as a setter with no readback: every
+image-processing setter this firmware implements is write-only, so none of them
+can be restored except by a firmware reload.
+
+### Newly settled: implemented, with no driver readback
+
+Implemented GET handlers the driver does not currently use. This is the list
+rule 4 ("add GET support first") can draw on; each still needs its response
+layout recovered before it is worth wiring up:
+
+| Opcode | Name | Handler |
+|---|---|---|
+| `0x105`/`0x106` | camera config current / camera config GET | `0x482f2` / `0x483a4` |
+| `0x10d` | channel info GET | `0x4866a` |
+| `0x119`/`0x11a` | camera MIPI freq current / MIPI frequency GET | `0x488f8` / `0x48916` |
+| `0x11d` | ISO params GET | `0x48988` |
+| `0x11e`/`0x11f` | camera pixel freq current / pixel frequency GET | `0x489ae` / `0x489cc` |
+| `0x121` | camera error-count GET | `0x48a0c` |
+| `0x205` | AE clip GET | `0x49a38` |
+| `0x207`/`0x209` | AE frame-rate maximum / minimum GET | `0x49a7c` / `0x49ac2` |
+| `0x212` | AE param GET | `0x49bcc` |
+| `0x217`/`0x219` | AE speed / AE stability GET | `0x49c1a` / `0x49c5e` |
+| `0x223` | AE target GET | `0x49dc6` |
+| `0x228` | AE stability-to-stable GET | `0x49e9e` |
+| `0x236` | AE mode GET | `0x4a0ee` |
+| `0x30d` | AWB 2nd gain GET | `0x4a9b4` |
+| `0x501` | sensor NVM GET | `0x49702` |
+| `0x507`/`0x508` | per-module LSC info / LSC GET | `0x497d2` / `0x497f0` |
+| `0x800` | crop GET | `0x478a2` |
+| `0x805`/`0x807`/`0x808` | colour calibration data / ideal / abs GET | `0x49360` / `0x493ca` / `0x49400` |
+| `0xa22` | colour LSC table GET | `0x49110` |
+| `0xb00` | output config GET | `0x47752` |
+
+### Layouts recovered from the sweep
+
+Three handlers were disassembled far enough to state a response layout. All
+offsets are from the start of the complete command, as elsewhere in this file.
+
+**`0x800` crop GET** (`0x478a2`) writes eight consecutive words, two rectangles,
+straight out of the channel context:
+
+```text
++0x0c..+0x18   ctx+0xd0, +0xd4, +0xd8, +0xdc
++0x1c..+0x28   ctx+0xb0, +0xb4, +0xb8, +0xbc
+```
+
+The driver's `CISP_CMD_CH_CROP_SET` sends one four-word rectangle, so the GET
+returns two of them -- most plausibly the requested rectangle and the geometry
+the ISP actually latched, though which group is which is not yet established.
+This is directly relevant to the far-corner crop starvation in DOWNSTREAM.md:
+it is a way to ask what the ISP did with the rectangle without needing the
+firmware's own log, and it is read-only.
+
+**`0x30d` AWB 2nd gain GET** (`0x4a9b4`) loads three destination pointers,
+`+0x0c`, `+0x10` and `+0x14`, and calls a vtable entry at `ctx.obj+0x70`. Three
+words of gain, not the two an R/B reading would predict.
+
+**`0x207`/`0x209` AE frame-rate maximum/minimum GET** (`0x49a7c`, `0x49ac2`)
+share a helper at `0x470d8`, selected by its third argument (`1` maximum, `0`
+minimum), and store a single `u32` at `+0x0c` (`0x49f74` and `0x4aad8`). Both
+first test a channel-context field at `+0x98` against `0xffff` and take a
+different, non-value path when it matches, so `0xffff` is a not-set sentinel
+and a readback has to be prepared for the sentinel case.
+
+Note that `0x203` and `0x20b` reach their responses through `0x4a722`, which is
+nothing but `blx r2` on a function pointer taken from the channel context. Their
+widths are therefore a runtime vtable decision and are *not* recoverable from
+the dispatcher alone -- the layouts recorded for them earlier in this file rest
+on the paired-setter reasoning, not on this sweep.
+
+### First hardware run of the swept readbacks (2026-08-18)
+
+MacBookAir7,2, kernel `7.0.0-29-generic`, DKMS build, warm indoor light.
+`tests/hw-validate.sh --only readbacks` passed every check with no firmware,
+channel-stop, IOMMU or DMAR fault, and the stream stayed live through all of
+them (`/tmp/facetimehd-hw-validate-20260818-202422.log`):
+
+| Readback | Raw result |
+|---|---|
+| `ae_frame_rate_max_raw` | `7672` |
+| `ae_frame_rate_min_raw` | `7672` |
+| `awb_2nd_gain_raw` | `4096 4096 4096` |
+| `crop_raw` | `0 0 1280 720` / `0 0 1280 720` |
+
+The previously established readbacks were unchanged in the same run - sensor
+temperature `-1`, AE bias `256/0`, gain cap `8192/256`, AE integration maximum
+`33`, sensor integration `38..1000000`, metering mode `3` - with AWB CCT at
+`2785`, consistent with the warm light.
+
+**The frame-rate window is `29.97` fps in Q8.8, and it is pinned.** `7672 / 256`
+is `29.96875`, and NTSC `30000/1001` is `29.97003`, which in Q8.8 truncates to
+exactly `7672`. That is the rate the decimation measurements already recorded
+for this sensor (29.95-29.97 at divisor 1). Two conclusions follow. The Q8.8
+reading previously described as "consistent with but not proved" by the gain
+values now has an independent corroboration on a quantity whose true value was
+measured by a different method entirely. And minimum equal to maximum means the
+AE frame-rate window is clamped to the sensor's single rate, which is direct
+evidence for what DOWNSTREAM.md, "Frame-rate selection", concluded behaviourally:
+this window is not a usable rate control. Neither handler took its `0xffff`
+sentinel path, so the not-written case remains untested.
+
+**AWB second gain is not a live measurement.** All three words read exactly
+`4096` while the CCT estimate reported `2785`, which is markedly warm light: a
+live white-balance gain triple cannot be equal on all three channels under an
+illuminant that far from neutral. The value is most plausibly unity in a
+fixed-point format where `4096` is `1.0`, left at its default. The dispatcher
+sweep supports that reading - `0x30c` AWB 2nd-gain *manual* is implemented
+while `0x30b` its adaptive thresholds is not - which describes a manual-only
+stage that nothing is currently driving. This closes it as a candidate for a
+second read-only V4L2 control: unlike `awb_cct_estimate`, there is no evidence
+it measures anything. It stays a debugfs readback.
+
+**Crop GET returns the right geometry, and does not yet disambiguate.** Both
+rectangles read `0 0 1280 720`, matching the full-array default the driver had
+programmed, in the `(left, top, right, bottom)` form the setter sends. That
+confirms the eight-word layout, the offsets and the encoding. It does **not**
+say which group is the request and which is what the ISP latched, because at
+the default rectangle they agree - and agreeing is what they should do when the
+ISP accepted the geometry unchanged. Separating them needs a rectangle the ISP
+does *not* honour verbatim, which is exactly the far-corner case that starves
+the stream. That is what the opt-in `crop-geometry` section exists to sample.
+
+### What the two crop rectangles are (2026-08-18)
+
+`tests/hw-validate.sh --only crop-geometry` on the same MacBookAir7,2, sampling
+`crop_raw` from a live stream with a 640x360 output on the 1280x720 array
+(`/tmp/facetimehd-hw-validate-20260818-203222.log`). Values are
+`(left, top, right, bottom)`, the form the setter sends:
+
+| Rectangle set | First group | Second group | Frames |
+|---|---|---|---|
+| full array | `0 0 1280 720` | `0 0 1280 720` | streaming |
+| `+8+8` | `8 8 648 368` | `0 0 1280 720` | streaming |
+| centred | `320 180 960 540` | `0 0 1280 720` | streaming |
+| bottom-right corner | `640 360 1280 720` | `0 0 1280 720` | **none** |
+| top-right corner | `640 0 1280 360` | `0 0 1280 720` | **none** |
+
+The last two rows come from the repeat run with the harness fixed
+(`/tmp/facetimehd-hw-validate-20260818-204049.log`), where a runtime-PM
+firmware reload between rectangles let the second corner be reached at all.
+
+**The first group is the active crop; the second is the full sensor array.**
+The first tracked every rectangle exactly, and the second never moved off
+`0 0 1280 720` - the array bounds - across four different crops. So the words
+at channel-context `0xd0..0xdc` are the current crop and those at `0xb0..0xbc`
+are the sensor rectangle. They agreed in the readbacks run only because the
+crop was the full array at the time, which made the two indistinguishable.
+
+**This retracts the hope that crop GET could root-cause the starving
+rectangle.** The earlier reading of this command - two rectangles, plausibly
+"requested" and "what the ISP latched" - was wrong in the half that mattered.
+The first group merely echoes the geometry in effect and the second is a
+constant, so neither can show a rectangle being silently adjusted, and the
+command carries no differential information about why one rectangle starves.
+The firmware's own log at `dyndbg=+p` is again the route to that question. What
+crop GET *is* good for is confirming from the ISP's side that a crop took
+effect, and reading the sensor array bounds without inferring them.
+
+**Both far corners starve, and firmware stored both rectangles exactly.** With
+a firmware reload forced between them, `+640+360` and `+640+0` each returned
+its own rectangle from crop GET while delivering no frames at all: the channel
+started, so the GET answered, and the stream then sat in `vb2_wait_for_done_vb`.
+That is a useful negative. The ISP is not rejecting the geometry and not
+quietly adjusting it - it holds precisely what was asked for and still produces
+nothing, so the fault is downstream of crop programming rather than in it.
+
+It also moves the "which rectangle triggers it" question, twice. The two
+starving corners share `left = sensor_width - output_width` (`640`) and differ
+in `top` (`360` and `0`), so the top is not the variable - which contradicts
+the earlier record that `+640+0` streamed while `+640+360` starved. That run
+had no recovery between cases; this one reloads firmware after each starve, so
+it is the more trustworthy.
+
+A flush right edge then looked like the trigger, and the `nearcorner` case was
+added to test it: `left = 632`, whose right edge at `1272` is *not* flush with
+the `1280` array. **It starved too**
+(`/tmp/facetimehd-hw-validate-20260818-204531.log`), which falsifies the flush
+edge outright. It also contradicts the older note that a left eight pixels
+lower streams normally - another observation from a run without recovery.
+
+What survives is bounded rather than solved. Left `0`, `8` and `320` streamed;
+left `632` and `640` starved at either top. The boundary lies between `320` and
+`632`. Note that `full`, `topleft` and `midoffset` all streamed on the *same*
+firmware load before `nearcorner` starved, so "the first rectangle after a load
+starves" is dead; only "the first *far-offset* rectangle after a load" still
+competes with a plain positional threshold. The section now sweeps left offsets
+`240 320 400 480 560` at a fixed top before the corners, each after the
+previous one's recovery. Any sweep step that streams is a far-offset rectangle
+that did not starve as the first one on its own firmware load, which
+falsifies the remaining "first far-offset" reading and leaves a positional
+threshold the same sweep locates.
+
+That run also exposed a defect in the harness rather than the driver. The
+section judged channel health with `capture_ok()`, which tests only
+`v4l2-ctl`'s exit status - and `v4l2-ctl` exits 0 when `VIDIOC_STREAMON` fails.
+So it reported no wedge while the channel was plainly dead, and the operator
+saw a bare warning with no cause. It now judges health by whether a whole frame
+arrived, restores a known-good rectangle before testing recovery so it measures
+the channel rather than the geometry just set, and reports for every rectangle
+whether frames actually flowed. This is the same trap recorded under "Pixel
+formats": an exit status is not evidence that a capture happened.
+
+### Reproduction
+
+```text
+r2 -q -2 -a arm -b 16 -e cfg.bigendian=false -c 'pd 8 @ 0x4826e' firmware.bin
+arm-none-eabi-objdump -D -b binary -m arm -EL -M force-thumb \
+    --start-address=0x47530 --stop-address=0x47640 firmware.bin
+```
+
+Scan for the halfword pair `E8DF` / `F0.x`, keep the sites whose preceding
+instructions branch to `0x4996c`, read `<class base>` from the `subw` and the
+entry count from the `cmp`, then decode `table_base + 2 * entry` per entry.
+
 
 ## Same-value setter harness
 
@@ -563,10 +862,14 @@ optional, separate shutdown-path test.
 7. Do not expose sensor temperature through hwmon until its scale is established.
    On the MacBookAir7,2 there is nothing to establish: see the sentinel note
    below.
-8. Do not advertise NV16 until `G_FMT` confirms NV16 and captured luma/chroma
-   plane contents are both plausible. Implementing it behind a default-off
-   module parameter is not the same as advertising it, and is what makes the
-   test runnable.
+8. Do not advertise a pixel format until `G_FMT` confirms the fourcc survives
+   and captured luma/chroma plane contents are both plausible at the sizing
+   being claimed. Implementing it behind a default-off module parameter is not
+   the same as advertising it, and is what makes the test runnable. NV12 has
+   since completed that path - measured 4:2:0, correct stride, and a stream at
+   the 4:2:0 `sizeimage` - so its parameter was removed and it is now
+   enumerated unconditionally. NV16 never will be: no output-format code
+   produces it.
 9. A recovered value may reach V4L2 as a **read-only** control once its meaning
    is supported by hardware evidence. `v4l2_ctrl_handler_setup()` skips
    read-only controls, so such a control cannot replay a firmware SET - which is
@@ -588,7 +891,10 @@ optional, separate shutdown-path test.
 - The first halfword and supported pattern indices for sensor test pattern.
 - Integration-time and gain units/ranges, and the correct atomic manual-exposure
   sequence (the firmware also has manual-mode and combined integration/gain
-  opcodes that may be more appropriate than collapsing two gain caps).
+  opcodes that may be more appropriate than collapsing two gain caps). The
+  dispatcher sweep confirms `0x22b` AE manual-mode set and `0x236` AE mode get
+  are both implemented on this firmware, so that alternative is real rather
+  than hypothetical; neither payload has been recovered yet.
 - Meanings and safe combinations of the three chroma-suppression bytes.
 - Whether any sensor *other* than this one returns something other than the `-1`
   unavailable sentinel, and its scale if so. This is closed for the
@@ -600,13 +906,18 @@ optional, separate shutdown-path test.
 - Nothing remains open about the semi-planar format's layout: code 0 is NV12,
   measured. What is untested is the driver streaming with `sizeimage` at the
   4:2:0 size, since the measurements came from an over-sized buffer.
-- Why one crop rectangle starves the stream. The ISP does honour a non-zero
-  `x1`/`y1` - that part is answered - but `x1 = sensor_width - width` together
-  with `y1 = 0` is accepted and then produces no buffers at all on first use,
-  while `y1 = 8` or `x1` eight pixels lower streams normally. See DOWNSTREAM.md,
-  "Frame-rate decimation and cropping". The driver's log was not readable in the
-  session that found it; a SIF or channel-start error there is the obvious next
-  evidence, and would say whether firmware rejected the geometry outright.
+- Why one far-offset crop rectangle starves the stream and wedges the channel.
+  The ISP does honour a non-zero `x1`/`y1` - that part is answered - but which
+  rectangle triggers the starvation is not pinned down. An earlier reading, that
+  it required `x1 = sensor_width - width` together with `y1 = 0`, was falsified
+  by the root run, where `+640+360` starved while `+640+0` streamed; see
+  DOWNSTREAM.md, "Frame-rate decimation and cropping", which is authoritative on
+  this. The driver's log was not readable in the session that found it; a SIF or
+  channel-start error at `dyndbg=+p` is the obvious next evidence, and would say
+  whether firmware rejected the geometry outright. The dispatcher sweep adds a
+  second, cheaper route: `0x800` crop GET is implemented and returns two
+  four-word rectangles, so the geometry the ISP actually latched can be read
+  back without the firmware log, through a read-only command.
 - Per-frame spacing under decimation. The mean rate is now measured and correct
   at every divisor, but `hw-validate.sh` checks only a coarse bunching floor, so
   uneven spacing at the right average would still pass.
