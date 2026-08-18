@@ -551,13 +551,49 @@ This is a rule about the requested geometry, not about firmware state: the
 `crop_raw` readback showed firmware storing every one of these rectangles
 exactly, including the ones that then delivered nothing.
 
-What it does *not* yet cover is the vertical axis. Every rectangle in phases 1
-and 2 had `top = 0`, so whether `top` carries the matching constraint against
-`(sensor_height - crop_height) / 2` is untested. The one rectangle that varied
-it, `+640+360`, also violated the horizontal rule, so it says nothing. Phase 3
-holds `left` at `0` and walks `top` across its centred position, including a
-one-pixel step past it - expressible because the driver rounds `left` to eight
-pixels but not `top`.
+Phase 3 then found the vertical axis symmetric, and pinned it to a **single
+pixel** (`/tmp/facetimehd-hw-validate-20260818-210747.log`). With `left` held
+at `0` and a 640x360 crop, whose centred top is `180`:
+
+| top | Result |
+|---:|---|
+| `180` | streaming |
+| `181` | starved |
+| `360` | starved |
+
+`181` is the sharpest measurement in this whole investigation: the driver
+rounds `left` to eight pixels but leaves `top` alone, so the vertical axis can
+ask a question the horizontal one cannot, and the answer is that one pixel past
+centre is enough to starve the stream.
+
+So the constraint is symmetric, and the whole rule is:
+
+```text
+left <= (sensor_width  - crop_width)  / 2
+top  <= (sensor_height - crop_height) / 2
+```
+
+Equivalently, and more suggestively about the mechanism:
+
+```text
+left + right  <= sensor_width
+top  + bottom <= sensor_height
+```
+
+which is to say **the crop's centre may not pass the sensor's centre** on
+either axis. Equality is fine on both at once - the centred 640x360 rectangle
+at `+320+180` sits exactly on both limits and streams.
+
+Against every rectangle measured across all runs - crop widths `1280`, `640`
+and `320`, crop heights `720`, `360` and `240`, offsets from `0` to `640`, and
+the exact boundary at eight-pixel resolution horizontally and one-pixel
+vertically - this predicts **20 of 20** outcomes with no exceptions.
+
+The `left + right` form is worth keeping in mind for anyone who picks this up:
+a limit that trips when `left` exceeds `sensor - right` looks like firmware
+deriving one edge from the other, or a field that is a distance from the far
+edge rather than an absolute coordinate. That is a hypothesis about mechanism,
+not a measurement, and the ISP registers behind it have not been examined.
 
 That run also exposed a defect in the harness rather than the driver. The
 section judged channel health with `capture_ok()`, which tests only

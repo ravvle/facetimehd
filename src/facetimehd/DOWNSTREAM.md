@@ -742,15 +742,30 @@ left `480` streams while `560` starves. That `480` is what rules out a fixed
 offset limit. Across every rectangle measured, three crop widths and the exact
 eight-pixel boundary at two different centres, it predicts 16 of 16 outcomes.
 
-The vertical axis is not covered by that evidence: every rectangle used to
-derive it had `top = 0`. Whether `top` faces the matching limit against
-`(sensor_height - crop_height) / 2` is what the section's third phase asks.
+The vertical axis is symmetric, and sharper: with `left` at `0`, a 640x360 crop
+streams at `top = 180` - its centred position - and starves at `top = 181`. One
+pixel. The driver rounds `left` to eight pixels but leaves `top` alone, so that
+axis can ask a finer question than the horizontal one, and the boundary is
+exactly centre. So the complete rule is:
 
-No driver-side clamp is added yet. The horizontal rule is now measured rather
-than guessed, but it is measured on one sensor, the vertical half is open, and
-silently moving a rectangle the application asked for is its own harm - so the
-shape of any fix is a decision to take deliberately, not a side effect of
-learning the rule.
+```text
+left <= (sensor_width  - crop_width)  / 2
+top  <= (sensor_height - crop_height) / 2
+```
+
+or equivalently `left + right <= sensor_width` and `top + bottom <=
+sensor_height` - **the crop's centre may not pass the sensor's centre**.
+Equality is fine on both axes at once: the centred `+320+180` 640x360 rectangle
+sits on both limits and streams. Across every rectangle measured - three crop
+widths, three crop heights, offsets `0` to `640`, and the exact boundary at
+eight-pixel resolution horizontally and one-pixel vertically - it predicts 20
+of 20 outcomes.
+
+No driver-side clamp is added yet, and that is now a deliberate open decision
+rather than a lack of evidence. The rule is measured on one sensor, and
+silently moving a rectangle the application asked for is its own harm - a
+`S_SELECTION` that quietly returns different geometry is the same class of
+surprise as the zoomed, off-centre picture under "Image geometry".
 
 Crop GET narrows it further from the other side: in both starving cases the ISP
 returned *exactly* the rectangle it was given. It is not rejecting the geometry
