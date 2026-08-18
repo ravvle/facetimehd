@@ -877,17 +877,37 @@ int fthd_isp_cmd_channel_crop_set(struct fthd_private *dev_priv, int channel,
 	return fthd_isp_cmd(dev_priv, CISP_CMD_CH_CROP_SET, &cmd, sizeof(cmd), &len);
 }
 
-int fthd_isp_cmd_channel_output_config_set(struct fthd_private *dev_priv, int channel, int x, int y, int pixelformat)
+int fthd_isp_cmd_channel_output_config_set(struct fthd_private *dev_priv, int channel, int x, int y,
+					   int stride, int pixelformat)
 {
 	struct isp_cmd_channel_output_config cmd;
 	int len;
 
-	pr_debug("output config: [%d, %d]\n", x, y);
+	pr_debug("output config: [%d, %d] stride %d\n", x, y, stride);
 
 	memset(&cmd, 0, sizeof(cmd));
 	cmd.channel = channel;
 	cmd.x1 = x; /* Y size */
-	cmd.x2 = x * 2; /* Chroma size? */
+	/*
+	 * x2 is the destination row stride in bytes, and it is now known to be
+	 * exactly that rather than the "chroma size?" upstream guessed at.
+	 * Upstream only ever had the packed formats, where two bytes per pixel
+	 * made the hardcoded x*2 both a correct stride and an unremarkable
+	 * constant, so nothing distinguished the two readings.
+	 *
+	 * The semi-planar format did: with x*2 still being sent for a
+	 * one-byte-per-pixel luma
+	 * plane, the ISP wrote luma rows 2560 bytes apart into a buffer laid out
+	 * for 1280, leaving every odd row of the captured frame zero - exactly
+	 * 50% of the luma plane, in a strict every-other-row pattern - and
+	 * scattering the chroma. It raised no IOMMU fault, because sizeimage
+	 * still covered what it wrote; the corruption was silent, and only
+	 * inspecting the planes separately found it.
+	 *
+	 * Passing bytesperline is therefore not a new guess: for YUYV and YVYU
+	 * it is width*2 and this command is byte-for-byte what it always was.
+	 */
+	cmd.x2 = stride;
 	cmd.x3 = x;
 	cmd.y1 = y;
 
@@ -1669,6 +1689,13 @@ int fthd_start_channel(struct fthd_private *dev_priv, int channel)
 	case V4L2_PIX_FMT_YVYU:
 		pixelformat = 2;
 		break;
+	case V4L2_PIX_FMT_NV12:
+		/* Semi-planar 4:2:0 output.  fthd_v4l2_adjust_format() sized the
+		 * buffer for both planes and fthd_buffer_prepare() gave the ISP
+		 * the chroma address; this is the code that asks it to produce
+		 * that layout in the first place. */
+		pixelformat = 0;
+		break;
 	default:
 		pixelformat = 1;
 		WARN_ON(1);
@@ -1676,6 +1703,7 @@ int fthd_start_channel(struct fthd_private *dev_priv, int channel)
 	ret = fthd_isp_cmd_channel_output_config_set(dev_priv, 0,
 						     dev_priv->fmt.fmt.width,
 						     dev_priv->fmt.fmt.height,
+						     dev_priv->fmt.fmt.bytesperline,
 						     pixelformat);
 	if (ret)
 		return ret;

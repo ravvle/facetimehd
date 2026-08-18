@@ -277,15 +277,64 @@ independent bytes and cannot honestly be represented by one generic strength.
   would silently have got something else. A private control with an honest name
   is better than a standard one with an invented meaning.
 
+## Colour-temperature readback
+
+`FTHD_CID_AWB_CCT_ESTIMATE` (`V4L2_CID_USER_BASE | 0x1003`, printed by v4l-utils
+as `awb_cct_estimate`) reports the ISP's own current colour-temperature estimate
+from `CISP_CMD_CH_AWB_CCT_GET`. It is the first firmware value recovered during
+the lockup investigation to reach the ordinary V4L2 surface, and both halves of
+that sentence needed justifying.
+
+**Why it is safe to register at all.** The rule the removed controls broke is
+that `v4l2_ctrl_handler_setup()` replays every registered control's default at
+each `STREAMON`, which is what sent malformed commands without anyone touching a
+control. This one is `V4L2_CTRL_FLAG_READ_ONLY`, and `handler_setup()` skips
+read-only controls outright — so registering it adds a GET an application may
+ask for and no SET the framework can ever replay. That is a structural
+guarantee, not a convention, and `tests/script-smoke.sh` asserts the flag.
+
+**Why the unit is not a guess.** Under warm light this firmware reported `2652`
+and under cool light `5777`, with the right ordering and realistic magnitudes;
+the value tracked lighting and not exposure. Cross-model confirmation is still
+open, which is part of why it is a private CID.
+
+**Why not `V4L2_CID_WHITE_BALANCE_TEMPERATURE`.** That control means the
+temperature the application asks the camera to assume: writable, and paired with
+a manual AWB mode. This is a measurement the ISP produces, and the manual
+AWB-CCT setter carries a second payload word whose meaning is still
+unidentified, so there is nothing to write. Publishing a measurement under a CID
+that means a set point would make an application that wrote it silently get
+nothing — the same class of dishonesty as mapping denoising onto
+`V4L2_CID_IMAGE_STABILIZATION`. `0x1001` and `0x1002` are deliberately skipped:
+they belonged to the removed noise-reduction and chroma-suppression controls.
+
+The control is volatile, so `g_volatile_ctrl` issues the GET on demand under a
+runtime-PM reference. It does not take `ioctl_lock`: `vdev->lock` *is*
+`ioctl_lock`, so `video_ioctl2()` already holds it, which is also what serialises
+this against the debugfs readbacks. On an idle camera it reports the last value
+sampled while streaming rather than failing or powering the ISP up — a
+diagnostic read is not a reason to retrain DDR and re-upload firmware, and
+returning an error there would fail `v4l2-compliance` for no gain.
+
 ## Sensor temperature
 
 Firmware disassembly confirms that `CISP_CMD_CH_SENSOR_TEMPERATURE_GET` returns
 a signed 16-bit sensor value, sign-extended into the response word after the
-channel. Its scale remains unknown. It is therefore exposed only through the
-root-readable `sensor_temperature_raw` debugfs file, and only while a stream is
-already active. Each read sends one GET; nothing polls it. It remains absent
-from hwmon because that ABI requires millidegrees Celsius, and plausibility
-filtering cannot establish a unit.
+channel. It is exposed only through the root-readable `sensor_temperature_raw`
+debugfs file, and only while a stream is already active. Each read sends one
+GET; nothing polls it.
+
+**This is now closed rather than open.** Every sampled condition on the
+MacBookAir7,2 returned `-1`: cold after boot, after ten minutes of continuous
+streaming, and under bright, dark, warm and cool light. A physical scale, however
+unknown, would have moved with the die temperature over a ten-minute stream. A
+constant `-1` is a not-supported sentinel, so there is nothing to calibrate and
+nothing to publish. `FTHD_SENSOR_TEMPERATURE_NONE` names the value and the
+debugfs file prints `-1 (unavailable)` — the raw number stays first on the line
+so anything parsing the file keeps working, with the interpretation appended
+rather than substituted. hwmon registration would still be wrong even on a
+sensor that returns something else, because that ABI requires millidegrees
+Celsius and no reading here establishes a unit.
 
 The same active-stream, mode-`0400` boundary exposes confirmed readbacks for
 AWB CCT, AE bias/tag, gain-cap states, AE integration limits, and Apple AE
@@ -377,13 +426,77 @@ the reverse-engineering notes.
 
 ## Pixel formats
 
-Only YUYV and YVYU are advertised. NV16 output code zero dates back to the 2015
-upstream driver, but upstream disabled it because that implementation mixed a
-two-plane model with the single-planar capture API. The newer contiguous-buffer
-layout is technically coherent but has not actually been validated: the old
-hardware test silently negotiated YUYV and produced a false NV16 pass because
-both formats use two bytes per pixel. NV16 was removed until a test verifies
-the returned fourcc and both luma/chroma regions. NV12 remains unsupported.
+YUYV, YVYU and **NV12** are advertised. The ISP's semi-planar output, format
+code 0, is NV12 - 4:2:0, not the 4:2:2 this driver assumed for a decade. NV12 is
+enumerated last, so an application that takes the first format offered still
+gets what it always got.
+
+That it is NV12 rather than NV16 is a hardware result, and it corrects an
+assumption this fork inherited. Upstream's 2015 comment called code 0 "plane 0 Y
+plane 1 UV" without giving it a sampling; every later reading, including this
+document's, filled in 4:2:2 and called it NV16. A capture on the MacBookAir7,2
+settled it: the ISP wrote a `width * height` luma plane followed by exactly
+`width * height / 2` of chroma - 360 chroma rows for a 720-row frame - and left
+the remaining 460,800 bytes of the NV16-sized buffer at zero. Splitting that
+chroma into its components gave Cb 122.3 and Cr 135.3, against 122.5 and 135.4
+from a YUYV capture of the same scene seconds later.
+
+The layout is therefore:
+
+```text
+bytesperline = width
+sizeimage    = width * height * 3 / 2
+ISP addr0    = mapped buffer base
+ISP addr1    = mapped buffer base + width * height
+```
+
+`iommu_allocate_sgtable()` gives each buffer one contiguous run of S2 IOVA
+pages, so the chroma plane is a byte offset into the same mapping and needs no
+second one; the vb2 queue stays single-planar, with the semi-planar case derived
+from the pixel format at each use rather than cached in a plane count - a cached
+count is what once asked a `V4L2_BUF_TYPE_VIDEO_CAPTURE` queue for two planes.
+
+**The old warning against NV12 had the risk backwards** and is withdrawn. It
+said nothing identified a 4:2:0 code, and that sizing a buffer at 1.5 bytes per
+pixel while the ISP wrote 4:2:2 at 2 would make the hardware DMA past the
+mapping. The code is identified - it is 0 - and the error ran the other way:
+sizing for 4:2:2 over-allocated and left a tail unwritten, which can never
+overrun. NV16 is now the format with no evidence behind it, and is not offered.
+
+It was gated behind a module parameter until the driver had streamed with
+`sizeimage` cut to the 4:2:0 size, since the measurements above came from an
+over-sized buffer. That run passed - `sizeimage` 1,382,400, no blank luma rows,
+chroma 127.2 against a YUYV reference midpoint of 126.8, and no firmware, buffer
+or DMA fault - so the parameter is gone and `nv12` is part of the default test
+suite rather than an opt-in experiment.
+
+**Two silent-failure lessons are built into the test.** The first NV16 "pass"
+was really YUYV: the format was absent from `ENUM_FMT`, `S_FMT` silently coerced
+the fourcc, and both formats had the same byte count, so a size-and-capture
+check could not tell them apart. The `nv12` section therefore re-reads `G_FMT`
+and requires the fourcc to survive. The second was the row stride below: the
+section counts blank luma rows, and compares chroma against a YUYV capture of
+the same scene rather than an absolute threshold, which is what turned "the
+chroma looks wrong" into "the chroma is 4:2:0".
+
+### The output-config stride
+
+`CISP_CMD_CH_OUTPUT_CONFIG_SET`'s `x2` is the destination row stride in bytes.
+Upstream hardcoded `width * 2`, which for the packed formats is simultaneously a
+correct stride and an unremarkable constant, so nothing distinguished the two
+readings until a one-byte-per-pixel plane arrived.
+
+With `width * 2` still being sent for the semi-planar luma plane, the ISP wrote
+luma rows 2560 bytes apart into a buffer laid out for 1280: exactly 50% of the
+luma plane came back zero, in a strict every-other-row pattern. **No IOMMU fault
+occurred** - `sizeimage` still covered everything written - so the corruption was
+silent, and only inspecting the planes separately found it. This document
+previously predicted that a wrong stride would fault loudly and be caught that
+way; it does not, because the ISP skips rows rather than overrunning.
+
+`fthd_isp_cmd_channel_output_config_set()` now takes the stride and is passed
+`bytesperline`. For YUYV and YVYU that is `width * 2`, so the command is
+byte-for-byte what it always was.
 
 ## Kernel integration, diagnostics and testing
 
@@ -398,8 +511,12 @@ the returned fourcc and both luma/chroma regions. NV12 remains unsupported.
 - CI performs warning-clean Clang builds and Sparse semantic checks through
   `tests/build-driver.sh`.
 - `tests/smoke-capture.sh` checks the V4L2 surface on real hardware, while
-  `tests/hw-validate.sh` covers probe, timing, controls, runtime PM, suspend,
-  firmware-wedge evidence and the optional reboot path.
+  `tests/hw-validate.sh` covers probe, timing, controls, frame-rate decimation,
+  cropping, runtime PM, suspend, firmware-wedge evidence and the optional reboot
+  path, plus the opt-in readback-profile, round-trip, metering-semantics and
+  NV12 experiments. Sections that only exercise driver logic run by default;
+  anything that mutates firmware state or enables an unvalidated format is
+  opt-in.
 - `tests/script-smoke.sh` covers the installer plumbing that shellcheck cannot
   see, including that every source file in this directory is listed in the
   Makefile - the failure that otherwise compiles in no CI job and only shows up
@@ -471,6 +588,95 @@ validator nor an independent boot-log scan found any channel, tag, DMA, or
 kernel fault. Stream restoration across full system suspend is therefore
 validated on this MacBookAir7,2.
 
+### Frame-rate decimation and cropping (2026-08-18)
+
+Run on the MacBookAir7,2, Ubuntu 26.04, kernel 7.0.0-29-generic, against the
+installed DKMS build - so these results describe the driver as it already
+shipped, not any later change.
+
+Decimation passes at every requested rate. The rate is measured from the
+difference between a short and a long capture at the same setting, which
+cancels v4l2-ctl's fixed start-up cost; that cost measured 3.2-4.4 s, against a
+6.0 s steady-state window, so subtracting it is not optional:
+
+| Requested | Divisor | `G_PARM` | Measured | Steady-state window |
+|---:|---:|---:|---:|---:|
+| 30 | 1 | `30.000` | 29.95 | 180 frames in 6010 ms |
+| 15 | 2 | `15.000` | 14.97 | 90 frames in 6012 ms |
+| 10 | 3 | `10.000` | 9.98 | 60 frames in 6014 ms |
+| 6 | 5 | `6.000` | 5.99 | 36 frames in 6012 ms |
+| 3 | 10 | `3.000` | 3.05 | 18 frames in 5909 ms |
+| 1 | 30 | `1.000` | 1.00 | 6 frames in 6012 ms |
+
+Every rate is within 1.7% of the request, `G_PARM` reports the divisor-derived
+rate exactly, and nothing starved - including divisor 30, where the requeue path
+recycles 29 of every 30 frames through a pool of four buffers. Per-frame spacing
+was not measured; only the bunching floor, which passed everywhere.
+
+Cropping: the ISP **does** honour a non-zero origin. Frames captured through
+`+8+8` and through the full array produce clearly different block signatures
+(the bright region moves from the centre column to the outer columns), which is
+the question "Cropping and digital zoom" left open. Aligned rectangles read back
+exactly; a request for `left=4, top=5` was stored as `left=8, top=5`, confirming
+that `left` is rounded to eight pixels and `top` is not.
+
+**A far-offset crop rectangle starves the stream, and wedges the channel.**
+With a 640x360 output on a 1280x720 sensor, a rectangle at the array's far
+corner is accepted by `S_SELECTION` and then delivers no buffers at all: the
+capture sits in `vb2_wait_for_done_vb` until it is killed, while the device
+stays runtime-active. Worse, the channel does not recover on its own - every
+subsequent `STREAMON` returns `-EIO` until the firmware is reloaded, so one bad
+rectangle invalidates every rectangle tested after it in the same run.
+
+Which rectangle triggers it is **not** yet pinned down. An earlier reading of
+this - that it needed `left == sensor_width - width` together with `top == 0` -
+was wrong, and the root run falsified it: there `+640+360` starved while
+`+640+0` streamed, the opposite pairing. Every observation so far is consistent
+with "the first far-offset rectangle used after a firmware load starves, and the
+wedged channel then explains the rest", but that has not been tested directly.
+The `crop` section now arms both corners as named cases, forces a runtime-PM
+recovery after a starvation, and marks later rectangles untrustworthy if the
+channel does not come back.
+
+Note that the driver's own clamping can produce such a rectangle from a request
+that does not look like one: `left=648, width=632` is rounded to `+640+0`
+640x360.
+
+Root-causing it needs the firmware's own log at `dyndbg=+p`; the ordinary log
+shows the stall but no channel or SIF error. No driver-side workaround has been
+added - refusing or nudging the rectangle would be a guess at the cause and
+would silently alter what the application asked for.
+
+### The semi-planar format is NV12, not NV16 (2026-08-18)
+
+Two runs, on the MacBookAir7,2 with the format enabled by module parameter.
+
+The first negotiated correctly and did not fault - `ENUM_FMT`, `G_FMT` holding
+the fourcc, ten frames as an exact multiple, no IOMMU or DMAR fault - and still
+produced a broken frame: 50% of the luma plane zero in an every-other-row
+pattern, chroma averaging 73.6 with Cb 71.7 and Cr 75.4. That was the
+output-config stride, described under "Pixel formats" above.
+
+With the stride fixed, the second run gave `nv12.stride_rows` clean at 0.0%
+blank rows and a luma mean of 96.7, but chroma still failed at 64.3 against a
+YUYV reference of Cb 122.5 / Cr 135.4. Mapping the whole frame row by row
+explained both numbers at once:
+
+| Region | Bytes | Content |
+|---|---:|---|
+| rows 0-719 | 921,600 | luma, complete, no blank rows |
+| rows 720-1079 | 460,800 | chroma, mean 128.3 |
+| rows 1080-1439 | 460,800 | **all zero, never written** |
+
+Chroma is 360 rows for a 720-row image: 4:2:0. The failing mean of 64.3 was
+simply the real chroma averaged with an equal quantity of untouched zeros. Taken
+over its actual extent the chroma reads Cb 122.3 / Cr 135.3 against the YUYV
+reference's 122.5 / 135.4, and luma 93.1 against 92.9 - the same picture, to
+within a fifth of a luma level.
+
+The driver now advertises NV12 with `sizeimage = width * height * 3 / 2` under
+`facetimehd.nv12=1`. NV16 is removed: no output-format code produces it.
+
 This validates one machine, model and kernel rather than the complete
 2013–2015 Mac range. Still untested or unproven are:
 
@@ -486,29 +692,36 @@ This validates one machine, model and kernel rather than the complete
   and buffer work remains enabled;
 
 - the visible effect of anti-banding and exposure mode under controlled light;
+- that `awb_cct_estimate` reads kelvin on any machine other than the
+  MacBookAir7,2. The warm-to-cool tracking there is strong evidence, and the
+  control is read-only so a wrong unit misinforms rather than misconfigures,
+  but it is one sensor;
 - orderly reboot or kexec while actively streaming;
 - recovery from a real firmware command timeout, which has not been reproduced;
 - any future reimplementation of manual exposure, white balance, exposure
   bias, sharpness or test-pattern controls. Recovered layouts and remaining
   semantic questions are recorded in `FIRMWARE-REVERSE-ENGINEERING.md`;
-- any future NV16 implementation: that the ISP accepts output format code 0,
-  that the returned fourcc remains NV16, that chroma lands at the expected
-  offset, and that no frame is written past `sizeimage`;
-- frame-rate selection: that a decimated stream really arrives at the requested
-  rate with even spacing, that the requeue worker keeps up without starving the
-  ISP of buffers at low divisors (only four exist), and that `STREAMOFF` during
-  heavy decimation returns every buffer. This part needs no firmware guessing -
-  it is driver logic - but it has not been run against hardware;
-- the crop: that the ISP accepts a non-zero `x1`/`y1` at all, whether the
-  rectangle needs an alignment stricter than the eight pixels assumed here, and
-  whether the scaler will upscale (which would make the "crop is never smaller
-  than the output" rule unnecessary rather than merely conservative);
+- NV12 on any machine other than the MacBookAir7,2. The format, its sampling,
+  its plane offsets and its stride are all measured there, and it is advertised
+  on that evidence, but like everything else here it is one sensor;
+- frame-rate selection is **validated** on the MacBookAir7,2 - see below - apart
+  from per-frame spacing, which the `decimation` section still does not measure.
+  It checks a coarse bunching floor only, so a stream that arrives at the right
+  mean rate with uneven spacing would pass;
+- the crop origin is **confirmed** honoured, but a far-corner rectangle starves
+  the stream and wedges the channel - see below. Two further questions on that item
+  are not reachable through this ABI at all and are not attempted: the driver
+  rounds the rectangle before the ISP ever sees it, so an alignment finer than
+  eight pixels cannot be requested, and it refuses a crop smaller than the
+  output, so whether the scaler would upscale cannot be asked. Both need
+  scaffolding of their own; the test records what the driver did with a
+  misaligned request so that work has a baseline;
 - any future backlight-compensation, noise-reduction or chroma-suppression
   controls: their visible effect and an honest mapping for every firmware
   field. They are not currently exposed;
 - whether any supported sensor returns something other than the `-1`
-  unavailable temperature sentinel, and its scale if so. Only the root-only,
-  active-stream raw debugfs read is currently exposed.
+  unavailable temperature sentinel, and its scale if so. Closed on the
+  MacBookAir7,2 - see "Sensor temperature" - and open only for other sensors.
 
 Remove entries from this document when the corresponding fixes are accepted
 upstream.

@@ -777,6 +777,15 @@ struct isp_cmd_channel_sensor_temperature {
 	s32 temperature;
 };
 
+/* What this firmware returns on a sensor that does not report a temperature.
+ * Repeated sampling on a MacBookAir7,2 - cold, after ten minutes of streaming,
+ * and across every lighting condition - never produced anything else, which is
+ * a sentinel rather than a reading on an unknown scale.  The driver reports it
+ * as unavailable instead of publishing it; a sensor that does return real data
+ * would show up as some other value and would still need its scale established
+ * before it could become an hwmon channel. */
+#define FTHD_SENSOR_TEMPERATURE_NONE (-1)
+
 struct isp_cmd_channel_start {
 	u32 channel;
 };
@@ -842,7 +851,8 @@ extern int fthd_isp_cmd_channel_stop(struct fthd_private *dev_priv);
 extern int fthd_isp_cmd_channel_camera_config(struct fthd_private *dev_priv);
 extern int fthd_isp_cmd_channel_crop_set(struct fthd_private *dev_priv, int channel,
 					 int x1, int y1, int x2, int y2);
-extern int fthd_isp_cmd_channel_output_config_set(struct fthd_private *dev_priv, int channel, int x, int y, int pixelformat);
+extern int fthd_isp_cmd_channel_output_config_set(struct fthd_private *dev_priv, int channel, int x, int y,
+						  int stride, int pixelformat);
 extern int fthd_isp_cmd_channel_recycle_mode(struct fthd_private *dev_priv, int channel, int mode);
 extern int fthd_isp_cmd_channel_recycle_start(struct fthd_private *dev_priv, int channel);
 extern int fthd_isp_cmd_channel_camera_config_select(struct fthd_private *dev_priv, int channel, int config);

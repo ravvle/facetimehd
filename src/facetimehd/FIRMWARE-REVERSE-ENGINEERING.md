@@ -351,37 +351,72 @@ their reads remained inside the eight-byte value word that Linux supplied.
 This makes AE bias the leading explanation, not a proof that the other guessed
 commands are safe.
 
-## NV16 findings
+## Semi-planar output: NV12, not NV16
 
-NV16 output code zero was not invented by the 2026 feature patch. It existed in
-the upstream driver in 2015. Upstream commit `d57b16fc6438` disabled NV16 with
-the comment that multiplanar support was missing, and it remains disabled in
-upstream `364b1c663583`.
+Output-format code 0 was not invented by the 2026 feature patch; it existed in
+the upstream driver in 2015, where a comment described it only as "plane 0 Y
+plane 1 UV". Upstream commit `d57b16fc6438` disabled it with the note that
+multiplanar support was missing, and it remains disabled in upstream
+`364b1c663583`. The old code modelled it as two vb2 planes while using the
+single-planar `V4L2_BUF_TYPE_VIDEO_CAPTURE` API and reported only
+`width * height` bytes per plane.
 
-The old code modelled NV16 as two vb2 planes but used the single-planar
-`V4L2_BUF_TYPE_VIDEO_CAPTURE` API and incorrectly reported only
-`width * height` bytes per plane. A correct single-planar NV16 buffer is one
-userspace buffer containing a `width * height` luma plane followed by an equal
-sized interleaved chroma plane. It therefore needs:
+Nothing in that comment gave the format a chroma sampling. Every later reading -
+upstream's, this fork's, and this document's earlier revision - supplied 4:2:2
+from the format's assumed name and called it NV16. **Hardware says 4:2:0.**
+
+Capturing through code 0 on the MacBookAir7,2 and mapping the frame row by row:
+
+| Region | Bytes | Content |
+|---|---:|---|
+| rows 0-719 | 921,600 | luma, complete |
+| rows 720-1079 | 460,800 | chroma, mean 128.3 |
+| rows 1080-1439 | 460,800 | never written, all zero |
+
+360 chroma rows for a 720-row frame is 4:2:0. Split into components the chroma
+gives Cb 122.3 and Cr 135.3, against Cb 122.5 and Cr 135.4 from a YUYV capture
+of the same scene seconds later; luma agrees at 93.1 against 92.9. The correct
+single-planar layout is therefore:
 
 ```text
 bytesperline = width
-sizeimage    = width * height * 2
+sizeimage    = width * height * 3 / 2
 ISP addr0    = mapped buffer base
 ISP addr1    = mapped buffer base + width * height
 ```
 
-The newer implementation follows that layout, and the driver's IOMMU allocator
-does give the scatterlist one contiguous ISP virtual-address range. Static
-analysis cannot prove that format code zero works on this sensor, so it still
-needs an explicit capture test before being advertised to normal format
-negotiators.
+The driver's IOMMU allocator gives the scatterlist one contiguous ISP
+virtual-address range, so the chroma plane needs no mapping of its own.
 
-The earlier hardware report did **not** validate NV16 despite recording a pass:
-NV16 was absent from `ENUM_FMT`, `S_FMT` silently coerced the unsupported fourcc
-to YUYV, both formats have the same total byte count, and the test checked only
-size and capture. A valid future test must read back `G_FMT` and require the
-returned fourcc to remain `NV16`, in addition to checking plane content.
+One field was a known unknown and is now resolved. `x2` in
+`CISP_CMD_CH_OUTPUT_CONFIG_SET` is the **destination row stride in bytes**, not
+the "chroma size?" upstream guessed at. Upstream hardcoded `width * 2`, which
+for the packed formats is simultaneously a correct stride and an unremarkable
+constant, so nothing distinguished the two readings.
+
+The semi-planar format distinguished them. With `width * 2` still being sent for
+a one-byte-per-pixel luma plane, hardware wrote luma rows 2560 bytes apart into
+a buffer laid out for 1280: exactly 50% of the luma rows came back zero, in a
+strict every-other-row pattern. No IOMMU fault occurred, because `sizeimage`
+still covered everything written - the predicted "bounded, loud" failure was in
+fact silent, because the ISP skips rows rather than overrunning. The driver now
+passes `bytesperline`, which leaves the packed formats byte-for-byte unchanged.
+
+Two earlier claims in this file are withdrawn by the above. NV12 was said to be
+unidentifiable and dangerous to guess, on the grounds that sizing a buffer at
+1.5 bytes per pixel while the ISP wrote 4:2:2 at 2 would overrun the mapping.
+The code is identified - it is 0 - and the error ran the other way: sizing for
+4:2:2 over-allocated and left a tail unwritten, which cannot overrun anything.
+
+The earlier hardware report did **not** validate the format despite recording a
+pass: it was absent from `ENUM_FMT`, `S_FMT` silently coerced the fourcc to
+YUYV, both formats had the same total byte count, and the test checked only size
+and capture. `tests/hw-validate.sh --only nv12` is built around each half of
+that mistake and around the stride failure above: it re-reads `G_FMT` and
+requires the fourcc to survive, checks `bytesperline` and `sizeimage`, counts
+blank luma rows, inspects the planes separately at their 4:2:0 extents, and
+compares chroma against a YUYV capture of the same scene rather than an absolute
+threshold.
 
 ## Other feature status learned during the incident
 
@@ -526,20 +561,52 @@ optional, separate shutdown-path test.
    log, capture frames, measure the intended image effect, stop/restart the
    stream, and check for delayed faults.
 7. Do not expose sensor temperature through hwmon until its scale is established.
+   On the MacBookAir7,2 there is nothing to establish: see the sentinel note
+   below.
 8. Do not advertise NV16 until `G_FMT` confirms NV16 and captured luma/chroma
-   plane contents are both plausible.
+   plane contents are both plausible. Implementing it behind a default-off
+   module parameter is not the same as advertising it, and is what makes the
+   test runnable.
+9. A recovered value may reach V4L2 as a **read-only** control once its meaning
+   is supported by hardware evidence. `v4l2_ctrl_handler_setup()` skips
+   read-only controls, so such a control cannot replay a firmware SET - which is
+   the mechanism behind the lockups, and the reason rule 1 exists.
+   `FTHD_CID_AWB_CCT_ESTIMATE` is the first of these. Use a driver-private CID
+   unless the standard control means exactly the same thing; a measurement
+   published under a CID that means a set point is a wrong answer with a
+   familiar name.
 
 ## Open questions
 
 - AE-bias encoding, units, valid range, and tag semantics.
-- AWB-CCT manual-set second-word/tag semantics; the GET value now strongly
-  tracks kelvin on the MacBookAir7,2 but still needs cross-model confirmation.
+- AWB-CCT manual-set second-word/tag semantics. The GET value strongly tracks
+  kelvin on the MacBookAir7,2 and is now published as the read-only
+  `awb_cct_estimate` V4L2 control; what remains open is cross-model confirmation
+  of the unit, and the manual setter's second word, which is why there is a
+  readback and no way to write one.
 - The four packed fields used by AWB first-gain manual.
 - The first halfword and supported pattern indices for sensor test pattern.
 - Integration-time and gain units/ranges, and the correct atomic manual-exposure
   sequence (the firmware also has manual-mode and combined integration/gain
   opcodes that may be more appropriate than collapsing two gain caps).
 - Meanings and safe combinations of the three chroma-suppression bytes.
-- Whether any supported sensor returns something other than the `-1`
-  unavailable sentinel, and its scale if so.
-- NV16 operation and chroma ordering on the MacBookAir7,2 sensor.
+- Whether any sensor *other* than this one returns something other than the `-1`
+  unavailable sentinel, and its scale if so. This is closed for the
+  MacBookAir7,2: `-1` came back cold, after ten minutes of continuous streaming
+  and under every sampled lighting condition, and a physical scale would have
+  moved with die temperature over that stream. The driver names the value
+  `FTHD_SENSOR_TEMPERATURE_NONE` and reports it as `-1 (unavailable)` rather
+  than inviting calibration of a constant.
+- Nothing remains open about the semi-planar format's layout: code 0 is NV12,
+  measured. What is untested is the driver streaming with `sizeimage` at the
+  4:2:0 size, since the measurements came from an over-sized buffer.
+- Why one crop rectangle starves the stream. The ISP does honour a non-zero
+  `x1`/`y1` - that part is answered - but `x1 = sensor_width - width` together
+  with `y1 = 0` is accepted and then produces no buffers at all on first use,
+  while `y1 = 8` or `x1` eight pixels lower streams normally. See DOWNSTREAM.md,
+  "Frame-rate decimation and cropping". The driver's log was not readable in the
+  session that found it; a SIF or channel-start error there is the obvious next
+  evidence, and would say whether firmware rejected the geometry outright.
+- Per-frame spacing under decimation. The mean rate is now measured and correct
+  at every divisor, but `hw-validate.sh` checks only a coarse bunching floor, so
+  uneven spacing at the right average would still pass.

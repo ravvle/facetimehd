@@ -284,7 +284,17 @@ Beyond the usual brightness and contrast, the driver exposes:
 v4l2-ctl --list-ctrls
 v4l2-ctl --set-ctrl auto_exposure=1          # manual exposure mode
 v4l2-ctl --set-ctrl power_line_frequency=1   # 50 Hz anti-banding
+v4l2-ctl --get-ctrl awb_cct_estimate         # read-only, while streaming
 ```
+
+`awb_cct_estimate` is the ISP's own current colour-temperature estimate in
+kelvin, read live from the firmware. It is read-only, so nothing about it is
+ever sent back to the camera; while the camera is idle it reports the last
+value sampled during a stream, or `0` if there has not been one yet. It is a
+driver-private control rather than the standard
+`V4L2_CID_WHITE_BALANCE_TEMPERATURE` because that one means the temperature an
+application asks the camera to *assume*, and this camera has no validated way
+to be told one.
 
 The inferred firmware-command controls are intentionally absent from the
 driver. The combined newer build repeatedly hard-locked the validation
@@ -293,6 +303,17 @@ every unvalidated command. Firmware disassembly then proved that several
 payload layouts were incomplete or put values in the wrong fields. See the
 [firmware reverse-engineering notes](src/facetimehd/FIRMWARE-REVERSE-ENGINEERING.md)
 and [`DOWNSTREAM.md`](src/facetimehd/DOWNSTREAM.md).
+
+### Pixel formats
+
+`YUYV` and `YVYU` are offered, both 4:2:2 packed at the sensor's native size or
+any smaller 8-pixel-aligned width.
+
+`NV12` (semi-planar 4:2:0) is also offered. It is enumerated after the packed
+formats, so applications that take the first format available are unaffected.
+
+`NV16` is not offered: the camera's semi-planar output was measured writing
+4:2:0, so nothing it produces is 4:2:2 semi-planar.
 
 ### Raw firmware readbacks
 
@@ -317,6 +338,14 @@ The numbers are deliberately labelled `raw`: firmware does not document their
 units or ranges. An idle read fails with `EPIPE`; there is no polling or hwmon
 registration. The complete check is
 `sudo ./tests/hw-validate.sh --only readbacks`.
+
+Two of these have since been resolved. `sensor_temperature_raw` prints
+`-1 (unavailable)` on the validation MacBook: repeated sampling — cold, after
+ten minutes of streaming, and under every lighting condition — never returned
+anything else, which is a not-supported sentinel rather than a reading on an
+unknown scale. It will never become an hwmon channel on such a sensor. The AWB
+colour temperature did track lighting properly, so it is also available to
+ordinary applications as the `awb_cct_estimate` control described above.
 
 Three deliberately opt-in experiments build on those reads:
 

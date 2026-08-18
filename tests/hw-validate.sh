@@ -50,11 +50,23 @@ METERING_WAIT_SECS="${METERING_WAIT_SECS:-8}"
 METERING_RESTART_AE="${METERING_RESTART_AE:-0}"
 METERING_RESTORE_NODE=""
 METERING_ORIGINAL=""
+# Requested rates, not divisors. The driver derives divisor = round(30/rate)
+# and caps it at FTHD_MAX_FPS_DIVISOR (30), so 1 fps is the slowest stream it
+# can produce and is the case that leans hardest on the requeue path.
+DECIMATION_RATES="${DECIMATION_RATES:-30 15 10 6 3 1}"
+DECIMATION_SECS="${DECIMATION_SECS:-6}"
+DECIMATION_TOLERANCE="${DECIMATION_TOLERANCE:-12}"
+DECIMATION_OFF_SECS="${DECIMATION_OFF_SECS:-5}"
+CROP_WIDTH="${CROP_WIDTH:-640}"
+CROP_HEIGHT="${CROP_HEIGHT:-360}"
+NV12_FRAMES="${NV12_FRAMES:-10}"
 
-# Removed inferred controls and NV16 are intentionally not selectable here.
-# Readbacks are in the normal suite after their first complete fault-free run.
-# Profiling and same-value setter round trips remain explicit hardware work.
-DEFAULT_SECTIONS="probe timing controls runtimepm suspend wedged readbacks"
+# Removed inferred controls are intentionally not selectable here. Readbacks
+# are in the normal suite after their first complete fault-free run. Decimation
+# and crop are driver logic with no firmware guessing in them, so they run by
+# default; profiling, same-value setter round trips, metering semantics and the
+# still-unadvertised NV16 format remain explicit hardware work.
+DEFAULT_SECTIONS="probe timing controls decimation crop nv12 runtimepm suspend wedged readbacks"
 ALL_SECTIONS="$DEFAULT_SECTIONS readback-profile roundtrips metering-modes"
 SECTIONS="$DEFAULT_SECTIONS"
 DO_REBOOT=0
@@ -76,7 +88,8 @@ Usage: sudo $0 [OPTIONS]
   -h, --help         Show this help.
 
 Sections: $ALL_SECTIONS
-  readback-profile, roundtrips and metering-modes are opt-in hardware experiments.
+  readback-profile, roundtrips and metering-modes are opt-in hardware
+  experiments.
 
 Environment:
   DEVICE        Video node to test (default: the node $MODULE_NAME claims).
@@ -99,6 +112,17 @@ Environment:
                 Seconds before checking each bounded capture (default: 8).
   METERING_RESTART_AE
                 Set to 1 to stop/restart AE around each mode change (default: 0).
+  DECIMATION_RATES
+                Requested frame rates to verify (default: 30 15 10 6 3 1).
+  DECIMATION_SECS
+                Seconds of steady-state capture per rate (default: 6).
+  DECIMATION_TOLERANCE
+                Percent the measured rate may differ by (default: 12).
+  DECIMATION_OFF_SECS
+                Seconds to stream before the mid-decimation STREAMOFF (default: 5).
+  CROP_WIDTH / CROP_HEIGHT
+                Output size used while moving the crop (default: 640x360).
+  NV12_FRAMES   Frames captured for the NV12 plane check (default: 10).
   REPORT        Report path (default: /tmp/facetimehd-hw-validate-DATE.log).
 EOF
 }
@@ -127,10 +151,17 @@ for _s in $SECTIONS; do
 done
 
 for _numeric_name in METERING_SETTLE_FRAMES METERING_CAPTURE_FRAMES \
-                     METERING_WAIT_SECS; do
+                     METERING_WAIT_SECS DECIMATION_SECS DECIMATION_TOLERANCE \
+                     DECIMATION_OFF_SECS CROP_WIDTH CROP_HEIGHT NV12_FRAMES; do
     _numeric_value="${!_numeric_name}"
     case "$_numeric_value" in
         ''|*[!0-9]*|0) die "$_numeric_name must be a positive integer" ;;
+    esac
+done
+
+for _rate in $DECIMATION_RATES; do
+    case "$_rate" in
+        ''|*[!0-9]*|0) die "DECIMATION_RATES must be positive integers" ;;
     esac
 done
 
@@ -282,9 +313,31 @@ wait_for_device() {
     return 1
 }
 
+# Every capture in this script is bounded, because a stream that produces no
+# buffers at all is a real observed failure and not a hypothetical one: an early
+# run of the crop section met a rectangle the ISP accepted and then never
+# delivered a frame for, and v4l2-ctl sat in vb2_wait_for_done_vb indefinitely.
+# Unbounded, that wedges the whole run rather than failing one check.
+#
+# The bound has to scale with the frame count and the requested rate. Anything
+# fixed either kills a legitimately slow decimated capture - ten frames at 1 fps
+# is ten seconds of correct behaviour - or leaves a starved 30 fps stream
+# hanging for minutes. The slack covers open, REQBUFS, and a runtime-PM resume
+# with its DDR retrain and firmware reload.
+CAPTURE_SLACK_SECS="${CAPTURE_SLACK_SECS:-20}"
+
+capture_timeout_secs() {
+    awk -v n="$1" -v r="${2:-30}" -v slack="$CAPTURE_SLACK_SECS" \
+        'BEGIN{ if (r <= 0) r = 30; printf "%d", n / r + slack }'
+}
+
+# Exit status 124 means the stream starved; callers that can say something
+# useful about that distinguish it, and the rest correctly see a failure.
 capture_ok() {
-    v4l2-ctl --device "$DEVICE" --stream-mmap --stream-count="${1:-$FRAMES}" \
-             --stream-to=/dev/null >>"$REPORT" 2>&1
+    local frames="${1:-$FRAMES}" rate="${2:-30}"
+    timeout -s TERM "$(capture_timeout_secs "$frames" "$rate")" \
+        v4l2-ctl --device "$DEVICE" --stream-mmap --stream-count="$frames" \
+                 --stream-to=/dev/null >>"$REPORT" 2>&1
 }
 
 # Mean luma of one frame, sampled across the whole image rather than the head
@@ -365,6 +418,242 @@ frame_luma_metrics() {
                        full / full_n, spot / spot_n, \
                        centre / centre_n, outer / outer_n
             }'
+}
+
+# The evidence that a stream tore down cleanly. Absence of all of these is what
+# earlier runs got wrong: a viewer that visibly kept producing frames was
+# reported as a pass while the log recorded a failed channel stop and four DMA
+# writes to unmapped address zero.
+FAULT_PATTERN='firmware stopped responding|failed to stop firmware channel|unknown tag|invalid state|IOMMU.*fault|DMAR:.*fault|channel stop failed'
+
+faults_present() { dmesg_since | grep -Eqi "$FAULT_PATTERN"; }
+
+# Milliseconds since the epoch.
+#
+# Deliberately not `date +%s%3N`. Ubuntu 26.04 ships uutils coreutils, whose
+# date ignores the %3N field-width modifier and prints all nine nanosecond
+# digits, so that expression yields an 18-digit number and every duration
+# derived from it is garbage - silently, and on a distribution this project
+# supports. Bash's own EPOCHREALTIME has no such ambiguity. Its decimal
+# separator follows the locale, hence the substitution.
+now_ms() {
+    local t="${EPOCHREALTIME:-}"
+
+    if [ -n "$t" ]; then
+        t="${t/,/.}"
+        # 10# so a fractional part with leading zeros is not read as octal.
+        printf '%s\n' "$(( ${t%.*} * 1000 + 10#${t#*.} / 1000 ))"
+        return 0
+    fi
+
+    # Second resolution: enough to catch a wildly wrong rate, not enough to
+    # confirm a correct one. clock_sane() below is what decides whether the
+    # measurements that depend on this are reported at all.
+    printf '%s\n' "$(( $(date +%s) * 1000 ))"
+}
+
+# A rate measurement is only as good as its clock, and the failure above was
+# silent - it produced confident, wrong frame rates rather than an error. So the
+# clock is checked against a known interval before any rate is trusted.
+clock_sane() {
+    local before after elapsed
+    before="$(now_ms)"
+    sleep 0.5
+    after="$(now_ms)"
+    elapsed=$(( after - before ))
+    [ "$elapsed" -ge 300 ] && [ "$elapsed" -le 3000 ]
+}
+
+# Capture @1 frames at an expected rate of @2 and print how many milliseconds it
+# took. Non-zero exit means the capture failed rather than merely ran slowly -
+# 124 specifically means it starved - which the caller must distinguish, because
+# a timing measurement taken from a killed capture is not a measurement.
+timed_capture() {
+    local frames="$1" rate="${2:-30}" start end rc
+    start="$(now_ms)"
+    timeout -s TERM "$(capture_timeout_secs "$frames" "$rate")" \
+        v4l2-ctl --device "$DEVICE" --stream-mmap --stream-count="$frames" \
+                 --stream-to=/dev/null >>"$REPORT" 2>&1
+    rc=$?
+    [ "$rc" -eq 0 ] || return "$rc"
+    end="$(now_ms)"
+    printf '%s\n' "$(( end - start ))"
+}
+
+# Sixteen block means (a 4x4 grid) of the last complete packed-YUV frame in a
+# capture. Y is every even byte in both YUYV and YVYU. Two such signatures
+# taken of the same still scene through different crop rectangles are how this
+# script tells "the ISP moved the window" from "the ISP ignored x1/y1", which
+# a single full-frame mean cannot do.
+packed_block_luma() {
+    local file="$1" frame_size="$2" width="$3" height="$4"
+    local size complete
+
+    size="$(stat -c %s "$file" 2>/dev/null || echo 0)"
+    complete=$(( size / frame_size ))
+    [ "$complete" -gt 0 ] || return 1
+
+    dd if="$file" bs="$frame_size" skip=$(( complete - 1 )) count=1 \
+       status=none 2>/dev/null |
+        od -An -tu1 -v |
+        awk -v w="$width" -v h="$height" '
+            {
+                for (i = 1; i <= NF; i++) {
+                    if (byte % 2 == 0) {
+                        pixel = byte / 2
+                        bx = int((pixel % w) * 4 / w)
+                        by = int(int(pixel / w) * 4 / h)
+                        if (bx > 3) bx = 3
+                        if (by > 3) by = 3
+                        b = by * 4 + bx
+                        sum[b] += $i
+                        n[b]++
+                    }
+                    byte++
+                }
+            }
+            END {
+                for (b = 0; b < 16; b++) {
+                    if (!n[b])
+                        exit 1
+                    out = out sprintf("%s%.1f", (b ? " " : ""), sum[b] / n[b])
+                }
+                print out
+            }'
+}
+
+# How differently two block signatures are *shaped*, with each one's own mean
+# removed first. Auto-exposure re-converges between two captures and shifts the
+# whole frame, so a raw difference would report a change the crop did not make;
+# subtracting the mean leaves only where the light is, which is what moving the
+# rectangle actually changes.
+block_shape_diff() {
+    awk -v a="$1" -v b="$2" '
+        BEGIN {
+            na = split(a, A, " ")
+            nb = split(b, B, " ")
+            if (na != nb || na == 0)
+                exit 1
+            for (i = 1; i <= na; i++) {
+                ma += A[i]
+                mb += B[i]
+            }
+            ma /= na
+            mb /= nb
+            for (i = 1; i <= na; i++) {
+                d = (A[i] - ma) - (B[i] - mb)
+                if (d < 0)
+                    d = -d
+                s += d
+            }
+            printf "%.1f\n", s / na
+        }'
+}
+
+# Spread of one signature: a scene with no spatial structure cannot show that
+# the crop moved, whatever the driver does.
+block_spread() {
+    awk -v a="$1" '
+        BEGIN {
+            n = split(a, A, " ")
+            if (n == 0)
+                exit 1
+            min = max = A[1]
+            for (i = 1; i <= n; i++) {
+                if (A[i] < min) min = A[i]
+                if (A[i] > max) max = A[i]
+            }
+            printf "%.1f\n", max - min
+        }'
+}
+
+# What fraction of a plane's rows are entirely zero, as a percentage.
+#
+# This is the single most diagnostic NV16 measurement, and it is the one the
+# first hardware run did not have. A destination row stride that disagrees with
+# the buffer layout makes the ISP skip rows rather than overrun anything, so it
+# raises no IOMMU fault and the frame is silently half empty: the first NV16
+# capture on the MacBookAir7,2 had exactly 50% of its luma rows zero, in a
+# strict every-other-row pattern, because the output-config command was still
+# sending the packed formats' width*2 stride for a one-byte-per-pixel plane.
+plane_zero_rows() {
+    local file="$1" offset="$2" stride="$3" rows="$4" i zero=0 sum
+
+    for i in $(seq 0 $(( rows - 1 ))); do
+        sum="$(dd if="$file" bs=1 skip=$(( offset + i * stride )) count="$stride" \
+               status=none 2>/dev/null | od -An -tu1 -v |
+               awk '{for (j = 1; j <= NF; j++) s += $j} END{print s + 0}')"
+        [ "$sum" -eq 0 ] && zero=$(( zero + 1 ))
+    done
+    awk -v z="$zero" -v n="$rows" 'BEGIN{printf "%.1f", z * 100 / n}'
+}
+
+# Mean of the Cb and Cr components of a packed YUYV frame: bytes go Y Cb Y Cr,
+# so Cb is every 4th byte from offset 1 and Cr every 4th from offset 3. YUYV is
+# a validated format on this hardware, which makes it the reference NV16's
+# chroma has to agree with - far stronger evidence than any absolute threshold,
+# because it is the same sensor looking at the same room.
+yuyv_chroma_means() {
+    local file="$1" frame_size="$2" size complete
+
+    size="$(stat -c %s "$file" 2>/dev/null || echo 0)"
+    complete=$(( size / frame_size ))
+    [ "$complete" -gt 0 ] || return 1
+    dd if="$file" bs="$frame_size" skip=$(( complete - 1 )) count=1 \
+       status=none 2>/dev/null | od -An -tu1 -v |
+        awk '{
+                 for (i = 1; i <= NF; i++) {
+                     m = byte % 4
+                     if (m == 1) { cb += $i; nb++ }
+                     else if (m == 3) { cr += $i; nr++ }
+                     byte++
+                 }
+             }
+             END {
+                 if (!nb || !nr)
+                     exit 1
+                 printf "%.1f %.1f\n", cb / nb, cr / nr
+             }'
+}
+
+# "mean min max" over six samples spread through a byte range of a file. Used
+# on the luma and chroma halves of an NV16 frame separately, because the whole
+# question there is whether the two halves hold different kinds of data.
+plane_stats() {
+    local file="$1" offset="$2" len="$3" step i off
+    step=$(( len / 6 ))
+    [ "$step" -gt 0 ] || return 1
+    for i in 0 1 2 3 4 5; do
+        off=$(( offset + i * step ))
+        dd if="$file" bs=1 skip="$off" count=4096 status=none 2>/dev/null
+    done | od -An -tu1 -v |
+        awk '{
+                 for (i = 1; i <= NF; i++) {
+                     v = $i
+                     s += v
+                     n++
+                     if (n == 1 || v < min) min = v
+                     if (n == 1 || v > max) max = v
+                 }
+             }
+             END {
+                 if (!n)
+                     exit 1
+                 printf "%.1f %d %d\n", s / n, min, max
+             }'
+}
+
+# One field out of v4l2-ctl --get-fmt-video, by its printed label.
+fmt_field() {
+    v4l2-ctl --device "$DEVICE" --get-fmt-video 2>/dev/null |
+        sed -n "s/^[[:space:]]*$1[[:space:]]*:[[:space:]]*//p" | head -1
+}
+
+# "left top width height" of the current crop rectangle.
+current_crop() {
+    v4l2-ctl --device "$DEVICE" --get-selection=target=crop 2>/dev/null |
+        sed -n 's/.*Left \([0-9-]*\), Top \([0-9-]*\), Width \([0-9]*\), Height \([0-9]*\).*/\1 \2 \3 \4/p' |
+        head -1
 }
 
 # Dynamic debug turns on the dev_dbg lines - notably "DDR verification passed
@@ -1046,6 +1335,48 @@ ae_sensor_integration_time_min_raw
 ae_sensor_integration_time_max_raw
 ae_metering_mode_raw
 EOF
+
+            # The same AWB CCT value through its V4L2 control, which is what a
+            # normal application sees. It is read-only and volatile, so this
+            # reaches the same firmware GET without any SET being possible; the
+            # debugfs value above is the reference it has to agree with.
+            cct_debugfs="$(cat "$DEBUGFS_DEVICE/awb_cct_raw" 2>/dev/null || true)"
+            cct_ctrl="$(v4l2-ctl --device "$DEVICE" --get-ctrl awb_cct_estimate \
+                        2>/dev/null | sed -n 's/^awb_cct_estimate: //p')"
+            if [ -z "$cct_ctrl" ]; then
+                result FAIL readbacks.awb_cct_ctrl \
+                    "awb_cct_estimate is not exposed as a V4L2 control"
+            elif [ -z "$cct_debugfs" ]; then
+                result WARN readbacks.awb_cct_ctrl \
+                    "control reads $cct_ctrl but the debugfs reference was unreadable"
+            elif awk -v a="$cct_ctrl" -v b="$cct_debugfs" \
+                     'BEGIN{d=a-b; if(d<0)d=-d; exit !(d <= b * 0.25 + 50)}'; then
+                # AWB keeps estimating between the two reads, so they are close
+                # rather than equal; a control wired to something else entirely
+                # would not land in the same neighbourhood at all.
+                result PASS readbacks.awb_cct_ctrl \
+                    "control reads $cct_ctrl against a debugfs $cct_debugfs"
+            else
+                result FAIL readbacks.awb_cct_ctrl \
+                    "control reads $cct_ctrl but debugfs reads $cct_debugfs - not the same value"
+            fi
+
+            # Read-only is the whole safety argument: a writable control would
+            # be replayed at every STREAMON. Judge the outcome rather than
+            # v4l2-ctl's exit status, which for a read-only control is a
+            # diagnostic of its own rather than the kernel's answer. 12345 K is
+            # not a colour temperature the ISP would report on its own.
+            v4l2-ctl --device "$DEVICE" --set-ctrl awb_cct_estimate=12345 \
+                >>"$REPORT" 2>&1 || true
+            cct_after="$(v4l2-ctl --device "$DEVICE" --get-ctrl awb_cct_estimate \
+                         2>/dev/null | sed -n 's/^awb_cct_estimate: //p')"
+            if [ "$cct_after" = 12345 ]; then
+                result FAIL readbacks.awb_cct_ro \
+                    "awb_cct_estimate took a written value - it is not read-only, so STREAMON can replay it"
+            else
+                result PASS readbacks.awb_cct_ro \
+                    "awb_cct_estimate ignored a write and still reads $cct_after"
+            fi
         fi
         kill "$STREAM_PID" 2>/dev/null || true
         wait "$STREAM_PID" 2>/dev/null || true
@@ -1580,6 +1911,613 @@ if wants metering-modes; then
             result INFO metering.interpretation \
                 "compare full/spot/centre/outer luma across modes; semantics are not assigned automatically"
         fi
+    fi
+fi
+
+# ============================================================================
+# Section: decimation
+# DOWNSTREAM.md - "Frame-rate selection"
+#
+# Nothing here guesses at a firmware payload: the divisor is applied to frames
+# the driver has already received, so this is driver logic and runs by default.
+# It answers the three open questions on that item - whether a decimated stream
+# really arrives at the requested rate, whether the requeue path keeps the ISP
+# fed from a pool of only four buffers, and whether a STREAMOFF in the middle
+# of heavy decimation gives every one of them back.
+#
+# The rate is measured from the difference between a short and a long capture
+# rather than from one capture's duration. v4l2-ctl spends roughly two seconds
+# opening the node, allocating buffers and reaching the first frame, and at
+# 30 fps that fixed cost is a third of a six-second measurement: it has to be
+# subtracted, not tolerated.
+# ============================================================================
+if wants decimation; then
+    step "decimation: are requested frame rates actually delivered"
+    log_section "SECTION decimation"
+
+    [ -n "$DEVICE" ] || wait_for_device || true
+    if [ -z "$DEVICE" ]; then
+        result SKIP decimation "no video node"
+    elif ! clock_sane; then
+        # Everything below is a duration; without a millisecond clock the only
+        # honest result is no result.
+        result FAIL decimation.clock \
+            "no usable millisecond clock, so no frame rate can be measured"
+    else
+        slowest_rate=""
+        slowest_divisor=0
+        for rate in $DECIMATION_RATES; do
+            # What the driver will actually select: divisor = round(30/rate),
+            # clamped to 1..FTHD_MAX_FPS_DIVISOR. Comparing against the
+            # requested rate instead would fail every rate that is not a
+            # divisor of 30, for a reason that is not a defect.
+            divisor="$(awk -v r="$rate" \
+                'BEGIN{d=int(30/r + 0.5); if (d<1) d=1; if (d>30) d=30; print d}')"
+            expect="$(awk -v d="$divisor" 'BEGIN{printf "%.3f", 30/d}')"
+            if [ "$divisor" -gt "$slowest_divisor" ]; then
+                slowest_divisor="$divisor"
+                slowest_rate="$rate"
+            fi
+
+            log_section "DECIMATION ${rate} fps (divisor $divisor)"
+            dmesg_mark
+
+            if ! v4l2-ctl --device "$DEVICE" --set-parm="$rate" >>"$REPORT" 2>&1; then
+                result FAIL "decimation.$rate.set" "S_PARM was rejected"
+                continue
+            fi
+            got="$(v4l2-ctl --device "$DEVICE" --get-parm 2>/dev/null |
+                   sed -n 's/^[[:space:]]*Frames per second:[[:space:]]*\([0-9.]*\).*/\1/p' |
+                   head -1)"
+            if [ -z "$got" ]; then
+                result FAIL "decimation.$rate.readback" "G_PARM printed no rate"
+                continue
+            fi
+            if awk -v g="$got" -v e="$expect" 'BEGIN{d=g-e; if(d<0)d=-d; exit !(d < 0.01)}'; then
+                result PASS "decimation.$rate.readback" \
+                    "G_PARM reports $got fps, the divisor-$divisor rate"
+            else
+                result FAIL "decimation.$rate.readback" \
+                    "G_PARM reports $got fps, expected $expect for divisor $divisor"
+                continue
+            fi
+
+            # Warm-up, discarded. With runtime PM on, the first capture after
+            # an idle gap pays for a DDR retrain and a firmware reload. That
+            # cost lands on whichever capture happens to be first, and the
+            # subtraction below cannot remove a cost that only one of the two
+            # paid - it would report a rate faster than the camera delivered.
+            capture_ok 4 "$rate" || true
+
+            # Two captures, both at this rate; the difference between them is
+            # free of v4l2-ctl's fixed start-up cost.
+            short_frames=$(( rate * 2 ))
+            [ "$short_frames" -ge 4 ] || short_frames=4
+            extra_frames=$(( rate * DECIMATION_SECS ))
+            [ "$extra_frames" -ge 4 ] || extra_frames=4
+            long_frames=$(( short_frames + extra_frames ))
+
+            # Capture the status explicitly. After a failed `if cmd`, `$?` is
+            # the status of the if statement, which is zero - reading it there
+            # would silently turn every starved capture into "some other error".
+            short_rc=0
+            short_ms="$(timed_capture "$short_frames" "$rate")" || short_rc=$?
+            long_rc=0
+            if [ "$short_rc" -eq 0 ]; then
+                long_ms="$(timed_capture "$long_frames" "$rate")" || long_rc=$?
+            fi
+            if [ "$short_rc" -ne 0 ] || [ "$long_rc" -ne 0 ]; then
+                if [ "$short_rc" -eq 124 ] || [ "$long_rc" -eq 124 ]; then
+                    result FAIL "decimation.$rate.capture" \
+                        "the stream starved: no buffers arrived before the timeout"
+                else
+                    result FAIL "decimation.$rate.capture" \
+                        "capture failed (status ${short_rc}/${long_rc})"
+                fi
+                continue
+            fi
+            log "frames $short_frames/$long_frames took ${short_ms}/${long_ms} ms"
+
+            if [ "$long_ms" -le "$short_ms" ]; then
+                result WARN "decimation.$rate.rate" \
+                    "the longer capture did not take longer (${short_ms} vs ${long_ms} ms) - unusable timing"
+            else
+                measured="$(awk -v n="$extra_frames" -v t="$(( long_ms - short_ms ))" \
+                            'BEGIN{printf "%.2f", n * 1000 / t}')"
+                if awk -v m="$measured" -v e="$expect" -v tol="$DECIMATION_TOLERANCE" \
+                       'BEGIN{d=m-e; if(d<0)d=-d; exit !(d <= e*tol/100)}'; then
+                    result PASS "decimation.$rate.rate" \
+                        "delivered $measured fps against an expected $expect"
+                else
+                    result FAIL "decimation.$rate.rate" \
+                        "delivered $measured fps, expected $expect +/-${DECIMATION_TOLERANCE}%"
+                fi
+            fi
+
+            # A coarse bunching probe, not a jitter measurement: N frames
+            # cannot legitimately arrive faster than (N-1)/rate, so a short
+            # capture finishing well inside that means the driver released a
+            # burst rather than spacing frames out. Only four buffers exist, so
+            # a burst can never be large - this catches a broken divisor, not
+            # small timing noise.
+            floor_ms="$(awk -v n="$short_frames" -v e="$expect" \
+                        'BEGIN{printf "%d", (n - 1) * 1000 / e * 0.7}')"
+            if [ "$short_ms" -ge "$floor_ms" ]; then
+                result PASS "decimation.$rate.spacing" \
+                    "$short_frames frames took ${short_ms} ms, at or above the ${floor_ms} ms floor"
+            else
+                result WARN "decimation.$rate.spacing" \
+                    "$short_frames frames took only ${short_ms} ms against a ${floor_ms} ms floor - frames may be arriving in bursts"
+            fi
+
+            dmesg_driver >>"$REPORT"
+            if faults_present; then
+                result FAIL "decimation.$rate.faults" \
+                    "firmware, buffer or DMA fault during decimated capture"
+            else
+                result PASS "decimation.$rate.faults" \
+                    "no firmware, buffer, IOMMU or DMAR faults"
+            fi
+        done
+
+        result INFO decimation.jitter \
+            "mean rate only; per-frame spacing is not measured by this test"
+
+        # STREAMOFF while decimation is holding buffers back. At the largest
+        # divisor most buffers are in the requeue path rather than owned by
+        # userspace, which is the state in which a lost buffer would show up.
+        if [ -n "$slowest_rate" ]; then
+            log_section "DECIMATION streamoff at ${slowest_rate} fps (divisor $slowest_divisor)"
+            v4l2-ctl --device "$DEVICE" --set-parm="$slowest_rate" >>"$REPORT" 2>&1 || true
+            dmesg_mark
+            v4l2-ctl --device "$DEVICE" --stream-mmap --stream-count=100000 \
+                     --stream-to=/dev/null >>"$REPORT" 2>&1 &
+            STREAM_PID=$!
+            sleep "$DECIMATION_OFF_SECS"
+            if kill -0 "$STREAM_PID" 2>/dev/null; then
+                kill "$STREAM_PID" 2>/dev/null || true
+                wait "$STREAM_PID" 2>/dev/null || true
+                STREAM_PID=""
+                sleep 2
+                dmesg_driver >>"$REPORT"
+                if faults_present; then
+                    result FAIL decimation.streamoff \
+                        "STREAMOFF under heavy decimation left a buffer, channel or DMA fault"
+                else
+                    result PASS decimation.streamoff \
+                        "STREAMOFF under heavy decimation returned every buffer cleanly"
+                fi
+                if capture_ok 10; then
+                    result PASS decimation.streamoff.restart \
+                        "capture works again after the mid-decimation STREAMOFF"
+                else
+                    result FAIL decimation.streamoff.restart \
+                        "capture failed after the mid-decimation STREAMOFF"
+                fi
+            else
+                result FAIL decimation.streamoff \
+                    "the decimated stream exited on its own before STREAMOFF"
+                STREAM_PID=""
+            fi
+        fi
+
+        v4l2-ctl --device "$DEVICE" --set-parm=30 >>"$REPORT" 2>&1 || true
+    fi
+fi
+
+# ============================================================================
+# Section: crop
+# DOWNSTREAM.md - "Cropping and digital zoom"
+#
+# The open question is whether the ISP honours a non-zero x1/y1 at all, and a
+# capture that merely succeeds does not answer it: a rectangle that is silently
+# ignored still produces perfectly good frames. So this compares the *shape* of
+# two frames taken through rectangles at opposite corners of the sensor array.
+# If the origin does nothing, both frames show the same scene.
+#
+# Alignment stricter than eight pixels and whether the scaler will upscale are
+# the other two open items and are deliberately absent: the driver rounds the
+# rectangle and refuses to go below the output size, so neither question is
+# reachable through this ABI. What this section can do is record exactly what
+# the driver did with a misaligned request, so a future firmware experiment has
+# the baseline.
+# ============================================================================
+if wants crop; then
+    step "crop: non-zero rectangles and whether they move the picture"
+    log_section "SECTION crop"
+
+    [ -n "$DEVICE" ] || wait_for_device || true
+    if [ -z "$DEVICE" ]; then
+        result SKIP crop "no video node"
+    else
+        crop_orig_wh="$(fmt_field 'Width\/Height')"
+        crop_orig_fmt="$(fmt_field 'Pixel Format' | sed -n "s/.*'\\([A-Z0-9]*\\)'.*/\\1/p")"
+        crop_bounds="$(v4l2-ctl --device "$DEVICE" \
+                       --get-selection=target=crop_bounds 2>/dev/null |
+                       sed -n 's/.*Width \([0-9]*\), Height \([0-9]*\).*/\1 \2/p' | head -1)"
+        log "original format: $crop_orig_wh $crop_orig_fmt; sensor bounds: ${crop_bounds:-unknown}"
+
+        if [ -z "$crop_bounds" ]; then
+            result SKIP crop.bounds "G_SELECTION did not report crop bounds"
+        else
+            sensor_w="${crop_bounds%% *}"
+            sensor_h="${crop_bounds##* }"
+
+            v4l2-ctl --device "$DEVICE" \
+                --set-fmt-video="width=$CROP_WIDTH,height=$CROP_HEIGHT,pixelformat=YUYV" \
+                >>"$REPORT" 2>&1 || true
+            out_wh="$(fmt_field 'Width\/Height')"
+            out_w="${out_wh%%/*}"
+            out_h="${out_wh##*/}"
+            frame_size=$(( out_w * 2 * out_h ))
+            result INFO crop.output \
+                "moving the crop over a ${sensor_w}x${sensor_h} array with a ${out_w}x${out_h} output"
+
+            if [ "$INTERACTIVE" = 1 ]; then
+                info "Point the camera at a still, unevenly lit scene - a window on"
+                info "one side, a wall on the other. Keep it still, then press Enter."
+                read -r _ || true
+            fi
+
+            # left top width height, and whether an exact readback is expected.
+            #
+            # cornerflush is a regression case, not an exploratory one. On the
+            # MacBookAir7,2 a rectangle at left = sensor_w - out_w with top = 0
+            # - the top-right corner, flush to both edges, unscaled - is
+            # accepted by S_SELECTION and then produces no buffers at all on its
+            # first use, leaving the capture in vb2_wait_for_done_vb. Moving the
+            # top to 8, or the left to 632, makes it stream normally, so this
+            # exact pair is the reproducer and belongs in the suite.
+            far_left=$(( sensor_w - out_w ))
+            far_top=$(( sensor_h - out_h ))
+            crop_sig_tl=""
+            crop_sig_br=""
+            crop_far_label=""
+            # Order matters. A starved rectangle wedges the channel, so every
+            # rectangle that answers a question comes first and the two known
+            # pathological corners come last. midoffset exists because the
+            # origin comparison needs a second rectangle of the SAME size at a
+            # different origin - comparing against the full array would differ
+            # in scale as well, which proves nothing about the origin - and
+            # because both corners have now starved in different runs.
+            mid_left="$(( ((sensor_w - out_w) / 2) & ~7 ))"
+            mid_top=$(( (sensor_h - out_h) / 2 ))
+            for spec in "0 0 $sensor_w $sensor_h exact full" \
+                        "8 8 $out_w $out_h exact topleft" \
+                        "$mid_left $mid_top $out_w $out_h exact midoffset" \
+                        "4 5 $out_w $out_h rounded misaligned" \
+                        "$far_left $far_top $out_w $out_h exact bottomright" \
+                        "$far_left 0 $out_w $out_h exact cornerflush"; do
+                read -r want_l want_t want_w want_h exactness label <<<"$spec"
+
+                dmesg_mark
+                if ! v4l2-ctl --device "$DEVICE" \
+                        --set-selection="target=crop,left=$want_l,top=$want_t,width=$want_w,height=$want_h" \
+                        >>"$REPORT" 2>&1; then
+                    result FAIL "crop.$label.set" \
+                        "S_SELECTION rejected ${want_w}x${want_h}+${want_l}+${want_t}"
+                    continue
+                fi
+                got_crop="$(current_crop)"
+                if [ -z "$got_crop" ]; then
+                    result FAIL "crop.$label.readback" "G_SELECTION printed nothing"
+                    continue
+                fi
+                if [ "$exactness" = exact ]; then
+                    if [ "$got_crop" = "$want_l $want_t $want_w $want_h" ]; then
+                        result PASS "crop.$label.readback" \
+                            "read back exactly as ${want_w}x${want_h}+${want_l}+${want_t}"
+                    else
+                        result FAIL "crop.$label.readback" \
+                            "asked for ${want_w}x${want_h}+${want_l}+${want_t}, got '$got_crop'"
+                    fi
+                else
+                    # Expected to be adjusted. The value is the record, not a verdict:
+                    # it is the driver's rounding, and says nothing about what the
+                    # ISP would have accepted.
+                    result INFO "crop.$label.readback" \
+                        "requested ${want_w}x${want_h}+${want_l}+${want_t}, driver stored '$got_crop'"
+                fi
+
+                # Bounded: a rectangle the ISP accepts and then delivers no
+                # buffers for is an observed failure on the MacBookAir7,2, and
+                # an unbounded capture there waits in vb2_wait_for_done_vb for
+                # as long as the run lasts.
+                capture_file="/tmp/facetimehd-crop-$label.raw"
+                rm -f "$capture_file"
+                crop_rc=0
+                timeout -s TERM "$(capture_timeout_secs 15 30)" \
+                    v4l2-ctl --device "$DEVICE" --stream-mmap --stream-count=15 \
+                             --stream-to="$capture_file" >>"$REPORT" 2>&1 || crop_rc=$?
+                # v4l2-ctl exits 0 even when STREAMON fails - it reports
+                # "VIDIOC_STREAMON returned -1" on stdout and still returns
+                # success - so an exit status alone once marked two empty
+                # captures as passes. The file is the evidence: no complete
+                # frame means no capture, whatever the status said.
+                crop_bytes="$(stat -c %s "$capture_file" 2>/dev/null || echo 0)"
+                if [ "$crop_rc" -eq 0 ] && [ "$crop_bytes" -lt "$frame_size" ]; then
+                    result FAIL "crop.$label.capture" \
+                        "v4l2-ctl reported success but wrote $crop_bytes bytes, less than one $frame_size-byte frame (STREAMON likely failed)"
+                    continue
+                fi
+                if [ "$crop_rc" -eq 0 ]; then
+                    result PASS "crop.$label.capture" "captured through this rectangle"
+                elif [ "$crop_rc" -eq 124 ]; then
+                    result FAIL "crop.$label.starved" \
+                        "the ISP accepted ${want_w}x${want_h}+${want_l}+${want_t} and then delivered no buffers at all"
+                    # A starved rectangle leaves the channel wedged: every
+                    # later STREAMON returns EIO until the firmware is
+                    # reloaded. Without this, one bad rectangle silently
+                    # invalidates every rectangle after it. An idle gap lets
+                    # runtime PM tear the ISP down and rebuild it; where
+                    # runtime PM is off there is nothing to wait for and the
+                    # remaining results are reported as untrustworthy.
+                    if [ "$(cat /sys/module/$MODULE_NAME/parameters/runtime_pm 2>/dev/null)" = Y ]; then
+                        sleep "$IDLE_WAIT"
+                        if capture_ok 5; then
+                            result INFO "crop.$label.recovered" \
+                                "a runtime-PM cycle brought the channel back for the remaining rectangles"
+                        else
+                            result WARN "crop.$label.recovered" \
+                                "the channel did not recover; rectangles after this one are not trustworthy"
+                        fi
+                    else
+                        result WARN "crop.$label.recovered" \
+                            "runtime PM is off, so the wedged channel cannot be reset here; rectangles after this one are not trustworthy"
+                    fi
+                    continue
+                else
+                    result FAIL "crop.$label.capture" "capture failed through this rectangle"
+                    continue
+                fi
+
+                sig="$(packed_block_luma "$capture_file" "$frame_size" "$out_w" "$out_h" || true)"
+                if [ -n "$sig" ]; then
+                    log "block luma [$label]: $sig"
+                    # Any far-offset rectangle answers the origin question, so
+                    # take whichever one produced a frame. Keying it to
+                    # bottomright alone meant a single starved rectangle
+                    # skipped the check the section exists for.
+                    case "$label" in
+                        topleft) crop_sig_tl="$sig" ;;
+                        midoffset|bottomright|cornerflush)
+                            [ -n "$crop_sig_br" ] || crop_sig_br="$sig"
+                            [ -n "$crop_far_label" ] || crop_far_label="$label" ;;
+                    esac
+                fi
+
+                dmesg_driver >>"$REPORT"
+                if faults_present; then
+                    result FAIL "crop.$label.faults" \
+                        "firmware, buffer or DMA fault with this rectangle"
+                fi
+            done
+
+            # The actual open question.
+            if [ -n "$crop_sig_tl" ] && [ -n "$crop_sig_br" ]; then
+                spread_tl="$(block_spread "$crop_sig_tl")"
+                spread_br="$(block_spread "$crop_sig_br")"
+                shape="$(block_shape_diff "$crop_sig_tl" "$crop_sig_br")"
+                log "crop shape difference: $shape (spreads $spread_tl / $spread_br)"
+                if awk -v a="$spread_tl" -v b="$spread_br" 'BEGIN{exit !(a < 5 && b < 5)}'; then
+                    result WARN crop.origin \
+                        "the scene has almost no spatial structure (spreads $spread_tl/$spread_br) - this cannot show whether the origin moved; re-run pointing at something uneven"
+                elif awk -v s="$shape" 'BEGIN{exit !(s >= 3)}'; then
+                    result PASS crop.origin \
+                        "topleft versus $crop_far_label produced different images (shape difference $shape) - the ISP honours a non-zero x1/y1"
+                else
+                    result WARN crop.origin \
+                        "topleft versus $crop_far_label produced near-identical images (shape difference $shape) - either the scene was uniform or the ISP ignored x1/y1"
+                fi
+                result INFO crop.frames \
+                    "kept /tmp/facetimehd-crop-{full,topleft,bottomright,misaligned}.raw for eyeballing"
+            else
+                result SKIP crop.origin \
+                    "no far-offset rectangle produced a frame to compare against"
+            fi
+        fi
+
+        # Restore. The crop floor is the output size, so the format goes back
+        # first or the default rectangle cannot be re-fitted around it.
+        if [ -n "$crop_orig_wh" ] && [ -n "$crop_orig_fmt" ]; then
+            v4l2-ctl --device "$DEVICE" \
+                --set-fmt-video="width=${crop_orig_wh%%/*},height=${crop_orig_wh##*/},pixelformat=$crop_orig_fmt" \
+                >>"$REPORT" 2>&1 || true
+        fi
+        crop_default="$(v4l2-ctl --device "$DEVICE" \
+                        --get-selection=target=crop_default 2>/dev/null |
+                        sed -n 's/.*Left \([0-9-]*\), Top \([0-9-]*\), Width \([0-9]*\), Height \([0-9]*\).*/\1,\2,\3,\4/p' |
+                        head -1)"
+        if [ -n "$crop_default" ]; then
+            IFS=, read -r d_l d_t d_w d_h <<<"$crop_default"
+            v4l2-ctl --device "$DEVICE" \
+                --set-selection="target=crop,left=$d_l,top=$d_t,width=$d_w,height=$d_h" \
+                >>"$REPORT" 2>&1 || true
+        fi
+    fi
+fi
+
+# ============================================================================
+# Section: nv12
+# DOWNSTREAM.md - "Pixel formats"
+#
+# The ISP's semi-planar output, format code 0, is NV12. That is a hardware
+# result, not a reading of the code: a capture wrote a width*height luma plane
+# followed by exactly width*height/2 of chroma and left the rest of an
+# NV16-sized buffer at zero, with Cb/Cr matching a YUYV capture of the same
+# scene. Every earlier reading of this driver, upstream's included, assumed
+# 4:2:2 and called it NV16.
+#
+# It is a normally advertised format now, so this runs by default and needs no
+# module reload. It stays a standing regression check because each of its
+# assertions exists for a failure that already happened once:
+#
+#   - G_FMT is re-read because an early NV16 "pass" was really YUYV; the fourcc
+#     was silently coerced and both formats had the same byte count.
+#   - The luma rows are checked for a blank-row pattern because a row stride the
+#     ISP disagrees with makes it skip rows rather than overrun anything - no
+#     fault, and a frame that is half empty.
+#   - The planes are measured at their 4:2:0 extents, because reading chroma
+#     over a 4:2:2 extent averages it with unwritten zeros and reports a wrong
+#     number that looks like a wrong format.
+#   - Chroma is compared against a YUYV capture of the same scene rather than an
+#     absolute threshold, which is what turned "the chroma looks wrong" into
+#     "the chroma is 4:2:0".
+# ============================================================================
+if wants nv12; then
+    step "nv12: semi-planar 4:2:0 capture"
+    log_section "SECTION nv12"
+
+    [ -n "$DEVICE" ] || wait_for_device || true
+    if [ -z "$DEVICE" ]; then
+        result SKIP nv12 "no video node"
+    else
+        if v4l2-ctl --device "$DEVICE" --list-formats 2>/dev/null | grep -q NV12; then
+            result PASS nv12.enum "ENUM_FMT advertises NV12"
+        else
+            result FAIL nv12.enum "ENUM_FMT does not advertise NV12"
+        fi
+
+        dmesg_mark
+        v4l2-ctl --device "$DEVICE" --set-fmt-video=pixelformat=NV12 \
+            >>"$REPORT" 2>&1 || true
+        nv12_fmt="$(fmt_field 'Pixel Format')"
+        case "$nv12_fmt" in
+            *NV12*)
+                result PASS nv12.gfmt "G_FMT still reports NV12 after S_FMT" ;;
+            *)
+                result FAIL nv12.gfmt \
+                    "S_FMT was coerced away from NV12 to '$nv12_fmt' - the old false pass" ;;
+        esac
+
+        nv12_wh="$(fmt_field 'Width\/Height')"
+        nv12_w="${nv12_wh%%/*}"
+        nv12_h="${nv12_wh##*/}"
+        nv12_bpl="$(fmt_field 'Bytes per Line')"
+        nv12_size="$(fmt_field 'Size Image')"
+        log "NV12 format: ${nv12_w}x${nv12_h} bpl=$nv12_bpl sizeimage=$nv12_size"
+
+        if [ "$nv12_bpl" = "$nv12_w" ]; then
+            result PASS nv12.stride \
+                "bytesperline is $nv12_bpl, the luma plane's own stride"
+        else
+            result FAIL nv12.stride \
+                "bytesperline is $nv12_bpl, expected $nv12_w for a one-byte luma plane"
+        fi
+        if [ "$nv12_size" = "$(( nv12_w * nv12_h * 3 / 2 ))" ]; then
+            result PASS nv12.sizeimage \
+                "sizeimage is $nv12_size, luma plus a half-height chroma plane"
+        else
+            result FAIL nv12.sizeimage \
+                "sizeimage is $nv12_size, expected $(( nv12_w * nv12_h * 3 / 2 )) for 4:2:0"
+        fi
+
+        nv12_file=/tmp/facetimehd-nv12.raw
+        rm -f "$nv12_file"
+        if capture_ok "$NV12_FRAMES" >/dev/null 2>&1 &&
+           v4l2-ctl --device "$DEVICE" --stream-mmap --stream-count="$NV12_FRAMES" \
+                --stream-to="$nv12_file" >>"$REPORT" 2>&1; then
+            result PASS nv12.capture "captured $NV12_FRAMES NV12 frames"
+        else
+            result FAIL nv12.capture "NV12 capture failed"
+        fi
+
+        nv12_bytes="$(stat -c %s "$nv12_file" 2>/dev/null || echo 0)"
+        nv12_frames_got=$(( nv12_size > 0 ? nv12_bytes / nv12_size : 0 ))
+        if [ "$nv12_size" -gt 0 ] &&
+           [ "$(( nv12_bytes % nv12_size ))" -eq 0 ] &&
+           [ "$nv12_frames_got" -gt 0 ]; then
+            result PASS nv12.frames \
+                "$nv12_bytes bytes is exactly $nv12_frames_got frames of $nv12_size"
+        else
+            result FAIL nv12.frames \
+                "$nv12_bytes bytes is not a whole number of $nv12_size-byte frames"
+        fi
+
+        if [ "$nv12_frames_got" -gt 0 ]; then
+            luma_len=$(( nv12_w * nv12_h ))
+            chroma_len=$(( luma_len / 2 ))
+            frame_off=$(( (nv12_frames_got - 1) * nv12_size ))
+            luma="$(plane_stats "$nv12_file" "$frame_off" "$luma_len" || true)"
+            chroma="$(plane_stats "$nv12_file" "$(( frame_off + luma_len ))" \
+                      "$chroma_len" || true)"
+            log "luma plane:   ${luma:-unreadable}"
+            log "chroma plane: ${chroma:-unreadable}"
+
+            if [ -z "$luma" ] || [ -z "$chroma" ]; then
+                result FAIL nv12.planes "could not sample both planes"
+            else
+                luma_mean="${luma%% *}"
+                chroma_mean="${chroma%% *}"
+                chroma_min="$(printf '%s\n' "$chroma" | awk '{print $2}')"
+                chroma_max="$(printf '%s\n' "$chroma" | awk '{print $3}')"
+
+                if awk -v m="$luma_mean" 'BEGIN{exit !(m >= 8 && m <= 247)}'; then
+                    result PASS nv12.luma \
+                        "luma plane mean $luma_mean is a real exposure, not a floor or a ceiling"
+                else
+                    result WARN nv12.luma \
+                        "luma plane mean $luma_mean is at a floor or ceiling - relight the scene and re-run"
+                fi
+
+                if [ "$chroma_min" = "$chroma_max" ]; then
+                    result FAIL nv12.chroma \
+                        "chroma plane is a constant $chroma_min - the ISP never wrote it, so addr1 is not where it puts chroma"
+                elif awk -v m="$chroma_mean" 'BEGIN{exit !(m >= 100 && m <= 156)}'; then
+                    result PASS nv12.chroma \
+                        "chroma plane mean $chroma_mean sits around the 128 neutral point, as interleaved CbCr should"
+                else
+                    result FAIL nv12.chroma \
+                        "chroma plane mean $chroma_mean is nowhere near the 128 neutral point - compare nv12.chroma_ref below before believing the scene is at fault"
+                fi
+            fi
+
+            # Row-stride check on the luma plane.
+            zero_rows="$(plane_zero_rows "$nv12_file" "$frame_off" "$nv12_w" 60 || true)"
+            if [ -z "$zero_rows" ]; then
+                result WARN nv12.stride_rows "could not sample luma rows"
+            elif awk -v z="$zero_rows" 'BEGIN{exit !(z < 2)}'; then
+                result PASS nv12.stride_rows \
+                    "no blank luma rows ($zero_rows% of the sampled rows are all zero)"
+            else
+                result FAIL nv12.stride_rows \
+                    "$zero_rows% of sampled luma rows are entirely zero - the ISP is writing at a different row stride than the buffer is laid out for"
+            fi
+
+        else
+            result SKIP nv12.planes "no complete frame to examine"
+        fi
+
+        # The chroma verdict is only meaningful against a reference from the
+        # same sensor and scene, in a format already known good.
+        v4l2-ctl --device "$DEVICE" --set-fmt-video=pixelformat=YUYV \
+            >>"$REPORT" 2>&1 || true
+        ref_file=/tmp/facetimehd-nv12-yuyv-reference.raw
+        ref_size="$(fmt_field 'Size Image')"
+        rm -f "$ref_file"
+        if capture_ok 5 >/dev/null 2>&1 &&
+           v4l2-ctl --device "$DEVICE" --stream-mmap --stream-count=5 \
+                --stream-to="$ref_file" >>"$REPORT" 2>&1 &&
+           ref="$(yuyv_chroma_means "$ref_file" "$ref_size")"; then
+            log "YUYV reference chroma (Cb Cr): $ref"
+            result INFO nv12.chroma_ref \
+                "same scene in YUYV gives Cb/Cr $ref against NV12's chroma mean ${chroma_mean:-unknown}"
+        else
+            result WARN nv12.chroma_ref \
+                "could not capture a YUYV reference for the chroma comparison"
+        fi
+
+        dmesg_driver >>"$REPORT"
+        if faults_present; then
+            result FAIL nv12.faults \
+                "firmware, buffer, IOMMU or DMAR fault during NV12 capture"
+        else
+            result PASS nv12.faults \
+                "no firmware, buffer, IOMMU or DMAR faults during NV12 capture"
+        fi
+        # Leave the node on the format everything else in this run expects.
+        v4l2-ctl --device "$DEVICE" --set-fmt-video=pixelformat=YUYV \
+        >>"$REPORT" 2>&1 || true
     fi
 fi
 

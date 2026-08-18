@@ -295,8 +295,20 @@ static int seq_firmware_readback(struct seq_file *seq,
 	case FTHD_FW_SENSOR_TEMPERATURE:
 		ret = fthd_isp_cmd_channel_sensor_temperature(dev_priv, 0,
 							      &signed_value);
+		/*
+		 * The raw value stays first on the line so anything parsing
+		 * this file keeps working, with the interpretation appended
+		 * rather than substituted.  -1 has now been read on a
+		 * MacBookAir7,2 at every sampled condition, including after ten
+		 * minutes of continuous streaming, which is what a
+		 * not-supported sentinel looks like and not what an unknown
+		 * temperature scale looks like.  Saying so here is what stops
+		 * the next reader from trying to calibrate it.
+		 */
 		if (!ret)
-			seq_printf(seq, "%d\n", signed_value);
+			seq_printf(seq, "%d%s\n", signed_value,
+				   signed_value == FTHD_SENSOR_TEMPERATURE_NONE ?
+				   " (unavailable)" : "");
 		break;
 	case FTHD_FW_AWB_CCT:
 		ret = fthd_isp_cmd_channel_awb_cct_get(dev_priv, 0, &value);

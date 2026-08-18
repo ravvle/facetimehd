@@ -355,6 +355,17 @@ step "Hardware-safety defaults"
 # turn an ordinary STREAMON into a whole-machine lockup.
 
 drv="$REPO_DIR/src/facetimehd/fthd_drv.c"
+v4l2="$REPO_DIR/src/facetimehd/fthd_v4l2.c"
+
+# The checks below look for control and format names in the driver, and the
+# driver's comments legitimately name the very things that must not be
+# registered - explaining why the AWB readback is *not*
+# V4L2_CID_WHITE_BALANCE_TEMPERATURE is exactly the reasoning DOWNSTREAM.md
+# asks for. Strip comment bodies so these test code rather than prose.
+code_only() {
+    sed -e 's://.*::' -e '/^[[:space:]]*\*/d' -e '/^[[:space:]]*\/\*/d' "$1"
+}
+
 if ! grep -Rq 'module_param(\(experimental_controls\|experimental_formats\|hwmon\)' \
         "$REPO_DIR/src/facetimehd"; then
     result ok "unsafe firmware interfaces have no module-parameter entry point"
@@ -409,18 +420,53 @@ else
     result bad "metering mutation bypasses its fixed-value or restoration boundary"
 fi
 
-if ! grep -q 'V4L2_CID_AUTO_EXPOSURE_BIAS\|V4L2_CID_WHITE_BALANCE_TEMPERATURE\|V4L2_CID_TEST_PATTERN\|FTHD_CID_NOISE_REDUCTION\|FTHD_CID_CHROMA_SUPPRESSION' \
-        "$REPO_DIR/src/facetimehd/fthd_v4l2.c"; then
+if ! code_only "$v4l2" |
+        grep -q 'V4L2_CID_AUTO_EXPOSURE_BIAS\|V4L2_CID_WHITE_BALANCE_TEMPERATURE\|V4L2_CID_TEST_PATTERN\|FTHD_CID_NOISE_REDUCTION\|FTHD_CID_CHROMA_SUPPRESSION'; then
     result ok "malformed or semantically unknown controls are not registered"
 else
     result bad "an unvalidated firmware control is still registered"
 fi
 
-if ! grep -q 'V4L2_PIX_FMT_NV16' "$REPO_DIR/src/facetimehd/fthd_v4l2.c" &&
-   ! grep -q 'V4L2_PIX_FMT_NV16' "$REPO_DIR/src/facetimehd/fthd_isp.c"; then
-    result ok "unvalidated NV16 is not advertised or selectable"
+# The AWB CCT readback is the one control fed straight from a firmware GET.
+# Read-only is not a presentation choice: v4l2_ctrl_handler_setup() skips
+# read-only controls, so that flag is the whole reason registering it cannot
+# replay a firmware SET at STREAMON or after a runtime resume - the mechanism
+# that produced the lockups. Volatile without read-only would put a setter back.
+if grep -q 'FTHD_CID_AWB_CCT_ESTIMATE' "$v4l2" &&
+   grep -qF '.flags	= V4L2_CTRL_FLAG_READ_ONLY | V4L2_CTRL_FLAG_VOLATILE,' "$v4l2" &&
+   grep -q 'if (ctrl->id != FTHD_CID_AWB_CCT_ESTIMATE)' "$v4l2" &&
+   grep -q 'fthd_isp_cmd_channel_awb_cct_get' "$v4l2"; then
+    result ok "the AWB CCT readback is read-only, so no SET is ever replayed"
 else
-    result bad "unvalidated NV16 remains reachable"
+    result bad "the AWB CCT readback is missing its read-only replay guard"
+fi
+
+# The ISP's semi-planar output is NV12, measured on hardware: format code 0
+# wrote a half-height chroma plane and left the rest of an NV16-sized buffer at
+# zero, with chroma matching a YUYV reference. The 4:2:0 sizing is the part that
+# must not regress - a 4:2:2 sizeimage silently averages real chroma with
+# unwritten zeros - and NV16 must not come back on the strength of its old name.
+if grep -qF 'pixelformat == V4L2_PIX_FMT_NV12;' "$v4l2" &&
+   grep -qF 'pix->bytesperline * pix->height * 3 / 2' "$v4l2" &&
+   ! code_only "$v4l2" | grep -q 'V4L2_PIX_FMT_NV16' &&
+   ! grep -q 'module_param(nv1[26]' "$v4l2" &&
+   grep -q 'nv12.gfmt' "$REPO_DIR/tests/hw-validate.sh" &&
+   grep -q 'nv12.stride_rows' "$REPO_DIR/tests/hw-validate.sh" &&
+   grep -q 'nv12.chroma_ref' "$REPO_DIR/tests/hw-validate.sh"; then
+    result ok "NV12 is advertised, sized 4:2:0, and has a hardware test"
+else
+    result bad "NV12 is missing, mis-sized, or has no hardware test"
+fi
+
+# x2 in CISP_CMD_CH_OUTPUT_CONFIG_SET is the destination row stride. Hardcoding
+# width*2 made the ISP write luma rows at double spacing for the one-byte-per-
+# pixel plane, blanking half the frame with no IOMMU fault to show for it.
+if grep -q 'int stride, int pixelformat' "$REPO_DIR/src/facetimehd/fthd_isp.c" &&
+   grep -qF 'cmd.x2 = stride;' "$REPO_DIR/src/facetimehd/fthd_isp.c" &&
+   grep -qF 'dev_priv->fmt.fmt.bytesperline,' "$REPO_DIR/src/facetimehd/fthd_isp.c"; then
+    result ok "output config sends the real row stride, not a hardcoded width*2"
+else
+    result bad "output config has gone back to a hardcoded row stride"
 fi
 
 # Once a command has entered the firmware ring it cannot be cancelled. A

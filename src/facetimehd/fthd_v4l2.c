@@ -28,8 +28,65 @@
 #define FTHD_MAX_HEIGHT 720
 #define FTHD_MIN_WIDTH 320
 #define FTHD_MIN_HEIGHT 240
-#define FTHD_NUM_FORMATS 3
 #define FTHD_PROTOCOL_ERROR_LIMIT 4
+
+/*
+ * The ISP's current correlated-colour-temperature estimate, read straight out
+ * of CISP_CMD_CH_AWB_CCT_GET.
+ *
+ * It is a driver-private CID rather than V4L2_CID_WHITE_BALANCE_TEMPERATURE
+ * because that standard control means the temperature the *application* asks
+ * the camera to assume, and is expected to be writable and paired with a manual
+ * AWB mode.  This is the opposite: a measurement the ISP produces, with no way
+ * to write it - the manual AWB-CCT setter carries a second payload word whose
+ * meaning is still unidentified, so it stays unexposed.  Publishing a
+ * measurement under a CID that means a set point would make an application that
+ * wrote it silently get nothing.
+ *
+ * The kelvin unit is hardware evidence rather than a guess - under warm light
+ * this firmware reported 2652 and under cool light 5777, with the right
+ * ordering and realistic magnitudes - but it is one machine, so
+ * FIRMWARE-REVERSE-ENGINEERING.md still lists cross-model confirmation as open.
+ * A private CID is also what keeps that caveat honest: nothing in userspace has
+ * a standing expectation about what this control means.
+ *
+ * 0x1001 and 0x1002 were used by the removed noise-reduction and
+ * chroma-suppression controls.  Starting at 0x1003 keeps anything built against
+ * that short-lived series from binding to a control with different semantics.
+ */
+#define FTHD_CID_AWB_CCT_ESTIMATE (V4L2_CID_USER_BASE | 0x1003)
+
+/* Wide enough for any plausible illuminant without asserting a tighter range
+ * than one machine's readings support. */
+#define FTHD_AWB_CCT_MIN 0
+#define FTHD_AWB_CCT_MAX 65535
+
+/*
+ * The ISP's semi-planar output, format code 0, is NV12 - and hardware said so.
+ *
+ * Upstream's 2015 comment called code 0 "plane 0 Y plane 1 UV" without giving
+ * it a sampling, and every later reading of this driver - including this fork's
+ * own notes - assumed 4:2:2 and called it NV16.  A capture on a MacBookAir7,2
+ * settled it: the ISP wrote a width*height luma plane followed by exactly
+ * width*height/2 of chroma - 360 chroma rows for a 720-row frame - and left the
+ * remaining 460,800 bytes of the NV16-sized buffer untouched.  Splitting that
+ * chroma into its components gave Cb 122.3 and Cr 135.3 against 122.5 and 135.4
+ * from a YUYV capture of the same scene seconds later.  That is 4:2:0.
+ *
+ * So NV12 is not a guess here, and the old warning against it - that nothing
+ * identified a 4:2:0 code and sizing a buffer for 1.5 bytes per pixel while the
+ * ISP wrote 2 would overrun the mapping - had the risk backwards.  The ISP
+ * writes 4:2:0; sizing for 4:2:2 over-allocated and left a tail unwritten.
+ * NV16 is the format with no evidence behind it and is not offered.
+ *
+ * It was gated behind a module parameter until the driver had streamed with
+ * sizeimage cut to the 4:2:0 size, since the measurements above came from an
+ * over-sized buffer.  That run passed - correct sizeimage, no blank luma rows,
+ * chroma at 127.2 against a YUYV reference midpoint of 126.8, and no firmware,
+ * buffer or DMA fault - so the format is advertised normally and the parameter
+ * is gone.  It is enumerated after YUYV and YVYU, so an application that takes
+ * the first format offered still gets what it always got.
+ */
 
 /* The only rate the sensor delivers.  Everything the driver reports is derived
  * from it, so G_PARM, S_PARM and ENUM_FRAMEINTERVALS cannot contradict each
@@ -55,6 +112,18 @@
  * saves bus and CPU work in the application, not power in the camera.
  */
 #define FTHD_MAX_FPS_DIVISOR FTHD_FPS
+
+/*
+ * True when the chroma plane lives at an offset inside the same buffer rather
+ * than interleaved with luma.  Derived from the format on every use instead of
+ * being cached in a plane count: the vb2 queue is single-planar in every case,
+ * and a cached count is exactly what once made queue_setup() ask a
+ * V4L2_BUF_TYPE_VIDEO_CAPTURE queue for two planes.
+ */
+static bool fthd_format_semiplanar(u32 pixelformat)
+{
+	return pixelformat == V4L2_PIX_FMT_NV12;
+}
 
 static int fthd_buffer_queue_setup(
     struct vb2_queue *vq,
@@ -274,8 +343,9 @@ static int fthd_buffer_prepare(struct vb2_buffer *vb)
 			goto fail;
 		}
 
-		/* One mapping for the whole buffer.  See the addr1 comment
-		 * below for why a semi-planar format does not need a second. */
+		/* One mapping for the whole buffer, semi-planar included.  See
+		 * the addr1 assignment below for why the chroma plane needs no
+		 * mapping of its own. */
 		sgtable = vb2_dma_sg_plane_desc(vb, 0);
 		ctx->plane[0] = iommu_allocate_sgtable(dev_priv, sgtable);
 		if (!ctx->plane[0]) {
@@ -299,6 +369,15 @@ static int fthd_buffer_prepare(struct vb2_buffer *vb)
 	base = (ctx->plane[0]->offset << PAGE_SHIFT) |
 		ctx->plane[0]->page_offset | 0xc0000000;
 	dma_list->desc[0].addr0 = base;
+
+	/* iommu_allocate_sgtable() walks the scatterlist into one contiguous
+	 * run of S2 IOVA pages, so a semi-planar format's chroma plane is
+	 * reachable as a plain byte offset from the start of that same mapping
+	 * rather than needing a second one.  fthd_v4l2_adjust_format() sized
+	 * the buffer for both planes, so this address is still inside it. */
+	if (fthd_format_semiplanar(dev_priv->fmt.fmt.pixelformat))
+		dma_list->desc[0].addr1 = base +
+			dev_priv->fmt.fmt.bytesperline * dev_priv->fmt.fmt.height;
 
 	spin_lock_irqsave(&dev_priv->buffer_lock, flags);
 	ctx->tag = ++dev_priv->buffer_tag;
@@ -948,10 +1027,15 @@ static int fthd_v4l2_ioctl_querycap(struct file *filp, void *priv,
 	return 0;
 }
 
+/*
+ * The ISP's output-format codes are NV12 0, YUYV 1, YVYU 2.  NV16 is absent
+ * because no code produces it: code 0 was measured writing 4:2:0 on hardware.
+ */
 static bool fthd_format_supported(u32 pixelformat)
 {
 	return pixelformat == V4L2_PIX_FMT_YUYV ||
-	       pixelformat == V4L2_PIX_FMT_YVYU;
+	       pixelformat == V4L2_PIX_FMT_YVYU ||
+	       pixelformat == V4L2_PIX_FMT_NV12;
 }
 
 static int fthd_v4l2_ioctl_enum_fmt_vid_cap(struct file *filp, void *priv,
@@ -967,6 +1051,10 @@ static int fthd_v4l2_ioctl_enum_fmt_vid_cap(struct file *filp, void *priv,
 	case 1:
 		fmt->pixelformat = V4L2_PIX_FMT_YVYU;
 		desc = "YVYU";
+		break;
+	case 2:
+		fmt->pixelformat = V4L2_PIX_FMT_NV12;
+		desc = "NV12";
 		break;
 	default:
 		return -EINVAL;
@@ -1006,8 +1094,20 @@ static int fthd_v4l2_adjust_format(struct fthd_private *dev_priv,
 	if (pix->width > max_w)
 		pix->width = round_down(max_w, 8);
 
-	pix->bytesperline = pix->width * 2;
-	pix->sizeimage = pix->bytesperline * pix->height;
+	if (fthd_format_semiplanar(pix->pixelformat)) {
+		/* Semi-planar 4:2:0: a width*height luma plane followed by an
+		 * interleaved CbCr plane of half that height, so half the size.
+		 * Both live in the one buffer, so bytesperline describes luma
+		 * only while sizeimage covers the pair.  The halving is what
+		 * hardware actually wrote - 360 chroma rows for a 720-row
+		 * frame - not an assumption carried over from the format's
+		 * name. */
+		pix->bytesperline = pix->width;
+		pix->sizeimage = pix->bytesperline * pix->height * 3 / 2;
+	} else {
+		pix->bytesperline = pix->width * 2;
+		pix->sizeimage = pix->bytesperline * pix->height;
+	}
 
 	return 0;
 }
@@ -1452,13 +1552,72 @@ static int fthd_s_ctrl(struct v4l2_ctrl *ctrl)
 }
 
 /*
- * No .g_volatile_ctrl: none of these controls is volatile, so the framework
- * answers G_CTRL from its own cached value.  The stub that used to be here
- * returned -EINVAL unconditionally, which would have made every read fail had
- * anything ever marked a control volatile.
+ * Only FTHD_CID_AWB_CCT_ESTIMATE is volatile; every other control is answered
+ * by the framework from its own cached value and never reaches this.
+ *
+ * No ioctl_lock here.  The control handler hangs off vdev->ctrl_handler and
+ * vdev->lock *is* ioctl_lock, so video_ioctl2() has already taken it by the
+ * time either control op runs - taking it again would deadlock.  That is also
+ * what serialises this against the debugfs readbacks, which take it explicitly.
  */
+static int fthd_g_volatile_ctrl(struct v4l2_ctrl *ctrl)
+{
+	struct fthd_private *dev_priv = container_of(ctrl->handler,
+						     struct fthd_private,
+						     v4l2_ctrl_handler);
+	u32 cct;
+	int ret;
+
+	if (ctrl->id != FTHD_CID_AWB_CCT_ESTIMATE)
+		return -EINVAL;
+
+	/*
+	 * Nothing to read from an idle ISP, and this must not be the thing that
+	 * powers one up: the read is a diagnostic, not a reason to train DDR and
+	 * re-upload firmware.  Leaving ctrl->val alone reports the last value
+	 * sampled while streaming - zero if there has never been one - which is
+	 * what keeps G_CTRL succeeding for v4l2-compliance and for any
+	 * application that reads controls before STREAMON.
+	 */
+	if (!dev_priv->channel_running)
+		return 0;
+
+	ret = fthd_pm_get(dev_priv);
+	if (ret)
+		return ret;
+	ret = fthd_isp_cmd_channel_awb_cct_get(dev_priv, 0, &cct);
+	fthd_pm_put(dev_priv);
+	if (ret)
+		return ret;
+
+	/* The firmware field is a u32 and the observed range is a few thousand;
+	 * clamping keeps a nonsensical reading inside the advertised range
+	 * rather than letting it surface as a negative kelvin. */
+	ctrl->val = clamp_t(u32, cct, FTHD_AWB_CCT_MIN, FTHD_AWB_CCT_MAX);
+	return 0;
+}
+
 static const struct v4l2_ctrl_ops fthd_ctrl_ops = {
 	.s_ctrl = fthd_s_ctrl,
+	.g_volatile_ctrl = fthd_g_volatile_ctrl,
+};
+
+/*
+ * Read-only, so v4l2_ctrl_handler_setup() skips it and no firmware SET is ever
+ * replayed at STREAMON or after a runtime resume.  That is the structural
+ * reason this control is safe to register while the manual AWB setter, whose
+ * second payload word is still unidentified, is not.
+ */
+static const struct v4l2_ctrl_config fthd_ctrl_awb_cct_estimate = {
+	.ops	= &fthd_ctrl_ops,
+	.id	= FTHD_CID_AWB_CCT_ESTIMATE,
+	.name	= "AWB CCT Estimate",
+	.type	= V4L2_CTRL_TYPE_INTEGER,
+	.min	= FTHD_AWB_CCT_MIN,
+	.max	= FTHD_AWB_CCT_MAX,
+	.step	= 1,
+	.def	= FTHD_AWB_CCT_MIN,
+	.flags	= V4L2_CTRL_FLAG_READ_ONLY | V4L2_CTRL_FLAG_VOLATILE,
 };
 
 static void fthd_video_device_release(struct video_device *vdev)
@@ -1523,7 +1682,7 @@ int fthd_v4l2_register(struct fthd_private *dev_priv)
 	if (ret)
 		goto fail_vdev_alloc;
 
-	v4l2_ctrl_handler_init(&dev_priv->v4l2_ctrl_handler, 7);
+	v4l2_ctrl_handler_init(&dev_priv->v4l2_ctrl_handler, 8);
 	v4l2_ctrl_new_std(&dev_priv->v4l2_ctrl_handler, &fthd_ctrl_ops,
 			  V4L2_CID_BRIGHTNESS, 0, 0xff, 1, 0x80);
 	v4l2_ctrl_new_std(&dev_priv->v4l2_ctrl_handler, &fthd_ctrl_ops,
@@ -1544,6 +1703,10 @@ int fthd_v4l2_register(struct fthd_private *dev_priv)
 			       &fthd_ctrl_ops, V4L2_CID_EXPOSURE_AUTO,
 			       V4L2_EXPOSURE_MANUAL, 0,
 			       V4L2_EXPOSURE_AUTO);
+	/* Read-only: registering it adds a GET the application can ask for and
+	 * no SET the framework can replay. */
+	v4l2_ctrl_new_custom(&dev_priv->v4l2_ctrl_handler,
+			     &fthd_ctrl_awb_cct_estimate, NULL);
 
 	if (dev_priv->v4l2_ctrl_handler.error) {
 		dev_err(&dev_priv->pdev->dev, "failed to setup control handlers\n");

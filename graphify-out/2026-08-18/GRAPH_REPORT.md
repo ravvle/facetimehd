@@ -1,16 +1,16 @@
 # Graph Report - facetimehd  (2026-08-18)
 
 ## Corpus Check
-- 40 files · ~70,377 words
+- 40 files · ~81,639 words
 - Verdict: corpus is large enough that graph structure adds value.
 
 ## Summary
-- 486 nodes · 983 edges · 28 communities (21 shown, 7 thin omitted)
-- Extraction: 88% EXTRACTED · 12% INFERRED · 0% AMBIGUOUS · INFERRED: 120 edges (avg confidence: 0.79)
+- 504 nodes · 1015 edges · 28 communities (21 shown, 7 thin omitted)
+- Extraction: 88% EXTRACTED · 12% INFERRED · 0% AMBIGUOUS · INFERRED: 123 edges (avg confidence: 0.79)
 - Token cost: 0 input · 0 output
 
 ## Graph Freshness
-- Built from commit: `8e154f95`
+- Built from commit: `216f08f8`
 - Run `git rev-parse HEAD` and compare to check if the graph is stale.
 - Run `graphify update .` after code changes (no API cost).
 
@@ -22,7 +22,7 @@
 - CI workflow
 - Hardware validation status (open items)
 - hw-validate.sh
-- fthd_hw.c
+- fthd_ringbuf.c
 - FaceTime HD Camera for Linux (project)
 - fthd_debugfs.c
 - fthd_hw.h
@@ -36,7 +36,7 @@
 - Removal of unused DDR shmoo calibration code
 - build-driver.sh
 - AGENTS.md
-- fthd_ringbuf.c
+- isp_fill_channel_info
 - FaceTimeHD firmware command notes
 - isp_init
 - fthd_firmware_roundtrip
@@ -49,8 +49,8 @@
 2. `fthd_start_channel()` - 26 edges
 3. `macbook-tune.sh script` - 21 edges
 4. `have()` - 18 edges
-5. `fthd_pci_probe()` - 16 edges
-6. `hw-validate.sh script` - 15 edges
+5. `hw-validate.sh script` - 17 edges
+6. `fthd_pci_probe()` - 16 edges
 7. `FaceTimeHD firmware command notes` - 14 edges
 8. `show_status()` - 13 edges
 9. `uninstall.sh script` - 12 edges
@@ -61,8 +61,8 @@
   src/facetimehd/DOWNSTREAM.md → .github/workflows/ci.yml
 - `fthd_pci_probe()` --calls--> `fthd_debugfs_init()`  [INFERRED]
   src/facetimehd/fthd_drv.c → src/facetimehd/fthd_debugfs.c
-- `fthd_pci_remove()` --calls--> `fthd_debugfs_exit()`  [INFERRED]
-  src/facetimehd/fthd_drv.c → src/facetimehd/fthd_debugfs.c
+- `fthd_v4l2_close()` --calls--> `fthd_pm_put()`  [INFERRED]
+  src/facetimehd/fthd_v4l2.c → src/facetimehd/fthd_drv.h
 - `KDIR=/usr/src/kernels override for RPM containers` --conceptually_related_to--> `Kernel build tree tested with -d, not -e or -L`  [INFERRED]
   .github/workflows/ci.yml → CLAUDE.md
 - `Kernel build matrix (Ubuntu/Fedora/AlmaLinux)` --conceptually_related_to--> `Supported distribution matrix`  [EXTRACTED]
@@ -83,16 +83,16 @@ Cohesion: 0.10
 Nodes (25): fthd_isp_cmd_channel_ae_metering_mode_set(), fthd_isp_cmd_channel_ae_speed_set(), fthd_isp_cmd_channel_ae_stability_set(), fthd_isp_cmd_channel_ae_stability_to_stable_set(), fthd_isp_cmd_channel_camera_config_select(), fthd_isp_cmd_channel_crop_set(), fthd_isp_cmd_channel_drc_start(), fthd_isp_cmd_channel_error_handling_config() (+17 more)
 
 ### Community 1 - "fthd_drv.c"
-Cohesion: 0.10
-Nodes (33): irqreturn_t, fthd_buffer_exit(), fthd_buffer_init(), iommu_allocator_destroy(), iommu_allocator_init(), fthd_debugfs_open(), fthd_debugfs_release(), fthd_debugfs_seq_open() (+25 more)
+Cohesion: 0.07
+Nodes (44): irqreturn_t, pci_channel_state_t, pci_ers_result_t, fthd_buffer_exit(), fthd_buffer_init(), iommu_allocator_destroy(), iommu_allocator_init(), u32 (+36 more)
 
 ### Community 2 - "common.sh"
 Cohesion: 0.09
 Nodes (60): collect(), redact(), section(), collect-diagnostics.sh script, usage(), extract-firmware.sh script, dkms_installed_versions(), enroll_mok() (+52 more)
 
 ### Community 3 - "fthd_v4l2.c"
-Cohesion: 0.07
-Nodes (39): pci_channel_state_t, pci_ers_result_t, iommu_allocate_sgtable(), iommu_free(), fthd_irq_work(), fthd_is_powered(), fthd_mark_firmware_wedged(), fthd_pci_error_detected() (+31 more)
+Cohesion: 0.08
+Nodes (39): iommu_allocate_sgtable(), iommu_free(), fthd_irq_work(), fthd_is_powered(), fthd_mark_firmware_wedged(), fthd_resume(), fthd_suspend(), u32 (+31 more)
 
 ### Community 4 - "CI workflow"
 Cohesion: 0.07
@@ -103,20 +103,20 @@ Cohesion: 0.07
 Nodes (31): Hardware report issue form, Debugfs created in probe(), destroyed in remove(), DDR/PLL/FWMSG bring-up messages are dev_dbg, Power management is not this project's job, facetimehd-runtime-pm.conf modprobe drop-in, A wrong firmware guess must be refused, not destructive, Hardware reports are the most valuable contribution, MacBookAir7,2 as the sole validation machine (+23 more)
 
 ### Community 6 - "hw-validate.sh"
-Cohesion: 0.17
-Nodes (15): capture_ok(), check_ring_wrap(), dmesg_driver(), dmesg_mark(), dmesg_since(), load_module(), log(), log_section() (+7 more)
+Cohesion: 0.09
+Nodes (17): capture_ok(), check_ring_wrap(), clock_sane(), dmesg_driver(), dmesg_mark(), dmesg_since(), faults_present(), load_module() (+9 more)
 
-### Community 7 - "fthd_hw.c"
-Cohesion: 0.18
-Nodes (15): u32, fthd_ddr_verify_mem(), u32, fthd_ddr_phy_save_regs(), fthd_hw_ddr_phy_soft_reset(), fthd_hw_ddr_rewrite_mode_regs(), fthd_hw_ddr_status_busy(), fthd_hw_init() (+7 more)
+### Community 7 - "fthd_ringbuf.c"
+Cohesion: 0.28
+Nodes (14): buf_t2h_handler(), u32, fthd_handle_irq(), io_t2h_handler(), sharedmalloc_handler(), terminal_handler(), isp_mem_destroy_offset(), u32 (+6 more)
 
 ### Community 8 - "FaceTime HD Camera for Linux (project)"
 Cohesion: 0.12
 Nodes (18): Bug report issue form, DOWNSTREAM.md is the review record for fork changes, driver-patches/ is a generated view, not an input, Fan support is deliberately its own script, Propose driver fixes upstream where they apply, Broadcom BCM1570 PCIe FaceTime HD Camera (14e4:1570), collect-diagnostics.sh one-file bug report, FaceTime HD Camera for Linux (project) (+10 more)
 
 ### Community 9 - "fthd_debugfs.c"
-Cohesion: 0.12
-Nodes (26): loff_t, s32, u8, fthd_debugfs_exit(), fthd_debugfs_init(), fthd_firmware_roundtrip_write(), fthd_metering_test_mode(), fthd_store_debug() (+18 more)
+Cohesion: 0.10
+Nodes (34): loff_t, s32, u8, fthd_debugfs_init(), fthd_debugfs_open(), fthd_debugfs_release(), fthd_debugfs_seq_open(), fthd_debugfs_seq_release() (+26 more)
 
 ### Community 10 - "fthd_hw.h"
 Cohesion: 0.41
@@ -127,24 +127,24 @@ Cohesion: 0.18
 Nodes (8): CALIBRATION_HASHES, CALIBRATION_LAYOUT, DRIVER_COMPRESSION, DRIVER_NAMES, DRIVER_OFFSETS, DRIVER_SIZES, FIRMWARE_VERSIONS, usage()
 
 ### Community 12 - "script-smoke.sh"
-Cohesion: 0.61
-Nodes (7): check_dkms_format(), check_documented_options(), expect_output(), expect_status(), make_stub_dkms(), result(), script-smoke.sh script
+Cohesion: 0.53
+Nodes (8): check_dkms_format(), check_documented_options(), code_only(), expect_output(), expect_status(), make_stub_dkms(), result(), script-smoke.sh script
 
 ### Community 14 - "Installer idempotency via diff against /usr/src"
 Cohesion: 0.50
 Nodes (4): diffutils is an RPM dependency on purpose, Installer idempotency via diff against /usr/src, Version derivation with source fingerprint, Package version omits the source fingerprint
 
-### Community 21 - "fthd_ringbuf.c"
-Cohesion: 0.24
-Nodes (16): buf_t2h_handler(), u32, fthd_handle_irq(), io_t2h_handler(), sharedmalloc_handler(), terminal_handler(), __fthd_isp_cmd(), isp_mem_destroy_offset() (+8 more)
+### Community 21 - "isp_fill_channel_info"
+Cohesion: 0.67
+Nodes (3): isp_fill_channel_info(), isp_free_channel_info(), isp_get_chan_index()
 
 ### Community 22 - "FaceTimeHD firmware command notes"
 Cohesion: 0.11
 Nodes (17): Bounded metering-mode semantics harness, Confirmed read-only command surface, Corrected-build reboot validation (2026-08-18), Corrected-build runtime-PM validation (2026-08-18), FaceTimeHD firmware command notes, Full-system suspend finding (2026-08-18), Image examined, Incident reconstruction (+9 more)
 
 ### Community 23 - "isp_init"
-Cohesion: 0.20
-Nodes (12): resource_size_t, fthd_isp_cmd_set_loadfile(), isp_acpi_set_power(), isp_enable_sensor(), isp_fill_channel_info(), isp_free_channel_info(), isp_get_chan_index(), isp_init() (+4 more)
+Cohesion: 0.24
+Nodes (11): resource_size_t, __fthd_isp_cmd(), fthd_isp_cmd_set_loadfile(), fthd_isp_debug_cmd(), isp_acpi_set_power(), isp_enable_sensor(), isp_init(), isp_load_firmware() (+3 more)
 
 ### Community 24 - "fthd_firmware_roundtrip"
 Cohesion: 0.30
@@ -170,17 +170,17 @@ Nodes (6): fthd_firmware_start(), fthd_isp_cmd_camera_config(), fthd_isp_cmd_cha
 ## Suggested Questions
 _Questions this graph is uniquely positioned to answer:_
 
-- **Why does `fthd_pci_probe()` connect `fthd_drv.c` to `fthd_debugfs.c`, `fthd_firmware_start`, `fthd_hw.c`?**
-  _High betweenness centrality (0.009) - this node is a cross-community bridge._
-- **Why does `Apple firmware extraction (firmware 1.43.0)` connect `CI workflow` to `FaceTime HD Camera for Linux (project)`?**
+- **Why does `fthd_pci_probe()` connect `fthd_drv.c` to `fthd_debugfs.c`, `fthd_firmware_start`?**
   _High betweenness centrality (0.008) - this node is a cross-community bridge._
+- **Why does `Apple firmware extraction (firmware 1.43.0)` connect `CI workflow` to `FaceTime HD Camera for Linux (project)`?**
+  _High betweenness centrality (0.007) - this node is a cross-community bridge._
 - **Why does `fthd_start_channel()` connect `fthd_isp.c` to `fthd_v4l2.c`, `fthd_firmware_start`?**
   _High betweenness centrality (0.007) - this node is a cross-community bridge._
 - **Are the 2 inferred relationships involving `fthd_start_channel()` (e.g. with `fthd_v4l2_refresh_crop()` and `fthd_stream_start()`) actually correct?**
   _`fthd_start_channel()` has 2 INFERRED edges - model-reasoned connections that need verification._
-- **Are the 9 inferred relationships involving `fthd_pci_probe()` (e.g. with `fthd_buffer_exit()` and `fthd_buffer_init()`) actually correct?**
-  _`fthd_pci_probe()` has 9 INFERRED edges - model-reasoned connections that need verification._
 - **What connects `build-deb.sh script`, `build-rpm.sh script`, `DRIVER_NAMES` to the rest of the system?**
   _34 weakly-connected nodes found - possible documentation gaps or missing edges._
 - **Should `fthd_isp.c` be split into smaller, more focused modules?**
   _Cohesion score 0.10416666666666667 - nodes in this community are weakly interconnected._
+- **Should `fthd_drv.c` be split into smaller, more focused modules?**
+  _Cohesion score 0.07017543859649122 - nodes in this community are weakly interconnected._
