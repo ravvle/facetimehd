@@ -2376,23 +2376,29 @@ fi
 # Section: crop-geometry (opt-in)
 # FIRMWARE-REVERSE-ENGINEERING.md - "Complete dispatcher table sweep"
 #
-# CISP_CMD_CH_CROP_GET returns two four-word rectangles and it is not
-# established which is the geometry the host asked for and which is what the
-# ISP latched. At the default rectangle they are identical, so the readbacks
-# section cannot separate them. Separating them needs a rectangle the ISP does
-# not honour verbatim - which is the far-corner case that starves the stream.
+# Two jobs. It reads CISP_CMD_CH_CROP_GET while a stream is live, which is how
+# the command's two rectangles were identified as the active crop and the
+# sensor array. And it locates the crop rectangle that starves the stream.
 #
-# So this samples crop_raw while a stream is actually running, across a set of
-# rectangles ordered safe-first, with the two known pathological corners last
-# because a starved rectangle wedges the channel. A starving rectangle is the
-# most interesting sample here, not a failure: the channel still starts, so the
-# GET still answers, and that answer is the point of the section.
+# What the sweep established: with a 640-wide crop on a 1280-wide array, left
+# 0/8/240/320 stream and 400/480/560/632/640 starve, so the boundary sits
+# between 320 and 400. Five rectangles streamed consecutively on one firmware
+# load before one starved, which killed the "first far-offset rectangle after a
+# load starves" reading. The right edge alone is not it either: the full array
+# ends at 1280 and streams, while a 640-wide crop ending at 1280 starves.
 #
-# It changes no firmware state: crop is set through the ordinary S_SELECTION
-# path the crop section already uses, and every command sent is a GET.
+# Two readings survive, and phase 2 separates them:
+#   A. left may not exceed the centred position, (sensor_w - crop_w) / 2.
+#      For a 640-wide crop that is exactly 320 - the last offset that streamed.
+#   B. left may not exceed a fixed limit near 320-400, whatever the crop width.
+# A 320-wide crop centres at left 480. Under A it streams there; under B it
+# starves. Phase 2 asks exactly that.
+#
+# It changes no firmware state: crop and format go through the ordinary
+# S_SELECTION/S_FMT paths, and every firmware command sent is a GET.
 # ============================================================================
 if wants crop-geometry; then
-    step "crop-geometry: reading the ISP's own crop rectangles per geometry"
+    step "crop-geometry: reading the ISP's crop rectangles and finding the starvation bound"
     log_section "SECTION crop-geometry"
 
     [ -n "$DEVICE" ] || wait_for_device || true
@@ -2409,29 +2415,19 @@ if wants crop-geometry; then
         cg_default="$(v4l2-ctl --device "$DEVICE" \
                       --get-selection=target=crop_default 2>/dev/null |
                       sed -n 's/.*Left \([0-9-]*\), Top \([0-9-]*\), Width \([0-9]*\), Height \([0-9]*\).*/\1,\2,\3,\4/p' | head -1)"
+        cg_orig_wh="$(fmt_field 'Width\/Height')"
         if [ -z "$cg_bounds" ]; then
             result SKIP crop-geometry.bounds "G_SELECTION did not report crop bounds"
         else
             cg_sensor_w="${cg_bounds%% *}"
             cg_sensor_h="${cg_bounds##* }"
-            v4l2-ctl --device "$DEVICE" \
-                --set-fmt-video="width=$CROP_WIDTH,height=$CROP_HEIGHT,pixelformat=YUYV" \
-                >>"$REPORT" 2>&1 || true
-            cg_wh="$(fmt_field 'Width\/Height')"
-            cg_out_w="${cg_wh%%/*}"
-            cg_out_h="${cg_wh##*/}"
-            cg_frame_size=$(( cg_out_w * 2 * cg_out_h ))
-            cg_far_left=$(( cg_sensor_w - cg_out_w ))
-            cg_far_top=$(( cg_sensor_h - cg_out_h ))
-            cg_mid_left="$(( ((cg_sensor_w - cg_out_w) / 2) & ~7 ))"
-            cg_mid_top=$(( (cg_sensor_h - cg_out_h) / 2 ))
-            cg_wedged=0
+            cg_frame_size=0
 
             # capture_ok() judges by v4l2-ctl's exit status, and v4l2-ctl exits
             # 0 even when VIDIOC_STREAMON fails - which is exactly what a
-            # wedged channel does. The first run of this section used it and
-            # silently reported no wedge while the channel was plainly dead,
-            # so health is judged by whether a whole frame arrived.
+            # wedged channel does. An earlier run of this section used it and
+            # silently reported no wedge while the channel was plainly dead, so
+            # health is judged by whether a whole frame arrived.
             cg_capture_ok() {
                 local f="/tmp/facetimehd-cropgeom-probe.raw" bytes
                 rm -f "$f"
@@ -2443,123 +2439,135 @@ if wants crop-geometry; then
                 [ "$bytes" -ge "$cg_frame_size" ]
             }
 
-            # A left-offset sweep, because the two readings that survived the
-            # earlier runs are "beyond some left offset it starves" and "the
-            # first far-offset rectangle after a firmware load starves". Both
-            # far corners starved, and so did left = 632, whose right edge is
-            # NOT flush with the array - so a flush right edge is not the
-            # trigger. What is known is that left 0, 8 and 320 streamed while
-            # 632 and 640 starved, so the boundary lies between 320 and 632.
-            #
-            # Each sweep step is tested after the previous one's recovery, so a
-            # step that streams is a step that did not starve as the first
-            # far-offset rectangle on its own firmware load. One that streams
-            # therefore falsifies the "first far-offset" reading outright and
-            # leaves a plain positional threshold, which the sweep also locates.
-            # The tops are held at 0 so left is the only variable.
-            cg_sweep=""
-            for cg_frac in 3 4 5 6 7; do
-                cg_sweep="$cg_sweep $(( (cg_far_left * cg_frac / 8) & ~7 ))"
-            done
-            cg_specs="0 0 $cg_sensor_w $cg_sensor_h full
-8 8 $cg_out_w $cg_out_h topleft
-$cg_mid_left $cg_mid_top $cg_out_w $cg_out_h midoffset"
-            for cg_off in $cg_sweep; do
-                cg_specs="$cg_specs
-$cg_off 0 $cg_out_w $cg_out_h sweep$cg_off"
-            done
-            cg_specs="$cg_specs
-$(( cg_far_left - 8 )) 0 $cg_out_w $cg_out_h nearcorner
-$cg_far_left $cg_far_top $cg_out_w $cg_out_h bottomright
-$cg_far_left 0 $cg_out_w $cg_out_h cornerflush"
+            # Set the output size for a phase and recompute the frame size the
+            # health check measures against.
+            cg_set_output() {
+                v4l2-ctl --device "$DEVICE" \
+                    --set-fmt-video="width=$1,height=$2,pixelformat=YUYV" \
+                    >>"$REPORT" 2>&1 || true
+                local wh; wh="$(fmt_field 'Width\/Height')"
+                cg_out_w="${wh%%/*}"
+                cg_out_h="${wh##*/}"
+                cg_frame_size=$(( cg_out_w * 2 * cg_out_h ))
+            }
 
-            while IFS= read -r cg_spec; do
-                [ -n "$cg_spec" ] || continue
-                read -r cg_l cg_t cg_w cg_h cg_label <<<"$cg_spec"
+            # One rectangle: set it, sample crop_raw from a live stream, then
+            # check the channel survived. The stream merely existing is enough
+            # for the GET - a starved rectangle sits in vb2_wait_for_done_vb
+            # with the channel started, which is the case most worth sampling -
+            # so frames are counted separately to say which happened.
+            cg_probe() {
+                local l="$1" t="$2" w="$3" h="$4" label="$5"
+                local got g_l g_t g_w g_h want cap pid raw bytes flow
 
                 dmesg_mark
                 if ! v4l2-ctl --device "$DEVICE" \
-                        --set-selection="target=crop,left=$cg_l,top=$cg_t,width=$cg_w,height=$cg_h" \
+                        --set-selection="target=crop,left=$l,top=$t,width=$w,height=$h" \
                         >>"$REPORT" 2>&1; then
-                    result FAIL "crop-geometry.$cg_label.set" \
-                        "S_SELECTION rejected ${cg_w}x${cg_h}+${cg_l}+${cg_t}"
-                    continue
+                    result FAIL "crop-geometry.$label.set" \
+                        "S_SELECTION rejected ${w}x${h}+${l}+${t}"
+                    return
                 fi
-                cg_got="$(current_crop)"
+                got="$(current_crop)"
                 read -r g_l g_t g_w g_h <<CGEOF
-$cg_got
+$got
 CGEOF
-                cg_want="$g_l $g_t $((g_l + g_w)) $((g_t + g_h))"
+                want="$g_l $g_t $((g_l + g_w)) $((g_t + g_h))"
 
-                # A background stream so the channel is running while the GET
-                # goes out. The process merely being alive is enough for that -
-                # a starved rectangle sits in vb2_wait_for_done_vb with the
-                # channel started, which is precisely the case worth sampling -
-                # so frames are counted separately to say which happened.
-                cg_cap="/tmp/facetimehd-cropgeom-$cg_label.raw"
-                rm -f "$cg_cap"
+                cap="/tmp/facetimehd-cropgeom-$label.raw"
+                rm -f "$cap"
                 v4l2-ctl --device "$DEVICE" --stream-mmap --stream-count=100000 \
-                         --stream-to="$cg_cap" >>"$REPORT" 2>&1 &
-                cg_pid=$!
+                         --stream-to="$cap" >>"$REPORT" 2>&1 &
+                pid=$!
                 sleep 3
-                cg_raw=""
-                if kill -0 "$cg_pid" 2>/dev/null; then
-                    cg_raw="$(tr '\n' '/' < "$DEBUGFS_DEVICE/crop_raw" 2>/dev/null | sed 's|/$||')"
+                raw=""
+                if kill -0 "$pid" 2>/dev/null; then
+                    raw="$(tr '\n' '/' < "$DEBUGFS_DEVICE/crop_raw" 2>/dev/null | sed 's|/$||')"
                 fi
-                kill "$cg_pid" 2>/dev/null || true
-                wait "$cg_pid" 2>/dev/null || true
-                cg_bytes="$(stat -c %s "$cg_cap" 2>/dev/null || echo 0)"
-                rm -f "$cg_cap"
-                if [ "$cg_bytes" -ge "$cg_frame_size" ]; then
-                    cg_flow="streaming"
+                kill "$pid" 2>/dev/null || true
+                wait "$pid" 2>/dev/null || true
+                bytes="$(stat -c %s "$cap" 2>/dev/null || echo 0)"
+                rm -f "$cap"
+                if [ "$bytes" -ge "$cg_frame_size" ]; then
+                    flow="streaming"
                 else
-                    cg_flow="no frames delivered"
+                    flow="no frames delivered"
                 fi
 
-                if [ -z "$cg_raw" ]; then
-                    result WARN "crop-geometry.$cg_label" \
-                        "requested $cg_want, but the channel was not running to read crop_raw"
-                elif [ "$cg_raw" = "$cg_want/$cg_want" ]; then
-                    result PASS "crop-geometry.$cg_label" \
-                        "both rectangles are $cg_want, matching the request ($cg_flow)"
+                if [ -z "$raw" ]; then
+                    result WARN "crop-geometry.$label" \
+                        "requested $want, but the channel was not running to read crop_raw"
+                elif [ "$raw" = "$want/$want" ]; then
+                    result PASS "crop-geometry.$label" \
+                        "both rectangles are $want, matching the request ($flow)"
                 else
-                    # The interesting outcome: the two groups disagree, which
-                    # is what tells them apart. Not a failure - it is the
-                    # measurement this section exists to take.
-                    result INFO "crop-geometry.$cg_label" \
-                        "requested $cg_want, firmware returned $cg_raw ($cg_flow)"
+                    result INFO "crop-geometry.$label" \
+                        "requested $want, firmware returned $raw ($flow)"
                 fi
 
                 # Restore a rectangle known to stream before testing recovery,
-                # so this measures the channel's health and not the geometry
-                # that was just set.
+                # so this measures the channel and not the geometry just set.
                 v4l2-ctl --device "$DEVICE" \
                     --set-selection="target=crop,left=0,top=0,width=$cg_sensor_w,height=$cg_sensor_h" \
                     >>"$REPORT" 2>&1 || true
                 if ! cg_capture_ok; then
-                    cg_wedged=1
-                    result INFO "crop-geometry.$cg_label.wedged" \
+                    result INFO "crop-geometry.$label.wedged" \
                         "the channel stopped delivering after this rectangle"
                     if [ "$(cat /sys/module/$MODULE_NAME/parameters/runtime_pm 2>/dev/null)" = Y ]; then
                         sleep "$IDLE_WAIT"
-                        cg_capture_ok && cg_wedged=0
+                        if cg_capture_ok; then
+                            result INFO "crop-geometry.$label.recovered" \
+                                "a runtime-PM cycle reloaded firmware for the next rectangle"
+                            return
+                        fi
                     fi
-                    if [ "$cg_wedged" -eq 0 ]; then
-                        result INFO "crop-geometry.$cg_label.recovered" \
-                            "a runtime-PM cycle reloaded firmware for the next rectangle"
-                    else
-                        result WARN "crop-geometry.$cg_label.recovered" \
-                            "the channel did not come back; later rectangles are not trustworthy"
-                    fi
+                    result WARN "crop-geometry.$label.recovered" \
+                        "the channel did not come back; later rectangles are not trustworthy"
                 fi
-            done <<CGSPECS
-$cg_specs
-CGSPECS
+            }
+
+            # -- phase 1: 640-wide crop, locate the boundary between 320 and 400
+            cg_set_output "$CROP_WIDTH" "$CROP_HEIGHT"
+            cg_centre=$(( (cg_sensor_w - cg_out_w) / 2 ))
+            cg_far_left=$(( cg_sensor_w - cg_out_w ))
+            result INFO crop-geometry.phase1 \
+                "${cg_out_w}x${cg_out_h} crop on ${cg_sensor_w}x${cg_sensor_h}; centred left is $cg_centre"
+
+            cg_probe 0 0 "$cg_sensor_w" "$cg_sensor_h" full
+            cg_probe "$cg_centre" 0 "$cg_out_w" "$cg_out_h" "atcentre$cg_centre"
+            # Just past centre. Under reading A this is the first to starve.
+            for cg_step in 8 24 56 80; do
+                cg_probe $(( cg_centre + cg_step )) 0 "$cg_out_w" "$cg_out_h" \
+                         "past$(( cg_centre + cg_step ))"
+            done
+            cg_probe "$cg_far_left" 0 "$cg_out_w" "$cg_out_h" cornerflush
+
+            # -- phase 2: narrower crop. Its centred left is further right than
+            # anything phase 1 could stream, so a stream there is reading A and
+            # a starve is reading B.
+            cg_set_output $(( CROP_WIDTH / 2 )) $(( CROP_HEIGHT / 2 ))
+            if [ "$cg_out_w" -ge "$CROP_WIDTH" ]; then
+                result SKIP crop-geometry.phase2 \
+                    "the driver would not accept a narrower output; cannot vary crop width"
+            else
+                cg_centre2=$(( (cg_sensor_w - cg_out_w) / 2 ))
+                result INFO crop-geometry.phase2 \
+                    "${cg_out_w}x${cg_out_h} crop; centred left is $cg_centre2, past phase 1's streaming range"
+                cg_probe "$cg_centre" 0 "$cg_out_w" "$cg_out_h" "narrow_at$cg_centre"
+                cg_probe "$cg_centre2" 0 "$cg_out_w" "$cg_out_h" "narrow_centre$cg_centre2"
+                cg_probe $(( cg_centre2 + 80 )) 0 "$cg_out_w" "$cg_out_h" \
+                         "narrow_past$(( cg_centre2 + 80 ))"
+            fi
 
             if [ -n "$cg_default" ]; then
                 IFS=, read -r cd_l cd_t cd_w cd_h <<<"$cg_default"
                 v4l2-ctl --device "$DEVICE" \
                     --set-selection="target=crop,left=$cd_l,top=$cd_t,width=$cd_w,height=$cd_h" \
+                    >>"$REPORT" 2>&1 || true
+            fi
+            if [ -n "$cg_orig_wh" ]; then
+                v4l2-ctl --device "$DEVICE" \
+                    --set-fmt-video="width=${cg_orig_wh%%/*},height=${cg_orig_wh##*/},pixelformat=YUYV" \
                     >>"$REPORT" 2>&1 || true
             fi
         fi

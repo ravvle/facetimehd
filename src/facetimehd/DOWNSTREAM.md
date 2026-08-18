@@ -725,15 +725,27 @@ So the flush edge is not it, and the older note here that a left eight pixels
 lower streams normally does not survive either - it too came from a run without
 recovery between rectangles.
 
-What is established is a bracket: left `0`, `8` and `320` stream; left `632`
-and `640` starve at either top. The boundary is between `320` and `632`. And
-because three rectangles streamed on the same firmware load before one starved,
-"the first rectangle after a load starves" is dead; only "the first *far-offset*
-rectangle after a load" still competes with a plain positional threshold. The
-`crop-geometry` section now sweeps left offsets `240 320 400 480 560` at a fixed
-top ahead of the corners, each after the previous one's recovery, which
-separates the two: a sweep step that streams is a far-offset rectangle that did
-not starve as the first one on its own firmware load.
+The left-offset sweep then bracketed it tightly. With a 640-wide crop on the
+1280-wide array, left `0`, `8`, `240` and `320` stream; left `400`, `480`,
+`560`, `632` and `640` starve. **The boundary is between `320` and `400`.**
+
+Two further readings die there. Five rectangles streamed consecutively on one
+firmware load before the first starve, which ends "the first far-offset
+rectangle after a load starves". And the right edge alone is not it: the full
+array ends at `1280` and streams while a 640-wide crop ending at `1280`
+starves.
+
+`320` is `(1280 - 640) / 2` - exactly the centred position, and every rectangle
+that streamed sits at or left of centre. So either the limit is *centre* for
+the crop's width, or a fixed offset that happens to land near it; every
+rectangle tested so far was 640 wide, which makes the two indistinguishable. A
+320-wide crop centres at `480`, past anything a 640-wide crop could stream, and
+separates them. The `crop-geometry` section now does exactly that in two
+phases.
+
+No driver-side clamp is added on this. The rule is not yet known, and refusing
+or nudging rectangles on a guess would silently change what the application
+asked for - the same objection recorded when this was first found.
 
 Crop GET narrows it further from the other side: in both starving cases the ISP
 returned *exactly* the rectangle it was given. It is not rejecting the geometry

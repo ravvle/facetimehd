@@ -487,17 +487,47 @@ the `1280` array. **It starved too**
 edge outright. It also contradicts the older note that a left eight pixels
 lower streams normally - another observation from a run without recovery.
 
-What survives is bounded rather than solved. Left `0`, `8` and `320` streamed;
-left `632` and `640` starved at either top. The boundary lies between `320` and
-`632`. Note that `full`, `topleft` and `midoffset` all streamed on the *same*
-firmware load before `nearcorner` starved, so "the first rectangle after a load
-starves" is dead; only "the first *far-offset* rectangle after a load" still
-competes with a plain positional threshold. The section now sweeps left offsets
-`240 320 400 480 560` at a fixed top before the corners, each after the
-previous one's recovery. Any sweep step that streams is a far-offset rectangle
-that did not starve as the first one on its own firmware load, which
-falsifies the remaining "first far-offset" reading and leaves a positional
-threshold the same sweep locates.
+The left-offset sweep then located the boundary
+(`/tmp/facetimehd-hw-validate-20260818-205545.log`). With a 640-wide crop on
+the 1280-wide array, at a fixed top:
+
+| left | right edge | Result |
+|---:|---:|---|
+| `0` (full array, 1280 wide) | `1280` | streaming |
+| `8` | `648` | streaming |
+| `240` | `880` | streaming |
+| `320` | `960` | streaming |
+| `400` | `1040` | starved |
+| `480` | `1120` | starved |
+| `560` | `1200` | starved |
+| `632` | `1272` | starved |
+| `640` | `1280` | starved |
+
+**The boundary is between left `320` and left `400`.** Two more readings die
+here. `full`, `topleft`, `midoffset`, `240` and `320` streamed *consecutively
+on one firmware load* before `400` starved, so "the first far-offset rectangle
+after a firmware load starves" is finished - five far-from-trivial rectangles
+preceded the first starve without a reload between them. And the right edge
+alone is not the trigger either: the full array ends at `1280` and streams
+while a 640-wide crop ending at `1280` starves, so the same right edge does
+both depending on the width.
+
+What is left is a limit on the left offset, and `320` is a suspicious value for
+it: `(1280 - 640) / 2` is exactly `320`, the **centred** position. Every
+rectangle that streamed sits at or left of centre and every one that starved
+sits right of it. So:
+
+- **A.** `left` may not exceed `(sensor_width - crop_width) / 2` - the crop may
+  be centred or left of centre, never right of centre.
+- **B.** `left` may not exceed a fixed limit somewhere in `320..400`,
+  independent of the crop width.
+
+Both fit every measurement so far, because every rectangle tested has been 640
+wide, which makes the two coincide. A *narrower* crop separates them: a
+320-wide crop centres at left `480`, past anything a 640-wide crop could
+stream. Under A it streams there; under B it starves. The section now runs two
+phases - a fine walk just past centre at 640 wide, then the same probe at 320
+wide - which decides it and pins the boundary at the same time.
 
 That run also exposed a defect in the harness rather than the driver. The
 section judged channel health with `capture_ok()`, which tests only
