@@ -1,16 +1,16 @@
 # Graph Report - facetimehd  (2026-08-18)
 
 ## Corpus Check
-- 41 files · ~62,830 words
+- 40 files · ~70,941 words
 - Verdict: corpus is large enough that graph structure adds value.
 
 ## Summary
-- 462 nodes · 943 edges · 27 communities (20 shown, 7 thin omitted)
-- Extraction: 88% EXTRACTED · 12% INFERRED · 0% AMBIGUOUS · INFERRED: 117 edges (avg confidence: 0.79)
+- 488 nodes · 990 edges · 27 communities (20 shown, 7 thin omitted)
+- Extraction: 88% EXTRACTED · 12% INFERRED · 0% AMBIGUOUS · INFERRED: 121 edges (avg confidence: 0.79)
 - Token cost: 0 input · 0 output
 
 ## Graph Freshness
-- Built from commit: `ed535ebd`
+- Built from commit: `8e154f95`
 - Run `git rev-parse HEAD` and compare to check if the graph is stale.
 - Run `graphify update .` after code changes (no API cost).
 
@@ -24,7 +24,7 @@
 - hw-validate.sh
 - fthd_hw.c
 - FaceTime HD Camera for Linux (project)
-- fthd_ringbuf.c
+- fthd_debugfs.c
 - fthd_hw.h
 - extract-firmware.sh
 - script-smoke.sh
@@ -36,36 +36,36 @@
 - Removal of unused DDR shmoo calibration code
 - build-driver.sh
 - AGENTS.md
-- fthd_s_ctrl
+- FaceTimeHD firmware command notes
 - isp_init
+- fthd_firmware_roundtrip
+- fthd_s_ctrl
 - fthd_stop_channel
 - fthd_firmware_start
-- isp_fill_channel_info
-- fthd_set_exposure
 
 ## God Nodes (most connected - your core abstractions)
-1. `install.sh script` - 30 edges
-2. `fthd_start_channel()` - 25 edges
+1. `install.sh script` - 31 edges
+2. `fthd_start_channel()` - 26 edges
 3. `macbook-tune.sh script` - 21 edges
 4. `have()` - 18 edges
-5. `fthd_pci_probe()` - 17 edges
-6. `fthd_s_ctrl()` - 15 edges
-7. `hw-validate.sh script` - 14 edges
-8. `show_status()` - 12 edges
-9. `extract-firmware.sh script` - 11 edges
-10. `info()` - 11 edges
+5. `fthd_pci_probe()` - 16 edges
+6. `hw-validate.sh script` - 15 edges
+7. `FaceTimeHD firmware command notes` - 14 edges
+8. `show_status()` - 13 edges
+9. `uninstall.sh script` - 12 edges
+10. `extract-firmware.sh script` - 11 edges
 
 ## Surprising Connections (you probably didn't know these)
 - `tests/script-smoke.sh Makefile-completeness check` --semantically_similar_to--> `Every shell script is linted guard`  [INFERRED] [semantically similar]
   src/facetimehd/DOWNSTREAM.md → .github/workflows/ci.yml
+- `fthd_pci_probe()` --calls--> `fthd_debugfs_init()`  [INFERRED]
+  src/facetimehd/fthd_drv.c → src/facetimehd/fthd_debugfs.c
 - `KDIR=/usr/src/kernels override for RPM containers` --conceptually_related_to--> `Kernel build tree tested with -d, not -e or -L`  [INFERRED]
   .github/workflows/ci.yml → CLAUDE.md
 - `Kernel build matrix (Ubuntu/Fedora/AlmaLinux)` --conceptually_related_to--> `Supported distribution matrix`  [EXTRACTED]
   .github/workflows/ci.yml → README.md
 - `Kernel build matrix (Ubuntu/Fedora/AlmaLinux)` --references--> `Linux 5.15 kernel floor`  [EXTRACTED]
   .github/workflows/ci.yml → README.md
-- `Hardware validation status (open items)` --references--> `MacBookAir7,2 as the sole validation machine`  [EXTRACTED]
-  src/facetimehd/DOWNSTREAM.md → README.md
 
 ## Import Cycles
 - None detected.
@@ -78,20 +78,20 @@
 ## Communities (27 total, 7 thin omitted)
 
 ### Community 0 - "fthd_isp.c"
-Cohesion: 0.14
-Nodes (24): fthd_isp_cmd_channel_ae_speed_set(), fthd_isp_cmd_channel_ae_stability_set(), fthd_isp_cmd_channel_ae_stability_to_stable_set(), fthd_isp_cmd_channel_camera_config_select(), fthd_isp_cmd_channel_crop_set(), fthd_isp_cmd_channel_drc_start(), fthd_isp_cmd_channel_error_handling_config(), fthd_isp_cmd_channel_face_detection_enable() (+16 more)
+Cohesion: 0.10
+Nodes (25): fthd_isp_cmd_channel_ae_metering_mode_set(), fthd_isp_cmd_channel_ae_speed_set(), fthd_isp_cmd_channel_ae_stability_set(), fthd_isp_cmd_channel_ae_stability_to_stable_set(), fthd_isp_cmd_channel_camera_config_select(), fthd_isp_cmd_channel_crop_set(), fthd_isp_cmd_channel_drc_start(), fthd_isp_cmd_channel_error_handling_config() (+17 more)
 
 ### Community 1 - "fthd_drv.c"
-Cohesion: 0.05
-Nodes (61): irqreturn_t, loff_t, fthd_buffer_exit(), fthd_buffer_init(), iommu_allocator_destroy(), iommu_allocator_init(), fthd_debugfs_exit(), fthd_debugfs_init() (+53 more)
+Cohesion: 0.08
+Nodes (42): irqreturn_t, pci_channel_state_t, pci_ers_result_t, fthd_buffer_exit(), fthd_buffer_init(), iommu_allocator_destroy(), iommu_allocator_init(), fthd_debugfs_exit() (+34 more)
 
 ### Community 2 - "common.sh"
-Cohesion: 0.10
-Nodes (58): collect(), redact(), section(), collect-diagnostics.sh script, usage(), extract-firmware.sh script, dkms_installed_versions(), enroll_mok() (+50 more)
+Cohesion: 0.09
+Nodes (60): collect(), redact(), section(), collect-diagnostics.sh script, usage(), extract-firmware.sh script, dkms_installed_versions(), enroll_mok() (+52 more)
 
 ### Community 3 - "fthd_v4l2.c"
-Cohesion: 0.07
-Nodes (40): pci_channel_state_t, pci_ers_result_t, iommu_allocate_sgtable(), iommu_free(), fthd_irq_work(), fthd_is_powered(), fthd_mark_firmware_wedged(), fthd_pci_error_detected() (+32 more)
+Cohesion: 0.08
+Nodes (37): iommu_allocate_sgtable(), iommu_free(), fthd_irq_work(), fthd_is_powered(), fthd_mark_firmware_wedged(), fthd_resume(), fthd_suspend(), u32 (+29 more)
 
 ### Community 4 - "CI workflow"
 Cohesion: 0.07
@@ -102,8 +102,8 @@ Cohesion: 0.07
 Nodes (31): Hardware report issue form, Debugfs created in probe(), destroyed in remove(), DDR/PLL/FWMSG bring-up messages are dev_dbg, Power management is not this project's job, facetimehd-runtime-pm.conf modprobe drop-in, A wrong firmware guess must be refused, not destructive, Hardware reports are the most valuable contribution, MacBookAir7,2 as the sole validation machine (+23 more)
 
 ### Community 6 - "hw-validate.sh"
-Cohesion: 0.19
-Nodes (14): capture_ok(), check_ring_wrap(), dmesg_driver(), dmesg_mark(), dmesg_since(), load_module(), log(), log_section() (+6 more)
+Cohesion: 0.17
+Nodes (15): capture_ok(), check_ring_wrap(), dmesg_driver(), dmesg_mark(), dmesg_since(), load_module(), log(), log_section() (+7 more)
 
 ### Community 7 - "fthd_hw.c"
 Cohesion: 0.18
@@ -113,9 +113,9 @@ Nodes (15): u32, fthd_ddr_verify_mem(), u32, fthd_ddr_phy_save_regs(), fthd_hw_d
 Cohesion: 0.12
 Nodes (18): Bug report issue form, DOWNSTREAM.md is the review record for fork changes, driver-patches/ is a generated view, not an input, Fan support is deliberately its own script, Propose driver fixes upstream where they apply, Broadcom BCM1570 PCIe FaceTime HD Camera (14e4:1570), collect-diagnostics.sh one-file bug report, FaceTime HD Camera for Linux (project) (+10 more)
 
-### Community 9 - "fthd_ringbuf.c"
-Cohesion: 0.30
-Nodes (12): buf_t2h_handler(), u32, fthd_handle_irq(), io_t2h_handler(), sharedmalloc_handler(), terminal_handler(), u32, fthd_channel_ringbuf_dump() (+4 more)
+### Community 9 - "fthd_debugfs.c"
+Cohesion: 0.09
+Nodes (36): loff_t, s32, u8, fthd_debugfs_init(), fthd_debugfs_open(), fthd_debugfs_release(), fthd_debugfs_seq_open(), fthd_debugfs_seq_release() (+28 more)
 
 ### Community 10 - "fthd_hw.h"
 Cohesion: 0.41
@@ -133,13 +133,21 @@ Nodes (7): check_dkms_format(), check_documented_options(), expect_output(), exp
 Cohesion: 0.50
 Nodes (4): diffutils is an RPM dependency on purpose, Installer idempotency via diff against /usr/src, Version derivation with source fingerprint, Package version omits the source fingerprint
 
-### Community 21 - "fthd_s_ctrl"
-Cohesion: 0.12
-Nodes (16): fthd_isp_cmd_channel_ae_bias_set(), fthd_isp_cmd_channel_ae_flicker_freq_set(), fthd_isp_cmd_channel_ae_metering_mode_set(), fthd_isp_cmd_channel_awb(), fthd_isp_cmd_channel_awb_cct_manual(), fthd_isp_cmd_channel_brightness_set(), fthd_isp_cmd_channel_chroma_suppression_set(), fthd_isp_cmd_channel_contrast_set() (+8 more)
+### Community 22 - "FaceTimeHD firmware command notes"
+Cohesion: 0.11
+Nodes (17): Bounded metering-mode semantics harness, Confirmed read-only command surface, Corrected-build reboot validation (2026-08-18), Corrected-build runtime-PM validation (2026-08-18), FaceTimeHD firmware command notes, Full-system suspend finding (2026-08-18), Image examined, Incident reconstruction (+9 more)
 
 ### Community 23 - "isp_init"
-Cohesion: 0.24
-Nodes (10): resource_size_t, fthd_isp_cmd_set_loadfile(), isp_acpi_set_power(), isp_enable_sensor(), isp_init(), isp_load_firmware(), isp_mem_create(), isp_mem_destroy() (+2 more)
+Cohesion: 0.18
+Nodes (13): resource_size_t, fthd_isp_cmd_set_loadfile(), isp_acpi_set_power(), isp_enable_sensor(), isp_fill_channel_info(), isp_free_channel_info(), isp_get_chan_index(), isp_init() (+5 more)
+
+### Community 24 - "fthd_firmware_roundtrip"
+Cohesion: 0.30
+Nodes (12): fthd_firmware_roundtrip(), u32, fthd_isp_cmd_channel_ae_bias_get(), fthd_isp_cmd_channel_ae_bias_set(), fthd_isp_cmd_channel_ae_bias_set_raw(), fthd_isp_cmd_channel_ae_gain_cap_min_set_raw(), fthd_isp_cmd_channel_ae_gain_cap_set_raw(), fthd_isp_cmd_channel_ae_gain_set() (+4 more)
+
+### Community 25 - "fthd_s_ctrl"
+Cohesion: 0.25
+Nodes (8): fthd_isp_cmd_channel_ae(), fthd_isp_cmd_channel_ae_flicker_freq_set(), fthd_isp_cmd_channel_awb(), fthd_isp_cmd_channel_brightness_set(), fthd_isp_cmd_channel_contrast_set(), fthd_isp_cmd_channel_hue_set(), fthd_isp_cmd_channel_saturation_set(), fthd_s_ctrl()
 
 ### Community 26 - "fthd_stop_channel"
 Cohesion: 0.25
@@ -149,33 +157,25 @@ Nodes (8): fthd_isp_cmd_channel_buffer_return(), fthd_isp_cmd_channel_face_detec
 Cohesion: 0.33
 Nodes (6): fthd_firmware_start(), fthd_isp_cmd_camera_config(), fthd_isp_cmd_channel_camera_config(), fthd_isp_cmd_channel_info(), fthd_isp_cmd_print_enable(), fthd_isp_cmd_start()
 
-### Community 28 - "isp_fill_channel_info"
-Cohesion: 0.40
-Nodes (5): u32, isp_fill_channel_info(), isp_free_channel_info(), isp_get_chan_index(), isp_mem_destroy_offset()
-
-### Community 29 - "fthd_set_exposure"
-Cohesion: 0.50
-Nodes (4): fthd_isp_cmd_channel_ae(), fthd_isp_cmd_channel_ae_gain_set(), fthd_isp_cmd_channel_ae_integration_time_set(), fthd_set_exposure()
-
 ## Knowledge Gaps
-- **19 isolated node(s):** `build-deb.sh script`, `build-rpm.sh script`, `DRIVER_NAMES`, `DRIVER_OFFSETS`, `DRIVER_SIZES` (+14 more)
+- **34 isolated node(s):** `build-deb.sh script`, `build-rpm.sh script`, `DRIVER_NAMES`, `DRIVER_OFFSETS`, `DRIVER_SIZES` (+29 more)
   These have ≤1 connection - possible missing edges or undocumented components.
 - **7 thin communities (<3 nodes) omitted from report** — run `graphify query` to explore isolated nodes.
 
 ## Suggested Questions
 _Questions this graph is uniquely positioned to answer:_
 
-- **Why does `fthd_pci_probe()` connect `fthd_drv.c` to `fthd_firmware_start`, `fthd_hw.c`?**
-  _High betweenness centrality (0.011) - this node is a cross-community bridge._
-- **Why does `Apple firmware extraction (firmware 1.43.0)` connect `CI workflow` to `FaceTime HD Camera for Linux (project)`?**
+- **Why does `fthd_pci_probe()` connect `fthd_drv.c` to `fthd_debugfs.c`, `fthd_firmware_start`, `fthd_hw.c`?**
   _High betweenness centrality (0.009) - this node is a cross-community bridge._
+- **Why does `Apple firmware extraction (firmware 1.43.0)` connect `CI workflow` to `FaceTime HD Camera for Linux (project)`?**
+  _High betweenness centrality (0.008) - this node is a cross-community bridge._
 - **Why does `fthd_start_channel()` connect `fthd_isp.c` to `fthd_v4l2.c`, `fthd_firmware_start`?**
   _High betweenness centrality (0.007) - this node is a cross-community bridge._
 - **Are the 2 inferred relationships involving `fthd_start_channel()` (e.g. with `fthd_v4l2_refresh_crop()` and `fthd_stream_start()`) actually correct?**
   _`fthd_start_channel()` has 2 INFERRED edges - model-reasoned connections that need verification._
-- **Are the 10 inferred relationships involving `fthd_pci_probe()` (e.g. with `fthd_buffer_exit()` and `fthd_buffer_init()`) actually correct?**
-  _`fthd_pci_probe()` has 10 INFERRED edges - model-reasoned connections that need verification._
+- **Are the 9 inferred relationships involving `fthd_pci_probe()` (e.g. with `fthd_buffer_exit()` and `fthd_buffer_init()`) actually correct?**
+  _`fthd_pci_probe()` has 9 INFERRED edges - model-reasoned connections that need verification._
 - **What connects `build-deb.sh script`, `build-rpm.sh script`, `DRIVER_NAMES` to the rest of the system?**
-  _19 weakly-connected nodes found - possible documentation gaps or missing edges._
+  _34 weakly-connected nodes found - possible documentation gaps or missing edges._
 - **Should `fthd_isp.c` be split into smaller, more focused modules?**
-  _Cohesion score 0.14461538461538462 - nodes in this community are weakly interconnected._
+  _Cohesion score 0.10416666666666667 - nodes in this community are weakly interconnected._

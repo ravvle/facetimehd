@@ -159,14 +159,6 @@ collect() {
         printf '(no kernel messages found; re-run with sudo for the full ring buffer)\n'
     fi
 
-    printf '\n===== Sensor temperature (debugfs) =====\n'
-    if compgen -G "/sys/kernel/debug/${MODULE_NAME}/*/sensor_temperature_raw" >/dev/null 2>&1; then
-        for f in "/sys/kernel/debug/${MODULE_NAME}/"*/sensor_temperature_raw; do
-            printf '%s: %s\n' "$f" "$(cat "$f" 2>&1 || true)"
-        done
-    else
-        printf '(debugfs not readable here; needs root)\n'
-    fi
 }
 
 step "Collecting diagnostics"

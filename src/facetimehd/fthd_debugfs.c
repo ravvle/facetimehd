@@ -17,7 +17,6 @@
 #include "fthd_isp.h"
 #include "fthd_ringbuf.h"
 #include "fthd_hw.h"
-#include "fthd_hwmon.h"
 
 static DEFINE_MUTEX(fthd_debugfs_lock);
 static struct dentry *fthd_debugfs_root;
@@ -240,25 +239,425 @@ static int seq_channel_debug_read(struct seq_file *seq, void *data)
 	return seq_channel_read(seq, dev_priv, &dev_priv->channel_debug);
 }
 
+enum fthd_fw_readback {
+	FTHD_FW_SENSOR_TEMPERATURE,
+	FTHD_FW_AWB_CCT,
+	FTHD_FW_AE_BIAS,
+	FTHD_FW_AE_GAIN_CAP,
+	FTHD_FW_AE_GAIN_CAP_MIN,
+	FTHD_FW_AE_GAIN_CAP_MAX_WITH_EXP,
+	FTHD_FW_AE_GAIN_CAP_OFF,
+	FTHD_FW_AE_INTEGRATION_TIME_MAX,
+	FTHD_FW_AE_SENSOR_INTEGRATION_TIME_MIN,
+	FTHD_FW_AE_SENSOR_INTEGRATION_TIME_MAX,
+	FTHD_FW_AE_METERING_MODE,
+};
+
+enum fthd_fw_roundtrip {
+	FTHD_FW_ROUNDTRIP_AE_BIAS,
+	FTHD_FW_ROUNDTRIP_AE_METERING_MODE,
+	FTHD_FW_ROUNDTRIP_AE_INTEGRATION_TIME_MAX,
+	FTHD_FW_ROUNDTRIP_AE_GAIN_CAP,
+	FTHD_FW_ROUNDTRIP_AE_GAIN_CAP_MIN,
+};
+
 /*
- * The sensor temperature exactly as the firmware reports it, with no scale
- * applied.  The hwmon device only publishes a reading it can defend as
- * celsius (see fthd_hwmon.c); this is the unfiltered value, and the place to
- * look for anyone working out what the firmware actually means by it.
+ * These files are deliberately unlike the ring-state diagnostics above.
+ * Reading one sends exactly one statically whitelisted firmware GET.  Requiring
+ * an already-running channel keeps a read from booting or configuring the ISP,
+ * and ioctl_lock prevents STREAMOFF from racing the command.
  */
-static int seq_sensor_temperature_read(struct seq_file *seq, void *data)
+static int seq_firmware_readback(struct seq_file *seq,
+				 enum fthd_fw_readback readback)
 {
 	struct fthd_private *dev_priv = seq->private;
-	s32 raw;
+	u32 value, tag;
+	s32 signed_value;
+	u16 bias;
+	u8 mode;
 	int ret;
 
-	ret = fthd_hwmon_read_raw(dev_priv, &raw);
+	mutex_lock(&dev_priv->ioctl_lock);
+	if (READ_ONCE(dev_priv->removing)) {
+		ret = -ENODEV;
+		goto out_unlock;
+	}
+	if (!dev_priv->channel_running) {
+		ret = -EPIPE;
+		goto out_unlock;
+	}
+
+	ret = fthd_pm_get(dev_priv);
+	if (ret)
+		goto out_unlock;
+
+	switch (readback) {
+	case FTHD_FW_SENSOR_TEMPERATURE:
+		ret = fthd_isp_cmd_channel_sensor_temperature(dev_priv, 0,
+							      &signed_value);
+		if (!ret)
+			seq_printf(seq, "%d\n", signed_value);
+		break;
+	case FTHD_FW_AWB_CCT:
+		ret = fthd_isp_cmd_channel_awb_cct_get(dev_priv, 0, &value);
+		if (!ret)
+			seq_printf(seq, "%u\n", value);
+		break;
+	case FTHD_FW_AE_BIAS:
+		ret = fthd_isp_cmd_channel_ae_bias_get(dev_priv, 0, &bias, &tag);
+		if (!ret)
+			seq_printf(seq, "bias=%u tag=%u\n", bias, tag);
+		break;
+	case FTHD_FW_AE_GAIN_CAP:
+		ret = fthd_isp_cmd_channel_ae_gain_cap_get(dev_priv, 0, &value);
+		if (!ret)
+			seq_printf(seq, "%u\n", value);
+		break;
+	case FTHD_FW_AE_GAIN_CAP_MIN:
+		ret = fthd_isp_cmd_channel_ae_gain_cap_min_get(dev_priv, 0,
+							     &value);
+		if (!ret)
+			seq_printf(seq, "%u\n", value);
+		break;
+	case FTHD_FW_AE_GAIN_CAP_MAX_WITH_EXP:
+		ret = fthd_isp_cmd_channel_ae_gain_cap_max_with_exp_get(dev_priv,
+								      0, &value);
+		if (!ret)
+			seq_printf(seq, "%u\n", value);
+		break;
+	case FTHD_FW_AE_GAIN_CAP_OFF:
+		ret = fthd_isp_cmd_channel_ae_gain_cap_off_get(dev_priv, 0,
+							     &value);
+		if (!ret)
+			seq_printf(seq, "%u\n", value);
+		break;
+	case FTHD_FW_AE_INTEGRATION_TIME_MAX:
+		ret = fthd_isp_cmd_channel_ae_integration_time_max_get(dev_priv,
+								      0, &value);
+		if (!ret)
+			seq_printf(seq, "%u\n", value);
+		break;
+	case FTHD_FW_AE_SENSOR_INTEGRATION_TIME_MIN:
+		ret = fthd_isp_cmd_channel_ae_sensor_integration_time_min_get(
+			dev_priv, 0, &value);
+		if (!ret)
+			seq_printf(seq, "%u\n", value);
+		break;
+	case FTHD_FW_AE_SENSOR_INTEGRATION_TIME_MAX:
+		ret = fthd_isp_cmd_channel_ae_sensor_integration_time_max_get(
+			dev_priv, 0, &value);
+		if (!ret)
+			seq_printf(seq, "%u\n", value);
+		break;
+	case FTHD_FW_AE_METERING_MODE:
+		ret = fthd_isp_cmd_channel_ae_metering_mode_get(dev_priv, 0,
+							       &mode);
+		if (!ret)
+			seq_printf(seq, "%u\n", mode);
+		break;
+	default:
+		ret = -EINVAL;
+		break;
+	}
+
+	fthd_pm_put(dev_priv);
+out_unlock:
+	mutex_unlock(&dev_priv->ioctl_lock);
+	return ret;
+}
+
+#define FTHD_FW_READBACK_SHOW(_name, _readback)                         \
+	static int _name(struct seq_file *seq, void *data)                \
+	{                                                                  \
+		return seq_firmware_readback(seq, _readback);                \
+	}
+
+FTHD_FW_READBACK_SHOW(seq_sensor_temperature_raw_read,
+			  FTHD_FW_SENSOR_TEMPERATURE);
+FTHD_FW_READBACK_SHOW(seq_awb_cct_raw_read, FTHD_FW_AWB_CCT);
+FTHD_FW_READBACK_SHOW(seq_ae_bias_raw_read, FTHD_FW_AE_BIAS);
+FTHD_FW_READBACK_SHOW(seq_ae_gain_cap_raw_read, FTHD_FW_AE_GAIN_CAP);
+FTHD_FW_READBACK_SHOW(seq_ae_gain_cap_min_raw_read,
+			  FTHD_FW_AE_GAIN_CAP_MIN);
+FTHD_FW_READBACK_SHOW(seq_ae_gain_cap_max_with_exp_raw_read,
+			  FTHD_FW_AE_GAIN_CAP_MAX_WITH_EXP);
+FTHD_FW_READBACK_SHOW(seq_ae_gain_cap_off_raw_read,
+			  FTHD_FW_AE_GAIN_CAP_OFF);
+FTHD_FW_READBACK_SHOW(seq_ae_integration_time_max_raw_read,
+			  FTHD_FW_AE_INTEGRATION_TIME_MAX);
+FTHD_FW_READBACK_SHOW(seq_ae_sensor_integration_time_min_raw_read,
+			  FTHD_FW_AE_SENSOR_INTEGRATION_TIME_MIN);
+FTHD_FW_READBACK_SHOW(seq_ae_sensor_integration_time_max_raw_read,
+			  FTHD_FW_AE_SENSOR_INTEGRATION_TIME_MAX);
+FTHD_FW_READBACK_SHOW(seq_ae_metering_mode_raw_read,
+			  FTHD_FW_AE_METERING_MODE);
+
+#undef FTHD_FW_READBACK_SHOW
+
+static int fthd_firmware_roundtrip(struct fthd_private *dev_priv,
+				   enum fthd_fw_roundtrip roundtrip)
+{
+	u32 before, after, tag_before, tag_after;
+	u16 bias_before, bias_after;
+	u8 mode_before, mode_after;
+	int ret;
+
+	switch (roundtrip) {
+	case FTHD_FW_ROUNDTRIP_AE_BIAS:
+		ret = fthd_isp_cmd_channel_ae_bias_get(dev_priv, 0,
+						       &bias_before, &tag_before);
+		if (ret)
+			return ret;
+		ret = fthd_isp_cmd_channel_ae_bias_set_raw(dev_priv, 0,
+							   bias_before, tag_before);
+		if (ret)
+			return ret;
+		ret = fthd_isp_cmd_channel_ae_bias_get(dev_priv, 0,
+						       &bias_after, &tag_after);
+		if (ret)
+			return ret;
+		return bias_before == bias_after && tag_before == tag_after ?
+			0 : -EIO;
+	case FTHD_FW_ROUNDTRIP_AE_METERING_MODE:
+		ret = fthd_isp_cmd_channel_ae_metering_mode_get(dev_priv, 0,
+							       &mode_before);
+		if (ret)
+			return ret;
+		ret = fthd_isp_cmd_channel_ae_metering_mode_set(dev_priv, 0,
+							       mode_before);
+		if (ret)
+			return ret;
+		ret = fthd_isp_cmd_channel_ae_metering_mode_get(dev_priv, 0,
+							       &mode_after);
+		if (ret)
+			return ret;
+		return mode_before == mode_after ? 0 : -EIO;
+	case FTHD_FW_ROUNDTRIP_AE_INTEGRATION_TIME_MAX:
+		ret = fthd_isp_cmd_channel_ae_integration_time_max_get(dev_priv,
+								      0, &before);
+		if (ret)
+			return ret;
+		ret = fthd_isp_cmd_channel_ae_integration_time_max_set_raw(
+			dev_priv, 0, before);
+		if (ret)
+			return ret;
+		ret = fthd_isp_cmd_channel_ae_integration_time_max_get(dev_priv,
+								      0, &after);
+		if (ret)
+			return ret;
+		return before == after ? 0 : -EIO;
+	case FTHD_FW_ROUNDTRIP_AE_GAIN_CAP:
+		ret = fthd_isp_cmd_channel_ae_gain_cap_get(dev_priv, 0, &before);
+		if (ret)
+			return ret;
+		ret = fthd_isp_cmd_channel_ae_gain_cap_set_raw(dev_priv, 0,
+							      before);
+		if (ret)
+			return ret;
+		ret = fthd_isp_cmd_channel_ae_gain_cap_get(dev_priv, 0, &after);
+		if (ret)
+			return ret;
+		return before == after ? 0 : -EIO;
+	case FTHD_FW_ROUNDTRIP_AE_GAIN_CAP_MIN:
+		ret = fthd_isp_cmd_channel_ae_gain_cap_min_get(dev_priv, 0,
+							     &before);
+		if (ret)
+			return ret;
+		ret = fthd_isp_cmd_channel_ae_gain_cap_min_set_raw(dev_priv, 0,
+								  before);
+		if (ret)
+			return ret;
+		ret = fthd_isp_cmd_channel_ae_gain_cap_min_get(dev_priv, 0,
+							     &after);
+		if (ret)
+			return ret;
+		return before == after ? 0 : -EIO;
+	default:
+		return -EINVAL;
+	}
+}
+
+static ssize_t fthd_firmware_roundtrip_write(
+	struct file *file, const char __user *user_buf, size_t count,
+	loff_t *ppos, enum fthd_fw_roundtrip roundtrip)
+{
+	struct fthd_private *dev_priv = file->private_data;
+	char buf[16];
+	int ret;
+
+	if (!count)
+		return 0;
+	if (*ppos || count >= sizeof(buf))
+		return -EINVAL;
+	if (copy_from_user(buf, user_buf, count))
+		return -EFAULT;
+	buf[count] = '\0';
+	if (strcmp(strim(buf), "same"))
+		return -EINVAL;
+
+	mutex_lock(&dev_priv->ioctl_lock);
+	if (READ_ONCE(dev_priv->removing)) {
+		ret = -ENODEV;
+		goto out_unlock;
+	}
+	if (!dev_priv->channel_running) {
+		ret = -EPIPE;
+		goto out_unlock;
+	}
+
+	ret = fthd_pm_get(dev_priv);
+	if (ret)
+		goto out_unlock;
+	ret = fthd_firmware_roundtrip(dev_priv, roundtrip);
+	fthd_pm_put(dev_priv);
+out_unlock:
+	mutex_unlock(&dev_priv->ioctl_lock);
+	if (ret)
+		return ret;
+	*ppos += count;
+	return count;
+}
+
+#define FTHD_FW_ROUNDTRIP_FOPS(_name, _roundtrip)                         \
+	static ssize_t _name##_write(struct file *file,                    \
+				     const char __user *user_buf,          \
+				     size_t count, loff_t *ppos)           \
+	{                                                                    \
+		return fthd_firmware_roundtrip_write(file, user_buf, count,   \
+						     ppos, _roundtrip);       \
+	}                                                                    \
+	static const struct file_operations _name##_fops = {                 \
+		.owner = THIS_MODULE,                                           \
+		.open = fthd_debugfs_open,                                      \
+		.write = _name##_write,                                         \
+		.release = fthd_debugfs_release,                                \
+		.llseek = noop_llseek,                                          \
+	}
+
+FTHD_FW_ROUNDTRIP_FOPS(roundtrip_ae_bias, FTHD_FW_ROUNDTRIP_AE_BIAS);
+FTHD_FW_ROUNDTRIP_FOPS(roundtrip_ae_metering_mode,
+			      FTHD_FW_ROUNDTRIP_AE_METERING_MODE);
+FTHD_FW_ROUNDTRIP_FOPS(roundtrip_ae_integration_time_max,
+			      FTHD_FW_ROUNDTRIP_AE_INTEGRATION_TIME_MAX);
+FTHD_FW_ROUNDTRIP_FOPS(roundtrip_ae_gain_cap,
+			      FTHD_FW_ROUNDTRIP_AE_GAIN_CAP);
+FTHD_FW_ROUNDTRIP_FOPS(roundtrip_ae_gain_cap_min,
+			      FTHD_FW_ROUNDTRIP_AE_GAIN_CAP_MIN);
+
+#undef FTHD_FW_ROUNDTRIP_FOPS
+
+/*
+ * A deliberately narrow mutation endpoint for identifying the four recovered
+ * Apple AE metering modes.  Numeric input is not accepted: spelling out the
+ * four compile-time tokens keeps this from becoming an arbitrary firmware
+ * setter while their user-visible meanings are still under test.
+ */
+static int fthd_metering_test_mode(char *token, u8 *mode)
+{
+	if (!strcmp(token, "mode0"))
+		*mode = 0;
+	else if (!strcmp(token, "mode1"))
+		*mode = 1;
+	else if (!strcmp(token, "mode2"))
+		*mode = 2;
+	else if (!strcmp(token, "mode3"))
+		*mode = 3;
+	else
+		return -EINVAL;
+
+	return 0;
+}
+
+static ssize_t fthd_test_ae_metering_mode_write(
+	struct file *file, const char __user *user_buf, size_t count, loff_t *ppos,
+	bool restart_ae)
+{
+	struct fthd_private *dev_priv = file->private_data;
+	char buf[16];
+	u8 requested, readback;
+	int ret, restart_ret;
+
+	if (!count)
+		return 0;
+	if (*ppos || count >= sizeof(buf))
+		return -EINVAL;
+	if (copy_from_user(buf, user_buf, count))
+		return -EFAULT;
+	buf[count] = '\0';
+	ret = fthd_metering_test_mode(strim(buf), &requested);
 	if (ret)
 		return ret;
 
-	seq_printf(seq, "%d\n", raw);
-	return 0;
+	mutex_lock(&dev_priv->ioctl_lock);
+	if (READ_ONCE(dev_priv->removing)) {
+		ret = -ENODEV;
+		goto out_unlock;
+	}
+	if (!dev_priv->channel_running) {
+		ret = -EPIPE;
+		goto out_unlock;
+	}
+
+	ret = fthd_pm_get(dev_priv);
+	if (ret)
+		goto out_unlock;
+	if (restart_ae) {
+		ret = fthd_isp_cmd_channel_ae(dev_priv, 0, 0);
+		if (ret)
+			goto out_pm;
+	}
+	ret = fthd_isp_cmd_channel_ae_metering_mode_set(dev_priv, 0,
+							 requested);
+	/* Once AE was stopped, always try to start it again even if SET failed. */
+	if (restart_ae) {
+		restart_ret = fthd_isp_cmd_channel_ae(dev_priv, 0, 1);
+		if (!ret)
+			ret = restart_ret;
+	}
+	if (!ret)
+		ret = fthd_isp_cmd_channel_ae_metering_mode_get(dev_priv, 0,
+							 &readback);
+	if (!ret && readback != requested)
+		ret = -EIO;
+out_pm:
+	fthd_pm_put(dev_priv);
+out_unlock:
+	mutex_unlock(&dev_priv->ioctl_lock);
+	if (ret)
+		return ret;
+	*ppos += count;
+	return count;
 }
+
+static ssize_t test_ae_metering_mode_write(
+	struct file *file, const char __user *user_buf, size_t count, loff_t *ppos)
+{
+	return fthd_test_ae_metering_mode_write(file, user_buf, count, ppos,
+						 false);
+}
+
+static ssize_t test_ae_metering_mode_restart_write(
+	struct file *file, const char __user *user_buf, size_t count, loff_t *ppos)
+{
+	return fthd_test_ae_metering_mode_write(file, user_buf, count, ppos,
+						 true);
+}
+
+static const struct file_operations test_ae_metering_mode_fops = {
+	.owner = THIS_MODULE,
+	.open = fthd_debugfs_open,
+	.write = test_ae_metering_mode_write,
+	.release = fthd_debugfs_release,
+	.llseek = noop_llseek,
+};
+
+static const struct file_operations test_ae_metering_mode_restart_fops = {
+	.owner = THIS_MODULE,
+	.open = fthd_debugfs_open,
+	.write = test_ae_metering_mode_restart_write,
+	.release = fthd_debugfs_release,
+	.llseek = noop_llseek,
+};
 
 static int fthd_debugfs_seq_open(struct inode *inode, struct file *file,
 				 int (*show)(struct seq_file *, void *))
@@ -310,7 +709,17 @@ FTHD_DEBUGFS_SEQ_FOPS(seq_channel_io_t2h_read);
 FTHD_DEBUGFS_SEQ_FOPS(seq_channel_buf_h2t_read);
 FTHD_DEBUGFS_SEQ_FOPS(seq_channel_buf_t2h_read);
 FTHD_DEBUGFS_SEQ_FOPS(seq_channel_debug_read);
-FTHD_DEBUGFS_SEQ_FOPS(seq_sensor_temperature_read);
+FTHD_DEBUGFS_SEQ_FOPS(seq_sensor_temperature_raw_read);
+FTHD_DEBUGFS_SEQ_FOPS(seq_awb_cct_raw_read);
+FTHD_DEBUGFS_SEQ_FOPS(seq_ae_bias_raw_read);
+FTHD_DEBUGFS_SEQ_FOPS(seq_ae_gain_cap_raw_read);
+FTHD_DEBUGFS_SEQ_FOPS(seq_ae_gain_cap_min_raw_read);
+FTHD_DEBUGFS_SEQ_FOPS(seq_ae_gain_cap_max_with_exp_raw_read);
+FTHD_DEBUGFS_SEQ_FOPS(seq_ae_gain_cap_off_raw_read);
+FTHD_DEBUGFS_SEQ_FOPS(seq_ae_integration_time_max_raw_read);
+FTHD_DEBUGFS_SEQ_FOPS(seq_ae_sensor_integration_time_min_raw_read);
+FTHD_DEBUGFS_SEQ_FOPS(seq_ae_sensor_integration_time_max_raw_read);
+FTHD_DEBUGFS_SEQ_FOPS(seq_ae_metering_mode_raw_read);
 
 static const struct file_operations fops_debug = {
 	.write = fthd_store_debug,
@@ -361,7 +770,43 @@ int fthd_debugfs_init(struct fthd_private *dev_priv)
 	debugfs_create_file("channel_debug", 0400, d, dev_priv,
 			    &seq_channel_debug_read_fops);
 	debugfs_create_file("sensor_temperature_raw", 0400, d, dev_priv,
-			    &seq_sensor_temperature_read_fops);
+			    &seq_sensor_temperature_raw_read_fops);
+	debugfs_create_file("awb_cct_raw", 0400, d, dev_priv,
+			    &seq_awb_cct_raw_read_fops);
+	debugfs_create_file("ae_bias_raw", 0400, d, dev_priv,
+			    &seq_ae_bias_raw_read_fops);
+	debugfs_create_file("ae_gain_cap_raw", 0400, d, dev_priv,
+			    &seq_ae_gain_cap_raw_read_fops);
+	debugfs_create_file("ae_gain_cap_min_raw", 0400, d, dev_priv,
+			    &seq_ae_gain_cap_min_raw_read_fops);
+	debugfs_create_file("ae_gain_cap_max_with_exp_raw", 0400, d, dev_priv,
+			    &seq_ae_gain_cap_max_with_exp_raw_read_fops);
+	debugfs_create_file("ae_gain_cap_off_raw", 0400, d, dev_priv,
+			    &seq_ae_gain_cap_off_raw_read_fops);
+	debugfs_create_file("ae_integration_time_max_raw", 0400, d, dev_priv,
+			    &seq_ae_integration_time_max_raw_read_fops);
+	debugfs_create_file("ae_sensor_integration_time_min_raw", 0400, d,
+			    dev_priv,
+			    &seq_ae_sensor_integration_time_min_raw_read_fops);
+	debugfs_create_file("ae_sensor_integration_time_max_raw", 0400, d,
+			    dev_priv,
+			    &seq_ae_sensor_integration_time_max_raw_read_fops);
+	debugfs_create_file("ae_metering_mode_raw", 0400, d, dev_priv,
+			    &seq_ae_metering_mode_raw_read_fops);
+	debugfs_create_file("roundtrip_ae_bias", 0200, d, dev_priv,
+			    &roundtrip_ae_bias_fops);
+	debugfs_create_file("roundtrip_ae_metering_mode", 0200, d, dev_priv,
+			    &roundtrip_ae_metering_mode_fops);
+	debugfs_create_file("roundtrip_ae_integration_time_max", 0200, d,
+			    dev_priv, &roundtrip_ae_integration_time_max_fops);
+	debugfs_create_file("roundtrip_ae_gain_cap", 0200, d, dev_priv,
+			    &roundtrip_ae_gain_cap_fops);
+	debugfs_create_file("roundtrip_ae_gain_cap_min", 0200, d, dev_priv,
+			    &roundtrip_ae_gain_cap_min_fops);
+	debugfs_create_file("test_ae_metering_mode", 0200, d, dev_priv,
+			    &test_ae_metering_mode_fops);
+	debugfs_create_file("test_ae_metering_mode_restart", 0200, d, dev_priv,
+			    &test_ae_metering_mode_restart_fops);
 	debugfs_create_file("debug", 0600, d, dev_priv, &fops_debug);
 	dev_priv->debugfs = d;
 	fthd_debugfs_users++;

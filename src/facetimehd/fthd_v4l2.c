@@ -67,13 +67,7 @@ static int fthd_buffer_queue_setup(
 	struct fthd_private *dev_priv = vb2_get_drv_priv(vq);
 	struct v4l2_pix_format *cur_fmt = &dev_priv->fmt.fmt;
 
-	/* Always exactly one vb2 plane, whatever dev_priv->fmt.planes says.
-	 * That field counts the planes the *ISP* is given addresses for, and a
-	 * semi-planar format keeps its chroma plane inside this same buffer at
-	 * a fixed offset - which is precisely what a single-planar NV16 is.
-	 * Userspace sees one buffer either way.  Returning fmt.planes here
-	 * would have asked a V4L2_BUF_TYPE_VIDEO_CAPTURE queue for two planes,
-	 * which it cannot have. */
+	/* This is a single-planar VIDEO_CAPTURE queue. */
 	if (*nplanes) {
 		if (*nplanes != 1)
 			return -EINVAL;
@@ -302,19 +296,9 @@ static int fthd_buffer_prepare(struct vb2_buffer *vb)
 	dma_list->desc[0].count = 1;
 	dma_list->desc[0].pool = 0x02;
 
-	/* iommu_allocate_sgtable() walks the scatterlist into one contiguous
-	 * run of S2 IOVA pages, so the chroma plane of a semi-planar format is
-	 * reachable as a byte offset from the start of the same mapping rather
-	 * than needing a mapping of its own.  The offset stays far below the
-	 * 0xc0000000 tag: the IOVA window is 4096 pages, so the whole address
-	 * fits in the low 24 bits and the addition cannot carry into it. */
 	base = (ctx->plane[0]->offset << PAGE_SHIFT) |
 		ctx->plane[0]->page_offset | 0xc0000000;
 	dma_list->desc[0].addr0 = base;
-
-	if (dev_priv->fmt.planes >= 2)
-		dma_list->desc[0].addr1 = base + dev_priv->fmt.fmt.bytesperline *
-						 dev_priv->fmt.fmt.height;
 
 	spin_lock_irqsave(&dev_priv->buffer_lock, flags);
 	ctx->tag = ++dev_priv->buffer_tag;
@@ -964,25 +948,10 @@ static int fthd_v4l2_ioctl_querycap(struct file *filp, void *priv,
 	return 0;
 }
 
-/*
- * NV16 is a single-planar format here: V4L2 defines it as one buffer holding a
- * luma plane followed by an interleaved CbCr plane, so it needs no multiplanar
- * queue - only a second address handed to the ISP, which fthd_buffer_prepare()
- * derives from the one mapping.
- *
- * NV12 is deliberately absent.  The ISP's own output-format codes are known
- * only for the three formats below (NV16 is 0, YUYV 1, YVYU 2); nothing
- * identifies a 4:2:0 code.  Guessing one is not like guessing a command
- * payload, where a wrong value simply gets refused: a buffer sized for 4:2:0
- * at 1.5 bytes per pixel while the ISP still writes 4:2:2 at 2 would have the
- * hardware DMA past the end of the mapping.  It stays out until real hardware
- * can confirm a code.
- */
 static bool fthd_format_supported(u32 pixelformat)
 {
 	return pixelformat == V4L2_PIX_FMT_YUYV ||
-	       pixelformat == V4L2_PIX_FMT_YVYU ||
-	       pixelformat == V4L2_PIX_FMT_NV16;
+	       pixelformat == V4L2_PIX_FMT_YVYU;
 }
 
 static int fthd_v4l2_ioctl_enum_fmt_vid_cap(struct file *filp, void *priv,
@@ -998,10 +967,6 @@ static int fthd_v4l2_ioctl_enum_fmt_vid_cap(struct file *filp, void *priv,
 	case 1:
 		fmt->pixelformat = V4L2_PIX_FMT_YVYU;
 		desc = "YVYU";
-		break;
-	case 2:
-		fmt->pixelformat = V4L2_PIX_FMT_NV16;
-		desc = "NV16";
 		break;
 	default:
 		return -EINVAL;
@@ -1041,21 +1006,8 @@ static int fthd_v4l2_adjust_format(struct fthd_private *dev_priv,
 	if (pix->width > max_w)
 		pix->width = round_down(max_w, 8);
 
-	switch (pix->pixelformat) {
-	case V4L2_PIX_FMT_NV16:
-		/* Semi-planar 4:2:2: a width*height luma plane followed by an
-		 * interleaved CbCr plane of the same size.  Both live in the
-		 * one buffer, so sizeimage covers both. */
-		pix->bytesperline = pix->width;
-		pix->sizeimage = pix->bytesperline * pix->height * 2;
-		break;
-	case V4L2_PIX_FMT_YUYV:
-	case V4L2_PIX_FMT_YVYU:
-	default:
-		pix->bytesperline = pix->width * 2;
-		pix->sizeimage = pix->bytesperline * pix->height;
-		break;
-	}
+	pix->bytesperline = pix->width * 2;
+	pix->sizeimage = pix->bytesperline * pix->height;
 
 	return 0;
 }
@@ -1107,16 +1059,6 @@ static int fthd_v4l2_ioctl_s_fmt_vid_cap(struct file *filp, void *priv,
 		 fmt->fmt.pix.pixelformat >> 16, fmt->fmt.pix.pixelformat >> 24);
 
 	dev_priv->fmt.fmt = fmt->fmt.pix;
-
-	switch (fmt->fmt.pix.pixelformat) {
-	case V4L2_PIX_FMT_NV16:
-		dev_priv->fmt.planes = 2;
-		break;
-	case V4L2_PIX_FMT_YUYV:
-	case V4L2_PIX_FMT_YVYU:
-		dev_priv->fmt.planes = 1;
-		break;
-	}
 
 	/* The crop may no longer be large enough for the new output size, and
 	 * the ISP must never be asked to upscale.  Growing it here is the
@@ -1461,101 +1403,6 @@ static const struct v4l2_ioctl_ops fthd_ioctl_ops = {
 	.vidioc_log_status      = v4l2_ctrl_log_status,
 };
 
-/*
- * Auto-cluster member indices.  v4l2_ctrl_auto_cluster() hands s_ctrl the
- * leader whenever any member changes, so the manual values are read out of
- * ctrl->cluster[] rather than from ctrl->val.
- */
-enum {
-	FTHD_EXP_AUTO,
-	FTHD_EXP_ABSOLUTE,
-	FTHD_EXP_GAIN,
-	FTHD_EXP_NUM,
-};
-
-enum {
-	FTHD_WB_AUTO,
-	FTHD_WB_TEMPERATURE,
-	FTHD_WB_NUM,
-};
-
-/* Driver-private control IDs; see the fthd_ctrl_config definitions below for
- * why these two are not mapped onto standard CIDs. */
-#define FTHD_CID_NOISE_REDUCTION    (V4L2_CID_USER_BASE | 0x1001)
-#define FTHD_CID_CHROMA_SUPPRESSION (V4L2_CID_USER_BASE | 0x1002)
-
-/* Exposure compensation offered as +/-2 EV in thirds, in milli-EV. */
-static const s64 fthd_exposure_bias_menu[] = {
-	-2000, -1667, -1333, -1000, -667, -333,
-	0,
-	333, 667, 1000, 1333, 1667, 2000,
-};
-#define FTHD_EXPOSURE_BIAS_DEF 6
-
-/*
- * The sensor's own pattern generator, which is worth having because it is the
- * one way to tell "the sensor or firmware is not producing frames" apart from
- * "the ring, the IOMMU mapping or buffer return is broken" without needing a
- * lit room or anything in front of the camera.  Only "Disabled" is known to be
- * accepted; the firmware refuses a pattern index it does not implement, which
- * surfaces as an error from S_CTRL.
- */
-static const char * const fthd_test_pattern_menu[] = {
-	"Disabled",
-	"Sensor Pattern 1",
-	"Sensor Pattern 2",
-	"Sensor Pattern 3",
-};
-
-/*
- * Selecting V4L2_EXPOSURE_MANUAL used to be a dead end: the menu offered it,
- * but nothing existed to set once AE was stopped, so it just froze the
- * exposure wherever AE happened to leave it.  Integration time and gain are
- * separate ISP state, so replaying both is order-independent.
- */
-static int fthd_set_exposure(struct fthd_private *dev_priv, struct v4l2_ctrl *ctrl)
-{
-	bool manual = ctrl->val == V4L2_EXPOSURE_MANUAL;
-	int ret;
-
-	ret = fthd_isp_cmd_channel_ae(dev_priv, 0, !manual);
-	if (ret || !manual)
-		return ret;
-
-	/* V4L2_CID_EXPOSURE_ABSOLUTE counts in 100us units. */
-	ret = fthd_isp_cmd_channel_ae_integration_time_set(dev_priv, 0,
-			ctrl->cluster[FTHD_EXP_ABSOLUTE]->val * 100);
-	if (ret)
-		return ret;
-
-	return fthd_isp_cmd_channel_ae_gain_set(dev_priv, 0,
-			ctrl->cluster[FTHD_EXP_GAIN]->val);
-}
-
-/*
- * The same dead end on the white-balance side: AUTO_WHITE_BALANCE could be
- * switched off with nothing to set afterwards.
- *
- * Only the colour temperature is offered, deliberately.  The ISP also has
- * CISP_CMD_CH_AWB_1ST_GAIN_MANUAL, but the CCT and the per-channel gains are
- * two ways of writing the same white-balance state - exposing both would put
- * two controls in this cluster whose replay order decides which one wins, and
- * v4l2_ctrl_handler_setup() replays every member on each runtime-PM cycle.
- * One unambiguous control beats two that quietly fight.
- */
-static int fthd_set_white_balance(struct fthd_private *dev_priv, struct v4l2_ctrl *ctrl)
-{
-	bool manual = !ctrl->val;
-	int ret;
-
-	ret = fthd_isp_cmd_channel_awb(dev_priv, 0, !manual);
-	if (ret || !manual)
-		return ret;
-
-	return fthd_isp_cmd_channel_awb_cct_manual(dev_priv, 0,
-			ctrl->cluster[FTHD_WB_TEMPERATURE]->val);
-}
-
 static int fthd_s_ctrl(struct v4l2_ctrl *ctrl)
 {
 	struct fthd_private *dev_priv = container_of(ctrl->handler, struct fthd_private, v4l2_ctrl_handler);
@@ -1585,9 +1432,7 @@ static int fthd_s_ctrl(struct v4l2_ctrl *ctrl)
 		ret = fthd_isp_cmd_channel_hue_set(dev_priv, 0, ctrl->val);
 		break;
 	case V4L2_CID_AUTO_WHITE_BALANCE:
-		/* This fell through to default: without a break, which happened
-		 * to preserve ret only because default: does nothing. */
-		ret = fthd_set_white_balance(dev_priv, ctrl);
+		ret = fthd_isp_cmd_channel_awb(dev_priv, 0, ctrl->val);
 		break;
 	case V4L2_CID_POWER_LINE_FREQUENCY:
 		ret = fthd_isp_cmd_channel_ae_flicker_freq_set(dev_priv, 0,
@@ -1595,37 +1440,8 @@ static int fthd_s_ctrl(struct v4l2_ctrl *ctrl)
 				ctrl->val == V4L2_CID_POWER_LINE_FREQUENCY_60HZ ? 60 : 0);
 		break;
 	case V4L2_CID_EXPOSURE_AUTO:
-		ret = fthd_set_exposure(dev_priv, ctrl);
-		break;
-	case V4L2_CID_AUTO_EXPOSURE_BIAS:
-		/* An integer menu: ctrl->val is the menu index, and the value
-		 * the user actually asked for is qmenu_int[] at that index. */
-		ret = fthd_isp_cmd_channel_ae_bias_set(dev_priv, 0,
-				ctrl->qmenu_int[ctrl->val]);
-		break;
-	case V4L2_CID_EXPOSURE_METERING:
-		/* The V4L2 menu and the ISP's mode numbering coincide, and
-		 * MATRIX is 3 - the value fthd_start_channel() used to pin. */
-		ret = fthd_isp_cmd_channel_ae_metering_mode_set(dev_priv, 0, ctrl->val);
-		break;
-	case V4L2_CID_SHARPNESS:
-		ret = fthd_isp_cmd_channel_sharpness_set(dev_priv, 0, ctrl->val);
-		break;
-	case V4L2_CID_TEST_PATTERN:
-		ret = fthd_isp_cmd_channel_test_pattern_config(dev_priv, 0, ctrl->val);
-		break;
-	case V4L2_CID_BACKLIGHT_COMPENSATION:
-		/* Dynamic range compression: fthd_start_channel() turns the DRC
-		 * block on unconditionally, and this is how hard it pulls the
-		 * shadows up.  That is what backlight compensation means on a
-		 * camera with no backlight-specific hardware of its own. */
-		ret = fthd_isp_cmd_channel_drc_strength_set(dev_priv, 0, ctrl->val);
-		break;
-	case FTHD_CID_NOISE_REDUCTION:
-		ret = fthd_isp_cmd_channel_noise_reduction_set(dev_priv, 0, ctrl->val);
-		break;
-	case FTHD_CID_CHROMA_SUPPRESSION:
-		ret = fthd_isp_cmd_channel_chroma_suppression_set(dev_priv, 0, ctrl->val);
+		ret = fthd_isp_cmd_channel_ae(dev_priv, 0,
+				ctrl->val == V4L2_EXPOSURE_AUTO);
 		break;
 	default:
 		return -EINVAL;
@@ -1645,37 +1461,6 @@ static const struct v4l2_ctrl_ops fthd_ctrl_ops = {
 	.s_ctrl = fthd_s_ctrl,
 };
 
-/*
- * Both noise-reduction blocks are driver-private controls because V4L2 has no
- * standard CID for either.  Inventing a meaning for a standard control that
- * does not have one - V4L2_CID_IMAGE_STABILIZATION was the tempting mistake
- * here - would make an application asking for stabilisation silently get
- * denoising instead, so they take user-base IDs and say what they are in their
- * names.  Defaults are mid-scale, which is the same convention the ISP's other
- * 0..255 knobs use and leaves out-of-the-box behaviour to the firmware.
- */
-static const struct v4l2_ctrl_config fthd_ctrl_noise_reduction = {
-	.ops  = &fthd_ctrl_ops,
-	.id   = FTHD_CID_NOISE_REDUCTION,
-	.name = "Noise Reduction",
-	.type = V4L2_CTRL_TYPE_INTEGER,
-	.min  = 0,
-	.max  = 0xff,
-	.step = 1,
-	.def  = 0x80,
-};
-
-static const struct v4l2_ctrl_config fthd_ctrl_chroma_suppression = {
-	.ops  = &fthd_ctrl_ops,
-	.id   = FTHD_CID_CHROMA_SUPPRESSION,
-	.name = "Chroma Noise Suppression",
-	.type = V4L2_CTRL_TYPE_INTEGER,
-	.min  = 0,
-	.max  = 0xff,
-	.step = 1,
-	.def  = 0x80,
-};
-
 static void fthd_video_device_release(struct video_device *vdev)
 {
 	struct fthd_private *dev_priv = video_get_drvdata(vdev);
@@ -1687,8 +1472,6 @@ static void fthd_video_device_release(struct video_device *vdev)
 int fthd_v4l2_register(struct fthd_private *dev_priv)
 {
 	struct v4l2_device *v4l2_dev = &dev_priv->v4l2_dev;
-	struct v4l2_ctrl *exp_cluster[FTHD_EXP_NUM];
-	struct v4l2_ctrl *wb_cluster[FTHD_WB_NUM];
 	struct video_device *vdev;
 	struct vb2_queue *q;
 	int ret;
@@ -1740,7 +1523,7 @@ int fthd_v4l2_register(struct fthd_private *dev_priv)
 	if (ret)
 		goto fail_vdev_alloc;
 
-	v4l2_ctrl_handler_init(&dev_priv->v4l2_ctrl_handler, 17);
+	v4l2_ctrl_handler_init(&dev_priv->v4l2_ctrl_handler, 7);
 	v4l2_ctrl_new_std(&dev_priv->v4l2_ctrl_handler, &fthd_ctrl_ops,
 			  V4L2_CID_BRIGHTNESS, 0, 0xff, 1, 0x80);
 	v4l2_ctrl_new_std(&dev_priv->v4l2_ctrl_handler, &fthd_ctrl_ops,
@@ -1750,63 +1533,17 @@ int fthd_v4l2_register(struct fthd_private *dev_priv)
 	v4l2_ctrl_new_std(&dev_priv->v4l2_ctrl_handler, &fthd_ctrl_ops,
 			  V4L2_CID_HUE, 0, 0xff, 1, 0x80);
 	v4l2_ctrl_new_std(&dev_priv->v4l2_ctrl_handler, &fthd_ctrl_ops,
-			  V4L2_CID_SHARPNESS, 0, 0xff, 1, 0x80);
+			  V4L2_CID_AUTO_WHITE_BALANCE, 0, 1, 1, 1);
 	/* Anti-banding.  Defaults to disabled so the ISP keeps the behaviour it
 	 * has always had unless the user asks for their mains frequency. */
 	v4l2_ctrl_new_std_menu(&dev_priv->v4l2_ctrl_handler, &fthd_ctrl_ops,
 			       V4L2_CID_POWER_LINE_FREQUENCY,
 			       V4L2_CID_POWER_LINE_FREQUENCY_60HZ, 0,
 			       V4L2_CID_POWER_LINE_FREQUENCY_DISABLED);
-	/* Defaults to the mode fthd_start_channel() used to pin unconditionally,
-	 * so the out-of-the-box metering behaviour is unchanged. */
-	v4l2_ctrl_new_std_menu(&dev_priv->v4l2_ctrl_handler, &fthd_ctrl_ops,
-			       V4L2_CID_EXPOSURE_METERING,
-			       V4L2_EXPOSURE_METERING_MATRIX, 0,
-			       V4L2_EXPOSURE_METERING_MATRIX);
-	/* Exposure compensation, which unlike the manual cluster below stays
-	 * useful with AE running - the fix for being backlit. */
-	v4l2_ctrl_new_int_menu(&dev_priv->v4l2_ctrl_handler, &fthd_ctrl_ops,
-			       V4L2_CID_AUTO_EXPOSURE_BIAS,
-			       ARRAY_SIZE(fthd_exposure_bias_menu) - 1,
-			       FTHD_EXPOSURE_BIAS_DEF, fthd_exposure_bias_menu);
-	v4l2_ctrl_new_std_menu_items(&dev_priv->v4l2_ctrl_handler, &fthd_ctrl_ops,
-				     V4L2_CID_TEST_PATTERN,
-				     ARRAY_SIZE(fthd_test_pattern_menu) - 1, 0, 0,
-				     fthd_test_pattern_menu);
-	/* DRC strength.  The block is already started by fthd_start_channel();
-	 * this is how hard it works. */
-	v4l2_ctrl_new_std(&dev_priv->v4l2_ctrl_handler, &fthd_ctrl_ops,
-			  V4L2_CID_BACKLIGHT_COMPENSATION, 0, 0xff, 1, 0x80);
-	v4l2_ctrl_new_custom(&dev_priv->v4l2_ctrl_handler,
-			     &fthd_ctrl_noise_reduction, NULL);
-	v4l2_ctrl_new_custom(&dev_priv->v4l2_ctrl_handler,
-			     &fthd_ctrl_chroma_suppression, NULL);
-
-	/* SHUTTER_PRIORITY and APERTURE_PRIORITY are not offered: this sensor
-	 * has neither a controllable shutter nor an aperture, only AE
-	 * start/stop. */
-	exp_cluster[FTHD_EXP_AUTO] =
-		v4l2_ctrl_new_std_menu(&dev_priv->v4l2_ctrl_handler, &fthd_ctrl_ops,
-				       V4L2_CID_EXPOSURE_AUTO,
-				       V4L2_EXPOSURE_MANUAL, 0,
-				       V4L2_EXPOSURE_AUTO);
-	/* One frame at FTHD_FPS is the longest integration the sensor can be
-	 * given, and V4L2_CID_EXPOSURE_ABSOLUTE counts in 100us units. */
-	exp_cluster[FTHD_EXP_ABSOLUTE] =
-		v4l2_ctrl_new_std(&dev_priv->v4l2_ctrl_handler, &fthd_ctrl_ops,
-				  V4L2_CID_EXPOSURE_ABSOLUTE, 1,
-				  10000 / FTHD_FPS, 1, 100);
-	exp_cluster[FTHD_EXP_GAIN] =
-		v4l2_ctrl_new_std(&dev_priv->v4l2_ctrl_handler, &fthd_ctrl_ops,
-				  V4L2_CID_GAIN, 0, 0xff, 1, 0);
-
-	wb_cluster[FTHD_WB_AUTO] =
-		v4l2_ctrl_new_std(&dev_priv->v4l2_ctrl_handler, &fthd_ctrl_ops,
-				  V4L2_CID_AUTO_WHITE_BALANCE, 0, 1, 1, 1);
-	wb_cluster[FTHD_WB_TEMPERATURE] =
-		v4l2_ctrl_new_std(&dev_priv->v4l2_ctrl_handler, &fthd_ctrl_ops,
-				  V4L2_CID_WHITE_BALANCE_TEMPERATURE,
-				  2000, 10000, 50, 5000);
+	v4l2_ctrl_new_std_menu(&dev_priv->v4l2_ctrl_handler,
+			       &fthd_ctrl_ops, V4L2_CID_EXPOSURE_AUTO,
+			       V4L2_EXPOSURE_MANUAL, 0,
+			       V4L2_EXPOSURE_AUTO);
 
 	if (dev_priv->v4l2_ctrl_handler.error) {
 		dev_err(&dev_priv->pdev->dev, "failed to setup control handlers\n");
@@ -1815,13 +1552,6 @@ int fthd_v4l2_register(struct fthd_private *dev_priv)
 		goto fail_queue;
 	}
 
-	/* Only safe once the error check above has confirmed every member was
-	 * actually created.  The manual controls are marked inactive while
-	 * their leader is in auto, which is what stops an application from
-	 * setting an exposure the ISP is about to overwrite. */
-	v4l2_ctrl_auto_cluster(FTHD_EXP_NUM, &exp_cluster[FTHD_EXP_AUTO],
-			       V4L2_EXPOSURE_MANUAL, false);
-	v4l2_ctrl_auto_cluster(FTHD_WB_NUM, &wb_cluster[FTHD_WB_AUTO], 0, false);
 	vdev->v4l2_dev = v4l2_dev;
 	strscpy(vdev->name, "Apple Facetime HD", sizeof(vdev->name));
 	vdev->vfl_dir = VFL_DIR_RX;
@@ -1839,7 +1569,6 @@ int fthd_v4l2_register(struct fthd_private *dev_priv)
 	dev_priv->fmt.fmt.width = dev_priv->sensor_width ? : FTHD_MAX_WIDTH;
 	dev_priv->fmt.fmt.height = dev_priv->sensor_height ? : FTHD_MAX_HEIGHT;
 	dev_priv->fmt.fmt.pixelformat = V4L2_PIX_FMT_YUYV;
-	dev_priv->fmt.planes = 1;
 	fthd_v4l2_adjust_format(dev_priv, &dev_priv->fmt.fmt);
 	/* After the format, because the crop's lower bound is the output size.
 	 * G_SELECTION is answerable from the first open either way; the channel

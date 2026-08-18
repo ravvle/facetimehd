@@ -48,7 +48,7 @@ confirm "Continue?" || { info "Cancelled."; exit 0; }
 # ---------------------------------------------------------------------------
 
 step "Unloading the kernel module"
-if lsmod | grep -q "^${MODULE_NAME}\b"; then
+if module_is_loaded "$MODULE_NAME"; then
     if modprobe -r "$MODULE_NAME" 2>/dev/null; then
         ok "unloaded"
     else
@@ -128,7 +128,7 @@ find /lib/modules -name 'bcwc_pcie.ko*' -delete 2>/dev/null || true
 # Written by DKMS from upstream's MODULES_CONF ("blacklist bdc_pci"); dkms
 # remove usually takes it with it, but not if the registration was already gone.
 rm -f -- "/etc/modprobe.d/${MODULE_NAME}-dkms.conf"
-# Written only by 'install.sh --runtime-pm off'. Removed here because it names a
+# Written only by an explicit install.sh --runtime-pm mode. Removed here because it names a
 # module that is going away: left behind, it would apply to a future reinstall
 # that never asked for it.
 if [ -f "/etc/modprobe.d/${MODULE_NAME}-runtime-pm.conf" ]; then
@@ -187,7 +187,7 @@ else
     check ok "no firmware"
 fi
 
-if lsmod | grep -q "^${MODULE_NAME}\b"; then
+if module_is_loaded "$MODULE_NAME"; then
     check bad "module still loaded (reboot to clear)"
 else
     check ok "module not loaded"

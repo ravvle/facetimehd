@@ -123,19 +123,17 @@ check_documented_options "$DIAG"
 step "install.sh --status"
 # ---------------------------------------------------------------------------
 #
-# --status must run to completion as a normal user on a machine with no camera,
-# no DKMS and no firmware, and say so rather than dying. Exit 1 is the correct
-# answer here - nothing is installed - so only a crash (or 0) is a failure.
+# --status must run to completion as a normal user and report what it sees.
+# CI normally has no installation and returns 1; a developer machine may have a
+# complete installation and return 0. Anything greater than 1 is a crash.
 
 status_rc=0
 status_out="$("$INSTALL" --status 2>&1)" || status_rc=$?
-if [ "$status_rc" -eq 1 ]; then
-    result ok "--status reports an incomplete install with exit 1"
-elif [ "$status_rc" -gt 1 ]; then
+if [ "$status_rc" -le 1 ]; then
+    result ok "--status completes with a valid state result (exit $status_rc)"
+else
     result bad "--status crashed (exit $status_rc)"
     printf '%s\n' "$status_out" | sed 's/^/      | /' | head -20
-else
-    result bad "--status returned 0 on a machine with nothing installed"
 fi
 
 for want in 'System' 'Driver' 'Firmware' 'Secure Boot'; do
@@ -145,6 +143,16 @@ for want in 'System' 'Driver' 'Firmware' 'Secure Boot'; do
         result bad "--status is missing its '$want' section"
     fi
 done
+
+# Under `set -o pipefail`, `lsmod | grep -q` can misreport a loaded module when
+# grep's early exit gives lsmod SIGPIPE. All lifecycle decisions must use the
+# sysfs helper instead.
+if grep -q '^module_is_loaded()' "$REPO_DIR/scripts/lib/common.sh" &&
+   ! grep -q 'lsmod.*grep -q' "$INSTALL" "$UNINSTALL"; then
+    result ok "module state checks are pipefail-safe"
+else
+    result bad "module state checks can fail from an lsmod SIGPIPE"
+fi
 
 expect_status 1 "install.sh --runtime-pm takes only on/off" \
     "$INSTALL" --runtime-pm sideways
@@ -279,6 +287,20 @@ else
     result bad "fingerprint changed for a DOWNSTREAM.md edit"
 fi
 
+# The source tree can be edited while a long-running root install is starting.
+# Version and contents must both come from the completed snapshot, never from
+# two observations of the live tree.
+snapshot_line="$(grep -nF "prepare_driver_source \"\$DRIVER_SRC\" \"\$SRC_STAGE\"" \
+                 "$INSTALL" | head -1 | cut -d: -f1)"
+staged_hash_line="$(grep -nF "driver_source_fingerprint \"\$SRC_STAGE\"" \
+                    "$INSTALL" | head -1 | cut -d: -f1)"
+if [ -n "$snapshot_line" ] && [ -n "$staged_hash_line" ] &&
+   [ "$snapshot_line" -lt "$staged_hash_line" ]; then
+    result ok "installer fingerprints the immutable source snapshot"
+else
+    result bad "installer can label staged contents with a live-tree fingerprint"
+fi
+
 # ---------------------------------------------------------------------------
 step "dkms.conf agrees with the Makefile"
 # ---------------------------------------------------------------------------
@@ -313,12 +335,180 @@ unbuilt=0
 objs="$(sed -n 's/^facetimehd-objs *:= *//p' "$REPO_DIR/src/facetimehd/Makefile")"
 for src in "$REPO_DIR"/src/facetimehd/*.c; do
     base="$(basename "$src" .c)"
+    # Kbuild emits these beside the real sources. They are build products, not
+    # translation units that belong in facetimehd-objs.
+    case "$base" in
+        *.mod|*.module-common) continue ;;
+    esac
     case " $objs " in
         *" $base.o "*) ;;
         *) result bad "$base.c is not in facetimehd-objs"; unbuilt=1 ;;
     esac
 done
 [ "$unbuilt" -eq 0 ] && result ok "every source file is in facetimehd-objs"
+
+# ---------------------------------------------------------------------------
+step "Hardware-safety defaults"
+# ---------------------------------------------------------------------------
+# Firmware disassembly proved that several inferred payloads were malformed.
+# They must be absent, not merely hidden behind a module parameter that can
+# turn an ordinary STREAMON into a whole-machine lockup.
+
+drv="$REPO_DIR/src/facetimehd/fthd_drv.c"
+if ! grep -Rq 'module_param(\(experimental_controls\|experimental_formats\|hwmon\)' \
+        "$REPO_DIR/src/facetimehd"; then
+    result ok "unsafe firmware interfaces have no module-parameter entry point"
+else
+    result bad "a removed firmware interface is still reachable"
+fi
+
+debugfs="$REPO_DIR/src/facetimehd/fthd_debugfs.c"
+if grep -q 'if (!dev_priv->channel_running)' "$debugfs" &&
+   grep -q 'debugfs_create_file("sensor_temperature_raw", 0400' "$debugfs" &&
+   grep -q 'debugfs_create_file("ae_metering_mode_raw", 0400' "$debugfs" &&
+   ! grep -q 'CISP_CMD_CH_\(SHARPNESS\|NOISE_REDUCTION\|CHROMA_SUPPRESSION\|DRC\)_GET' \
+        "$REPO_DIR/src/facetimehd/fthd_isp.c"; then
+    result ok "raw firmware GETs are root-only, stream-gated, and whitelisted"
+else
+    result bad "firmware readbacks bypass their stream or opcode safety boundary"
+fi
+
+if grep -q 'strcmp(strim(buf), "same")' "$debugfs" &&
+   grep -q 'debugfs_create_file("roundtrip_ae_bias", 0200' "$debugfs" &&
+   grep -q 'debugfs_create_file("roundtrip_ae_gain_cap_min", 0200' "$debugfs" &&
+   grep -q 'fthd_firmware_roundtrip(dev_priv, roundtrip)' "$debugfs" &&
+   grep -q 'ROUNDTRIPS=.*ae_bias.*ae_gain_cap_min' \
+        "$REPO_DIR/tests/hw-validate.sh" &&
+   grep -q 'readback-profile roundtrips' "$REPO_DIR/tests/hw-validate.sh" &&
+   grep -q 'profile_snapshot bright30' \
+        "$REPO_DIR/tests/hw-validate.sh"; then
+    result ok "round-trip setters are same-value-only, root-only, stream-gated, and opt-in"
+else
+    result bad "round-trip validation exposes values or bypasses its safety harness"
+fi
+
+if grep -q 'debugfs_create_file("test_ae_metering_mode", 0200' "$debugfs" &&
+   grep -q 'debugfs_create_file("test_ae_metering_mode_restart", 0200' "$debugfs" &&
+   grep -q 'strcmp(token, "mode0")' "$debugfs" &&
+   grep -q 'strcmp(token, "mode1")' "$debugfs" &&
+   grep -q 'strcmp(token, "mode2")' "$debugfs" &&
+   grep -q 'strcmp(token, "mode3")' "$debugfs" &&
+   grep -q 'readback != requested' "$debugfs" &&
+   grep -q 'if (restart_ae)' "$debugfs" &&
+   grep -q 'METERING_RESTART_AE' "$REPO_DIR/tests/hw-validate.sh" &&
+   grep -q 'if wants metering-modes' "$REPO_DIR/tests/hw-validate.sh" &&
+   grep -q 'restored original mode.*before STREAMOFF' \
+        "$REPO_DIR/tests/hw-validate.sh" &&
+   grep -qF "metering_sleep_count=\$(( METERING_SETTLE_FRAMES +" \
+        "$REPO_DIR/tests/hw-validate.sh" &&
+   grep -q 's >= o + 20 && s < 235' \
+        "$REPO_DIR/tests/hw-validate.sh" &&
+   ! grep -q 'kstrto.*metering' "$debugfs"; then
+    result ok "metering mutation is four-token-only, verified, restored, and opt-in"
+else
+    result bad "metering mutation bypasses its fixed-value or restoration boundary"
+fi
+
+if ! grep -q 'V4L2_CID_AUTO_EXPOSURE_BIAS\|V4L2_CID_WHITE_BALANCE_TEMPERATURE\|V4L2_CID_TEST_PATTERN\|FTHD_CID_NOISE_REDUCTION\|FTHD_CID_CHROMA_SUPPRESSION' \
+        "$REPO_DIR/src/facetimehd/fthd_v4l2.c"; then
+    result ok "malformed or semantically unknown controls are not registered"
+else
+    result bad "an unvalidated firmware control is still registered"
+fi
+
+if ! grep -q 'V4L2_PIX_FMT_NV16' "$REPO_DIR/src/facetimehd/fthd_v4l2.c" &&
+   ! grep -q 'V4L2_PIX_FMT_NV16' "$REPO_DIR/src/facetimehd/fthd_isp.c"; then
+    result ok "unvalidated NV16 is not advertised or selectable"
+else
+    result bad "unvalidated NV16 remains reachable"
+fi
+
+# Once a command has entered the firmware ring it cannot be cancelled. A
+# signal-interrupted STOP previously let STREAMOFF unmap live DMA buffers.
+if grep -q 'wait_event_timeout(chan->wq' \
+        "$REPO_DIR/src/facetimehd/fthd_ringbuf.c" &&
+   ! grep -q 'wait_event_interruptible_timeout(chan->wq' \
+        "$REPO_DIR/src/facetimehd/fthd_ringbuf.c" &&
+   [ "$(grep -c 'wake_up(&chan->wq)' \
+         "$REPO_DIR/src/facetimehd/fthd_drv.c")" -eq 3 ] &&
+   ! grep -q 'wake_up_interruptible(&chan->wq)' \
+         "$REPO_DIR/src/facetimehd/fthd_drv.c" &&
+   grep -q 'suspend.post_faults' "$REPO_DIR/tests/hw-validate.sh"; then
+    result ok "firmware waits and suspend validation protect live DMA mappings"
+else
+    result bad "a signal or hidden suspend fault can release live DMA mappings"
+fi
+
+# Runtime PM performs a full teardown after probe without any userspace action.
+# Keep that transition opt-in so an omitted initramfs option means off, not on.
+if grep -q '^static bool runtime_pm;$' "$drv" &&
+   grep -q '^module_param(runtime_pm, bool, 0444);$' "$drv" &&
+   grep -q '^[[:space:]]*if (runtime_pm)$' "$drv"; then
+    result ok "runtime PM defaults off and is explicitly probe-gated"
+else
+    result bad "runtime PM is not safely opt-in"
+fi
+
+# The full installer enables the now hardware-tested runtime path by default,
+# while both choices remain explicit and reach early initramfs loading.
+if grep -q '^RUNTIME_PM=on$' "$INSTALL" &&
+   grep -qF "options \$MODULE_NAME runtime_pm=0" "$INSTALL" &&
+   grep -qF "options \$MODULE_NAME runtime_pm=1" "$INSTALL" &&
+   grep -qF "if [ \"\$RUNTIME_PM\" != keep ]; then" "$INSTALL"; then
+    result ok "installer enables runtime PM by default and preserves its recovery opt-out"
+else
+    result bad "installer runtime-PM defaults or recovery mode are inconsistent"
+fi
+
+if grep -q 'confirm_yes "Install the camera driver and firmware?' "$REPO_DIR/setup.sh" &&
+   grep -q 'confirm_yes "Install fan support' "$REPO_DIR/setup.sh" &&
+   grep -q 'confirm_yes "  Download and extract the firmware' "$INSTALL"; then
+    result ok "supported setup features use default-yes prompts"
+else
+    result bad "a supported setup feature still defaults to disabled"
+fi
+
+if printf '\n' | confirm_yes "test" >/dev/null &&
+   ! printf 'n\n' | confirm_yes "test" >/dev/null; then
+    result ok "default-yes confirmation accepts Enter and honours an explicit no"
+else
+    result bad "default-yes confirmation parsing is broken"
+fi
+
+# A hard lock after module load must not turn a successful DKMS install into
+# zero-length files after reset. The installer's set -e makes either failed
+# sync fatal, and both source and module filesystems must be persisted before
+# modprobe executes the new code.
+src_sync_pattern="sync -f -- \"\$SRC_DIR\""
+mod_sync_pattern="sync -f -- \"/lib/modules/\$KVER\""
+load_pattern="elif modprobe \"\$MODULE_NAME\""
+src_sync_line="$(grep -nF "$src_sync_pattern" "$INSTALL" | head -1 | cut -d: -f1)"
+mod_sync_line="$(grep -nF "$mod_sync_pattern" "$INSTALL" | head -1 | cut -d: -f1)"
+load_line="$(grep -nF "$load_pattern" "$INSTALL" | head -1 | cut -d: -f1)"
+if [ -n "$src_sync_line" ] && [ -n "$mod_sync_line" ] && [ -n "$load_line" ] &&
+   [ "$src_sync_line" -lt "$load_line" ] && [ "$mod_sync_line" -lt "$load_line" ]; then
+    result ok "installer syncs DKMS source and module before live load"
+else
+    result bad "installer can live-load before DKMS files are persistent"
+fi
+
+# The camera PCI device is discovered by udev in the initramfs on affected
+# MacBooks.  DKMS regenerates that image before install.sh writes its runtime-PM
+# drop-in, so the installer must perform a second refresh after the setting is
+# final and before it can execute the module.
+runtime_write_line="$(grep -nF "options \$MODULE_NAME runtime_pm=0" "$INSTALL" |
+                      head -1 | cut -d: -f1)"
+initramfs_line="$(grep -nF "update-initramfs -u -k \"\$KVER\"" "$INSTALL" |
+                  head -1 | cut -d: -f1)"
+dracut_line="$(grep -nF "dracut --force \"/boot/initramfs-\${KVER}.img\" \"\$KVER\"" "$INSTALL" |
+              head -1 | cut -d: -f1)"
+if [ -n "$runtime_write_line" ] && [ -n "$initramfs_line" ] &&
+   [ -n "$dracut_line" ] && [ "$runtime_write_line" -lt "$initramfs_line" ] &&
+   [ "$initramfs_line" -lt "$load_line" ] && [ "$dracut_line" -lt "$load_line" ]; then
+    result ok "runtime-PM setting reaches initramfs before module load"
+else
+    result bad "runtime-PM setting can miss an initramfs-loaded module"
+fi
 
 # ---------------------------------------------------------------------------
 echo

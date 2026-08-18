@@ -33,6 +33,13 @@ require_root() {
 
 have() { command -v "$1" >/dev/null 2>&1; }
 
+# sysfs is the kernel's authoritative loaded-module list. Avoid
+# `lsmod | grep -q` here: these scripts use pipefail, so grep's successful early
+# exit can give lsmod SIGPIPE and make the whole pipeline report failure.
+module_is_loaded() {
+    [ -d "/sys/module/$1" ]
+}
+
 require_cmds() {
     local missing=() c
     for c in "$@"; do have "$c" || missing+=("$c"); done
@@ -84,6 +91,16 @@ confirm() {
     printf '%s [y/N] ' "$1"
     read -r reply || return 1
     [[ $reply =~ ^[Yy]$ ]]
+}
+
+# Use only for supported features whose normal installation default is on.
+# Dangerous overrides and recovery actions continue to use confirm() above.
+confirm_yes() {
+    [ "${ASSUME_YES:-0}" = "1" ] && return 0
+    local reply
+    printf '%s [Y/n] ' "$1"
+    read -r reply || return 1
+    [[ -z $reply || $reply =~ ^[Yy]$ ]]
 }
 
 # --- Platform detection -----------------------------------------------------

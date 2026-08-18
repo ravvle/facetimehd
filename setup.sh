@@ -29,7 +29,8 @@ Usage: sudo $0 [OPTIONS]
 
 Runs scripts/macbook-tune.sh and scripts/install.sh, in that order. Each has its own
 options for anyone who wants more control - see README.md, or run either
-script with --help directly.
+script with --help directly. Interactive feature prompts default to yes; answer
+"n" to skip one.
 EOF
 }
 
@@ -69,9 +70,9 @@ if [ "$ASSUME_YES" -eq 1 ]; then
     do_fan=1
 else
     do_driver=1
-    confirm "Install the camera driver and firmware?" || do_driver=0
+    confirm_yes "Install the camera driver and firmware?" || do_driver=0
     do_fan=1
-    confirm "Install fan support (mbpfan, so the machine stops throttling)?" || do_fan=0
+    confirm_yes "Install fan support (mbpfan, so the machine stops throttling)?" || do_fan=0
 fi
 
 if [ "$do_driver" -eq 0 ] && [ "$do_fan" -eq 0 ]; then

@@ -385,9 +385,11 @@ out:
  * timeouts; it is cleared in fthd_pm_down() once the hardware and every
  * outstanding object are gone.
  *
- * A wait interrupted by a signal (-ERESTARTSYS) gets the same "do not free"
- * treatment without wedging the device: the firmware itself is not at fault,
- * and the next command commonly lands on a different ring slot anyway.
+ * Once a command is in the hardware ring it cannot be cancelled. Its bounded
+ * completion wait must therefore not be interruptible by a userspace signal:
+ * returning early from a channel STOP lets STREAMOFF release DMA mappings
+ * while firmware still owns them. The timeout remains the escape hatch for
+ * firmware that genuinely stops responding.
  */
 static int __fthd_isp_cmd(struct fthd_private *dev_priv, struct fw_channel *chan,
 			  int timeout_ms, bool is_debug, enum fthd_isp_cmds command,
@@ -463,9 +465,9 @@ static int __fthd_isp_cmd(struct fthd_private *dev_priv, struct fw_channel *chan
 				chan->name);
 			fthd_mark_firmware_wedged(dev_priv);
 		}
-		/* Do not isp_mem_destroy(request): the firmware may still
-		 * write a late completion into it. Leaked into mem_objects
-		 * until the next full teardown reclaims it. */
+		/* Do not isp_mem_destroy(request): the firmware may still write a
+		 * late completion into it. Leaked into mem_objects until the next
+		 * full teardown reclaims it. */
 		return ret;
 	}
 
@@ -1225,12 +1227,30 @@ int fthd_isp_cmd_channel_ae_metering_mode_set(struct fthd_private *dev_priv, int
 	return fthd_isp_cmd(dev_priv, CISP_CMD_APPLE_CH_AE_METERING_MODE_SET, &cmd, sizeof(cmd), &len);
 }
 
+int fthd_isp_cmd_channel_ae_metering_mode_get(struct fthd_private *dev_priv,
+					       int channel, u8 *mode)
+{
+	struct isp_cmd_channel_ae_metering_mode_get cmd;
+	int ret, len = sizeof(cmd);
+
+	memset(&cmd, 0, sizeof(cmd));
+	cmd.channel = channel;
+	ret = fthd_isp_cmd(dev_priv, CISP_CMD_APPLE_CH_AE_METERING_MODE_GET,
+			   &cmd, sizeof(cmd), &len);
+	if (ret)
+		return ret;
+	if (len != sizeof(cmd))
+		return -EIO;
+
+	*mode = cmd.mode;
+	return 0;
+}
+
 /*
  * Anti-banding.  CISP_CMD_APPLE_CH_AE_FLICKER_FREQ_SET is one of the
- * Apple-private opcodes, so its payload is not documented anywhere; the layout
- * used here follows the shape every other per-channel setter uses, with the
- * mains frequency in Hz.  A wrong guess is refused by the firmware and
- * surfaces as an error from S_CTRL rather than as a wedged ISP.
+ * Apple-private opcodes. Firmware reads one word at command offset +0x0c,
+ * confirming this payload layout. The ISP accepted 0, 50 and 60 in hardware
+ * tests; their visible effect still needs a controlled-light comparison.
  */
 int fthd_isp_cmd_channel_ae_flicker_freq_set(struct fthd_private *dev_priv, int channel, int freq)
 {
@@ -1246,23 +1266,131 @@ int fthd_isp_cmd_channel_ae_flicker_freq_set(struct fthd_private *dev_priv, int 
 	return fthd_isp_cmd(dev_priv, CISP_CMD_APPLE_CH_AE_FLICKER_FREQ_SET, &cmd, sizeof(cmd), &len);
 }
 
-/*
- * Exposure compensation, applied while AE keeps running.  This is the useful
- * half of manual exposure on a laptop: it is what pulls a backlit face out of
- * silhouette without handing the whole exposure loop to userspace.
- */
-int fthd_isp_cmd_channel_ae_bias_set(struct fthd_private *dev_priv, int channel, int bias)
+/* Not exposed to userspace: encoding and tag semantics are still unknown. */
+int fthd_isp_cmd_channel_ae_bias_set_raw(struct fthd_private *dev_priv,
+					  int channel, u16 bias, u32 tag)
 {
 	struct isp_cmd_channel_ae_bias_set cmd;
 	int len;
 
-	pr_debug("set ae bias %d milli-EV\n", bias);
+	pr_debug("set ae bias raw %u tag %u\n", bias, tag);
 
 	memset(&cmd, 0, sizeof(cmd));
 	cmd.channel = channel;
 	cmd.bias = bias;
+	cmd.tag = tag;
 	len = sizeof(cmd);
 	return fthd_isp_cmd(dev_priv, CISP_CMD_CH_AE_BIAS_EXPOSURE_SET, &cmd, sizeof(cmd), &len);
+}
+
+int fthd_isp_cmd_channel_ae_bias_set(struct fthd_private *dev_priv,
+				      int channel, int bias)
+{
+	return fthd_isp_cmd_channel_ae_bias_set_raw(dev_priv, channel,
+						     (u16)bias, 0);
+}
+
+int fthd_isp_cmd_channel_ae_bias_get(struct fthd_private *dev_priv, int channel,
+				      u16 *bias, u32 *tag)
+{
+	struct isp_cmd_channel_ae_bias_get cmd;
+	int ret, len = sizeof(cmd);
+
+	memset(&cmd, 0, sizeof(cmd));
+	cmd.channel = channel;
+	ret = fthd_isp_cmd(dev_priv, CISP_CMD_CH_AE_BIAS_EXPOSURE_GET,
+			   &cmd, sizeof(cmd), &len);
+	if (ret)
+		return ret;
+	if (len != sizeof(cmd))
+		return -EIO;
+
+	*bias = cmd.bias;
+	*tag = cmd.tag;
+	return 0;
+}
+
+static int fthd_isp_cmd_channel_u32_get(struct fthd_private *dev_priv,
+					enum fthd_isp_cmds opcode, int channel,
+					u32 *value)
+{
+	struct isp_cmd_channel_u32 cmd;
+	int ret, len = sizeof(cmd);
+
+	memset(&cmd, 0, sizeof(cmd));
+	cmd.channel = channel;
+	ret = fthd_isp_cmd(dev_priv, opcode, &cmd, sizeof(cmd), &len);
+	if (ret)
+		return ret;
+	if (len != sizeof(cmd))
+		return -EIO;
+
+	*value = cmd.value;
+	return 0;
+}
+
+#define FTHD_DEFINE_CHANNEL_U32_GET(_name, _opcode)                         \
+	int _name(struct fthd_private *dev_priv, int channel, u32 *value)    \
+	{                                                                    \
+		return fthd_isp_cmd_channel_u32_get(dev_priv, _opcode, channel, \
+						    value);                  \
+	}
+
+FTHD_DEFINE_CHANNEL_U32_GET(fthd_isp_cmd_channel_ae_gain_cap_get,
+			    CISP_CMD_CH_AE_GAIN_CAP_GET)
+FTHD_DEFINE_CHANNEL_U32_GET(fthd_isp_cmd_channel_ae_gain_cap_min_get,
+			    CISP_CMD_CH_AE_GAIN_CAP_MIN_GET)
+FTHD_DEFINE_CHANNEL_U32_GET(fthd_isp_cmd_channel_ae_gain_cap_max_with_exp_get,
+			    CISP_CMD_CH_AE_GAIN_CAP_MAX_WITH_EXP_GET)
+FTHD_DEFINE_CHANNEL_U32_GET(fthd_isp_cmd_channel_ae_gain_cap_off_get,
+			    CISP_CMD_CH_AE_GAIN_CAP_OFF_GET)
+FTHD_DEFINE_CHANNEL_U32_GET(fthd_isp_cmd_channel_ae_integration_time_max_get,
+			    CISP_CMD_CH_AE_INTEGRATION_TIME_MAX_GET)
+FTHD_DEFINE_CHANNEL_U32_GET(fthd_isp_cmd_channel_ae_sensor_integration_time_min_get,
+			    CISP_CMD_CH_AE_SENSOR_INTEGRATION_TIME_MIN_GET)
+FTHD_DEFINE_CHANNEL_U32_GET(fthd_isp_cmd_channel_ae_sensor_integration_time_max_get,
+			    CISP_CMD_CH_AE_SENSOR_INTEGRATION_TIME_MAX_GET)
+FTHD_DEFINE_CHANNEL_U32_GET(fthd_isp_cmd_channel_awb_cct_get,
+			    CISP_CMD_CH_AWB_CCT_GET)
+
+#undef FTHD_DEFINE_CHANNEL_U32_GET
+
+static int fthd_isp_cmd_channel_u32_set(struct fthd_private *dev_priv,
+					enum fthd_isp_cmds opcode, int channel,
+					u32 value)
+{
+	struct isp_cmd_channel_u32 cmd;
+	int len;
+
+	memset(&cmd, 0, sizeof(cmd));
+	cmd.channel = channel;
+	cmd.value = value;
+	len = sizeof(cmd);
+	return fthd_isp_cmd(dev_priv, opcode, &cmd, sizeof(cmd), &len);
+}
+
+int fthd_isp_cmd_channel_ae_gain_cap_set_raw(struct fthd_private *dev_priv,
+					      int channel, u32 value)
+{
+	return fthd_isp_cmd_channel_u32_set(dev_priv,
+					    CISP_CMD_CH_AE_GAIN_CAP_SET,
+					    channel, value);
+}
+
+int fthd_isp_cmd_channel_ae_gain_cap_min_set_raw(struct fthd_private *dev_priv,
+						  int channel, u32 value)
+{
+	return fthd_isp_cmd_channel_u32_set(dev_priv,
+					    CISP_CMD_CH_AE_GAIN_CAP_MIN_SET,
+					    channel, value);
+}
+
+int fthd_isp_cmd_channel_ae_integration_time_max_set_raw(
+	struct fthd_private *dev_priv, int channel, u32 value)
+{
+	return fthd_isp_cmd_channel_u32_set(dev_priv,
+			CISP_CMD_CH_AE_INTEGRATION_TIME_MAX_SET,
+			channel, value);
 }
 
 int fthd_isp_cmd_channel_ae_integration_time_set(struct fthd_private *dev_priv, int channel,
@@ -1271,7 +1399,7 @@ int fthd_isp_cmd_channel_ae_integration_time_set(struct fthd_private *dev_priv, 
 	struct isp_cmd_channel_ae_integration_time_set cmd;
 	int len;
 
-	pr_debug("set integration time %u us\n", usec);
+	pr_debug("set integration time raw %u\n", usec);
 
 	memset(&cmd, 0, sizeof(cmd));
 	cmd.channel = channel;
@@ -1280,33 +1408,21 @@ int fthd_isp_cmd_channel_ae_integration_time_set(struct fthd_private *dev_priv, 
 	return fthd_isp_cmd(dev_priv, CISP_CMD_CH_AE_INTEGRATION_TIME_SET, &cmd, sizeof(cmd), &len);
 }
 
-/*
- * There is no "set the gain" opcode: the ISP exposes a gain *cap* pair, and
- * collapsing the two onto one value is what pins AE to a fixed gain.  Both
- * halves are sent because setting only the maximum would still let AE choose
- * anything below it.
- */
+/* Not exposed: using two AE caps as a manual-gain control is unvalidated. */
 int fthd_isp_cmd_channel_ae_gain_set(struct fthd_private *dev_priv, int channel,
 				     unsigned int gain)
 {
-	struct isp_cmd_channel_ae_gain_set cmd;
-	int len, ret;
+	int ret;
 
 	pr_debug("set gain %u\n", gain);
 
-	memset(&cmd, 0, sizeof(cmd));
-	cmd.channel = channel;
-	cmd.gain = gain;
-	len = sizeof(cmd);
-	ret = fthd_isp_cmd(dev_priv, CISP_CMD_CH_AE_GAIN_CAP_MIN_SET, &cmd, sizeof(cmd), &len);
+	ret = fthd_isp_cmd_channel_ae_gain_cap_min_set_raw(dev_priv, channel,
+							    gain);
 	if (ret)
 		return ret;
 
-	memset(&cmd, 0, sizeof(cmd));
-	cmd.channel = channel;
-	cmd.gain = gain;
-	len = sizeof(cmd);
-	return fthd_isp_cmd(dev_priv, CISP_CMD_CH_AE_GAIN_CAP_SET, &cmd, sizeof(cmd), &len);
+	return fthd_isp_cmd_channel_ae_gain_cap_set_raw(dev_priv, channel,
+							gain);
 }
 
 int fthd_isp_cmd_channel_awb_cct_manual(struct fthd_private *dev_priv, int channel,
@@ -1315,45 +1431,14 @@ int fthd_isp_cmd_channel_awb_cct_manual(struct fthd_private *dev_priv, int chann
 	struct isp_cmd_channel_awb_cct_manual cmd;
 	int len;
 
-	pr_debug("set awb cct %u K\n", cct);
+	pr_debug("set awb cct raw %u\n", cct);
 
 	memset(&cmd, 0, sizeof(cmd));
 	cmd.channel = channel;
 	cmd.cct = cct;
+	cmd.tag = 0;
 	len = sizeof(cmd);
 	return fthd_isp_cmd(dev_priv, CISP_CMD_CH_AWB_CCT_MANUAL, &cmd, sizeof(cmd), &len);
-}
-
-/*
- * Deliberately unused, and kept rather than deleted.
- *
- * CISP_CMD_CH_AWB_1ST_GAIN_MANUAL is the other way of writing manual white
- * balance: the per-channel gains rather than the colour temperature.  Exposing
- * both as V4L2 controls would put two controls describing one piece of ISP
- * state in the same cluster, and since runtime PM replays the whole handler on
- * every idle cycle, their replay order - not the user - would decide which one
- * won.  fthd_set_white_balance() therefore offers only the CCT.
- *
- * The helper stays because the choice is between two writable representations
- * of the same state, not between a working and a broken one: anyone
- * reconsidering it (say, because hardware shows the CCT command is the one the
- * firmware ignores) needs this side implemented to compare against.  See
- * DOWNSTREAM.md, "Manual exposure and white balance".
- */
-int fthd_isp_cmd_channel_awb_gain_manual(struct fthd_private *dev_priv, int channel,
-					 unsigned int red, unsigned int blue)
-{
-	struct isp_cmd_channel_awb_gain_manual cmd;
-	int len;
-
-	pr_debug("set awb gains red %u blue %u\n", red, blue);
-
-	memset(&cmd, 0, sizeof(cmd));
-	cmd.channel = channel;
-	cmd.red = red;
-	cmd.blue = blue;
-	len = sizeof(cmd);
-	return fthd_isp_cmd(dev_priv, CISP_CMD_CH_AWB_1ST_GAIN_MANUAL, &cmd, sizeof(cmd), &len);
 }
 
 int fthd_isp_cmd_channel_sharpness_set(struct fthd_private *dev_priv, int channel, int sharpness)
@@ -1407,7 +1492,7 @@ int fthd_isp_cmd_channel_chroma_suppression_set(struct fthd_private *dev_priv, i
 
 	memset(&cmd, 0, sizeof(cmd));
 	cmd.channel = channel;
-	cmd.strength = strength;
+	cmd.field0 = strength;
 	len = sizeof(cmd);
 	return fthd_isp_cmd(dev_priv, CISP_CMD_CH_CHROMA_SUPPRESSION_SET, &cmd, sizeof(cmd), &len);
 }
@@ -1433,10 +1518,10 @@ int fthd_isp_cmd_channel_drc_strength_set(struct fthd_private *dev_priv, int cha
 /*
  * Sensor die temperature, returned exactly as the firmware reports it.
  *
- * The opcode is documented by name only, so the scale is unknown - it could be
- * celsius, deci-celsius or a raw sensor code.  Rather than guess a conversion
- * and publish a confidently wrong number, this returns the raw value and the
- * hwmon layer decides what to do with it; see fthd_hwmon_read().
+ * Firmware disassembly proves the signed field width, but not its scale. This
+ * It is exposed only by the root-readable, on-demand active-stream debugfs
+ * probe. It is not connected to hwmon or V4L2 and is never polled; see
+ * FIRMWARE-REVERSE-ENGINEERING.md.
  */
 int fthd_isp_cmd_channel_sensor_temperature(struct fthd_private *dev_priv, int channel, s32 *raw)
 {
@@ -1584,9 +1669,6 @@ int fthd_start_channel(struct fthd_private *dev_priv, int channel)
 	case V4L2_PIX_FMT_YVYU:
 		pixelformat = 2;
 		break;
-	case V4L2_PIX_FMT_NV16:
-		pixelformat = 0;
-		break;
 	default:
 		pixelformat = 1;
 		WARN_ON(1);
@@ -1604,12 +1686,9 @@ int fthd_start_channel(struct fthd_private *dev_priv, int channel)
 	ret = fthd_isp_cmd_channel_recycle_start(dev_priv, 0);
 	if (ret)
 		return ret;
-	/* AE metering mode is not pinned here any more.  It used to be forced to
-	 * 3 on every channel start, which would have discarded whatever
-	 * V4L2_CID_EXPOSURE_METERING was set to; fthd_start_streaming() replays
-	 * the whole control handler right after this returns, and that control's
-	 * default is the same mode 3.  Same reasoning as brightness and contrast
-	 * below. */
+	ret = fthd_isp_cmd_channel_ae_metering_mode_set(dev_priv, 0, 3);
+	if (ret)
+		return ret;
 	ret = fthd_isp_cmd_channel_drc_start(dev_priv, 0);
 	if (ret)
 		return ret;

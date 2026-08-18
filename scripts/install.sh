@@ -26,13 +26,15 @@ DRIVER_SRC="${FTHD_DRIVER_SRC:-$REPO_DIR/src/facetimehd}"
 FIRMWARE_EXTRACTOR="${FTHD_FIRMWARE_EXTRACTOR:-$SCRIPT_DIR/extract-firmware.sh}"
 MODULE_NAME=facetimehd
 
+# shellcheck disable=SC2034  # consumed by confirm()/confirm_yes() in common.sh
 ASSUME_YES=0
 FORCE_REBUILD=0
 SKIP_FIRMWARE=0
 SKIP_HW_CHECK=0
 ENROLL_MOK=0
 SHOW_STATUS=0
-RUNTIME_PM=''
+RUNTIME_PM=on
+NO_LOAD=0
 
 # Drop-in that persists the driver's runtime_pm module parameter. Named for the
 # project so uninstall.sh can remove exactly what was added and nothing else.
@@ -50,9 +52,11 @@ Usage: sudo $0 [OPTIONS]
                        Key so DKMS can sign the module. Asks for a one-time
                        password, then needs a reboot to finish.
       --runtime-pm MODE
-                       Persist the driver's runtime power management: 'off'
-                       writes $RUNTIME_PM_DROPIN,
-                       'on' removes it again (the driver's own default).
+                       Persist runtime power management: 'on' is the installer
+                       default; 'off' is the recovery opt-out. Both write
+                       $RUNTIME_PM_DROPIN and refresh the initramfs.
+      --no-load        Build and install without unloading or loading the live
+                       module. Use this for recovery, then reboot deliberately.
       --status         Report what is installed and exit. Needs no root.
   -h, --help           Show this help.
 
@@ -65,11 +69,14 @@ EOF
 
 while [ $# -gt 0 ]; do
     case "$1" in
-        -y|--yes)        ASSUME_YES=1 ;;
+        -y|--yes)        # Read dynamically by common.sh's prompt helpers.
+                         # shellcheck disable=SC2034
+                         ASSUME_YES=1 ;;
         --force)         FORCE_REBUILD=1 ;;
         --skip-firmware) SKIP_FIRMWARE=1 ;;
         --skip-hw-check) SKIP_HW_CHECK=1 ;;
         --enroll-mok)    ENROLL_MOK=1 ;;
+        --no-load)       NO_LOAD=1 ;;
         --status)        SHOW_STATUS=1 ;;
         --runtime-pm)    shift; [ $# -gt 0 ] || die "--runtime-pm needs on or off"
                          RUNTIME_PM="$1" ;;
@@ -81,7 +88,7 @@ while [ $# -gt 0 ]; do
 done
 
 case "$RUNTIME_PM" in
-    ''|on|off) ;;
+    keep|on|off) ;;
     *) die "--runtime-pm takes 'on' or 'off', not '$RUNTIME_PM'." ;;
 esac
 
@@ -175,7 +182,7 @@ show_status() {
         done
     fi
 
-    if lsmod 2>/dev/null | grep -q "^${MODULE_NAME}\b"; then
+    if module_is_loaded "$MODULE_NAME"; then
         ok "Module loaded"
     else
         bad "Module not loaded"; rc=1
@@ -255,10 +262,13 @@ show_status() {
             N) info "Runtime PM: off" ;;
             *) info "Runtime PM: unknown" ;;
         esac
+    elif grep -Eq '^[[:space:]]*options[[:space:]]+facetimehd([[:space:]]+.*)?[[:space:]]runtime_pm=(1|Y|y|on)([[:space:]]|$)' \
+              "$RUNTIME_PM_DROPIN" 2>/dev/null; then
+        info "Runtime PM enabled by $RUNTIME_PM_DROPIN (module not loaded to confirm)"
     elif [ -f "$RUNTIME_PM_DROPIN" ]; then
         info "Runtime PM disabled by $RUNTIME_PM_DROPIN (module not loaded to confirm)"
     else
-        info "Runtime PM left at the driver's default (on) - module not loaded to confirm"
+        info "Runtime PM left at the driver's safe default (off) - module not loaded to confirm"
     fi
 
     echo
@@ -607,21 +617,25 @@ info "$DRIVER_SRC"
 # The package version comes from upstream's own dkms.conf, carried through the
 # fork. Nothing here hardcodes a version number.
 [ -f "$DRIVER_SRC/dkms.conf" ] || die "Driver source has no dkms.conf; cannot continue."
-DRIVER_VERSION="$(sed -n 's/^[[:space:]]*PACKAGE_VERSION=["'"'"']\{0,1\}\([^"'"'"']*\)["'"'"']\{0,1\}[[:space:]]*$/\1/p' \
-                      "$DRIVER_SRC/dkms.conf" | head -n1)"
-[ -n "$DRIVER_VERSION" ] || die "Could not read PACKAGE_VERSION from upstream dkms.conf."
 
-# Hash the maintained sources into the version so a source edit cannot reuse the
-# DKMS version of a tree that was already built.
-require_cmds sha256sum
-SOURCE_FINGERPRINT="$(driver_source_fingerprint "$DRIVER_SRC")"
-DRIVER_VERSION="${DRIVER_VERSION}+d${SOURCE_FINGERPRINT}"
-info "Driver version: $MODULE_NAME/$DRIVER_VERSION"
-
+# Snapshot first, then derive both the version and fingerprint from that one
+# immutable tree. Hashing DRIVER_SRC before copying it lets a concurrent edit
+# produce a DKMS version whose label describes different contents.
 DRIVER_STAGE_TMP="$(mktemp -d -t facetimehd-driver.XXXXXXXX)"
 trap 'rm -rf -- "$DRIVER_STAGE_TMP"' EXIT
 SRC_STAGE="$DRIVER_STAGE_TMP/source"
 prepare_driver_source "$DRIVER_SRC" "$SRC_STAGE"
+
+DRIVER_VERSION="$(sed -n 's/^[[:space:]]*PACKAGE_VERSION=["'"'"']\{0,1\}\([^"'"'"']*\)["'"'"']\{0,1\}[[:space:]]*$/\1/p' \
+                      "$SRC_STAGE/dkms.conf" | head -n1)"
+[ -n "$DRIVER_VERSION" ] || die "Could not read PACKAGE_VERSION from upstream dkms.conf."
+
+# Hash the staged sources into the version so a source edit cannot reuse the
+# DKMS version of a tree that was already built.
+require_cmds sha256sum
+SOURCE_FINGERPRINT="$(driver_source_fingerprint "$SRC_STAGE")"
+DRIVER_VERSION="${DRIVER_VERSION}+d${SOURCE_FINGERPRINT}"
+info "Driver version: $MODULE_NAME/$DRIVER_VERSION"
 
 SRC_DIR="/usr/src/${MODULE_NAME}-${DRIVER_VERSION}"
 
@@ -701,7 +715,7 @@ else
   extracted image against known-good values before installing it.
 
 EOF
-    if ! confirm "  Download and extract the firmware from Apple's servers now?"; then
+    if ! confirm_yes "  Download and extract the firmware from Apple's servers now?"; then
         warn "Firmware skipped. The driver will load but the camera will not"
         warn "produce an image until you run this script again."
         SKIP_FIRMWARE=1
@@ -749,16 +763,15 @@ fi
 # 4b. Runtime power management, when asked for
 # ---------------------------------------------------------------------------
 #
-# This project configures no power management by default and that has not
-# changed: the drop-in is written only when explicitly asked for. What it does
-# is make the driver's own documented escape hatch survive a reboot, instead of
-# the user having to add facetimehd.runtime_pm=0 to the kernel command line by
-# hand every time. uninstall.sh removes it.
+# The driver's built-in default remains off for manual/module-only installs,
+# but the full project installer enables this hardware-tested feature. Write
+# either value explicitly so it survives upgrades and early initramfs loading;
+# uninstall.sh removes the project-owned setting.
 if [ "$RUNTIME_PM" = off ]; then
     step "Disabling the driver's runtime power management"
     cat > "$RUNTIME_PM_DROPIN" <<EOF
 # Written by facetimehd install.sh --runtime-pm off
-# Removed by 'install.sh --runtime-pm on' or by uninstall.sh.
+# Replaced by either runtime-PM mode; removed by uninstall.sh.
 #
 # The driver's runtime PM powers the camera down when nothing has it open and
 # reloads its firmware on the next use. This turns that off for machines where
@@ -767,13 +780,16 @@ options $MODULE_NAME runtime_pm=0
 EOF
     ok "Wrote $RUNTIME_PM_DROPIN (takes effect on the next module load)"
 elif [ "$RUNTIME_PM" = on ]; then
-    step "Restoring the driver's default runtime power management"
-    if [ -f "$RUNTIME_PM_DROPIN" ]; then
-        rm -f -- "$RUNTIME_PM_DROPIN"
-        ok "Removed $RUNTIME_PM_DROPIN"
-    else
-        info "Nothing to remove; runtime PM was already at its default."
-    fi
+    step "Enabling the driver's runtime power management"
+    cat > "$RUNTIME_PM_DROPIN" <<EOF
+# Written by facetimehd install.sh --runtime-pm on
+# Replaced by either runtime-PM mode; removed by uninstall.sh.
+#
+# Runtime PM performs the hardware-tested ISP, DDR and PCI idle transition five
+# seconds after the final camera close.
+options $MODULE_NAME runtime_pm=1
+EOF
+    ok "Wrote $RUNTIME_PM_DROPIN (takes effect on the next module load)"
 fi
 
 # ---------------------------------------------------------------------------
@@ -783,16 +799,49 @@ fi
 step "Loading the driver"
 depmod -a "$(uname -r)"
 
+# DKMS may refresh the initramfs as part of installing the module, but that
+# happens before the runtime-PM drop-in above is written or removed.  This
+# camera is commonly discovered by initramfs udev before the real root is
+# mounted, so a root-filesystem-only modprobe setting is too late: the module
+# has already parsed its parameters.  Refresh the image again whenever the
+# user explicitly changed that setting, with both the module and drop-in now
+# in their final state.
+if [ "$RUNTIME_PM" != keep ]; then
+    step "Refreshing the early-boot image"
+    if command -v update-initramfs >/dev/null 2>&1; then
+        update-initramfs -u -k "$KVER"
+    elif command -v dracut >/dev/null 2>&1; then
+        dracut --force "/boot/initramfs-${KVER}.img" "$KVER"
+    else
+        runtime_pm_cmdline=1
+        [ "$RUNTIME_PM" = off ] && runtime_pm_cmdline=0
+        warn "No initramfs generator found; use facetimehd.runtime_pm=$runtime_pm_cmdline"
+        warn "on the kernel command line until the early-boot image is rebuilt."
+    fi
+fi
+
+# A module can probe successfully and still lock the machine during a later
+# power transition. If that forces a hard reset before ext4's delayed writes
+# reach disk, the DKMS source and .ko can come back as zero-length files even
+# though the installer had reported success. Persist both filesystems before
+# any operation that executes the new kernel code.
+sync -f -- "$SRC_DIR"
+sync -f -- "/lib/modules/$KVER"
+
 # Unload first, so a rebuild actually takes effect. When the resident module is
 # pinned by an open camera application the unload fails, and the modprobe that
 # follows then succeeds trivially against the *old* module - which would be
 # reported as a successful load of the build we just made. Track it instead.
 MODULE_STALE=0
-if lsmod | grep -q "^${MODULE_NAME}\b" && ! modprobe -r "$MODULE_NAME" 2>/dev/null; then
+if [ "$NO_LOAD" -eq 1 ]; then
+    info "Live module load deferred (--no-load)"
+elif module_is_loaded "$MODULE_NAME" && ! modprobe -r "$MODULE_NAME" 2>/dev/null; then
     MODULE_STALE=1
 fi
 
-if [ "$MODULE_STALE" -eq 1 ]; then
+if [ "$NO_LOAD" -eq 1 ]; then
+    info "The installed module will take effect after a deliberate reboot."
+elif [ "$MODULE_STALE" -eq 1 ]; then
     warn "The running $MODULE_NAME could not be unloaded - it is probably in use"
     warn "by an open camera application. The newly built module takes over at"
     warn "the next reboot."
@@ -830,9 +879,11 @@ else
     bad "Firmware missing at $FW_DIR/firmware.bin"; rc=1
 fi
 
-if [ "$MODULE_STALE" -eq 1 ]; then
+if [ "$NO_LOAD" -eq 1 ]; then
+    info "Module not checked (--no-load); reboot to activate this build"
+elif [ "$MODULE_STALE" -eq 1 ]; then
     bad "An older $MODULE_NAME is still loaded (reboot to pick up this build)"
-elif lsmod | grep -q "^${MODULE_NAME}\b"; then
+elif module_is_loaded "$MODULE_NAME"; then
     ok "Module loaded"
 else
     bad "Module not loaded yet (reboot required)"
@@ -848,7 +899,9 @@ if compgen -G '/sys/class/video4linux/video*' >/dev/null; then
         break
     done
 fi
-if [ -n "$video_dev" ]; then
+if [ "$NO_LOAD" -eq 1 ]; then
+    info "Video device not checked against the deferred module"
+elif [ -n "$video_dev" ]; then
     ok "Video device present: $video_dev"
 else
     bad "No Apple Facetime HD /dev/video* device yet (reboot required)"

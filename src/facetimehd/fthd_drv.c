@@ -25,7 +25,6 @@
 #include "fthd_buffer.h"
 #include "fthd_v4l2.h"
 #include "fthd_debugfs.h"
-#include "fthd_hwmon.h"
 
 /* Powering the ISP back up means re-training DDR and re-uploading the firmware
  * image, which is not cheap.  Idle for this long before doing it. */
@@ -33,11 +32,11 @@
 #define FTHD_PCI_BAR_MASK (BIT(FTHD_PCI_S2_IO) | BIT(FTHD_PCI_S2_MEM) | \
 			   BIT(FTHD_PCI_ISP_IO))
 
-static bool runtime_pm = true;
+static bool runtime_pm;
 module_param(runtime_pm, bool, 0444);
 MODULE_PARM_DESC(runtime_pm,
-		 "Power the camera down while nothing has it open (default: 1). "
-		 "0 leaves the decision to userspace via /sys/bus/pci/devices/.../power/control.");
+		 "Power the camera down while nothing has it open (default: 0). "
+		 "Enable only after validating suspend/resume on this machine.");
 
 static void fthd_pm_down(struct fthd_private *dev_priv);
 
@@ -243,19 +242,19 @@ static void fthd_handle_irq(struct fthd_private *dev_priv, struct fw_channel *ch
 
 	if (chan == dev_priv->channel_io) {
 		pr_debug("IO channel ready\n");
-		wake_up_interruptible(&chan->wq);
+		wake_up(&chan->wq);
 		return;
 	}
 
 	if (chan == dev_priv->channel_buf_h2t) {
 		pr_debug("H2T channel ready\n");
-		wake_up_interruptible(&chan->wq);
+		wake_up(&chan->wq);
 		return;
 	}
 
 	if (chan == dev_priv->channel_debug) {
 		pr_debug("DEBUG channel ready\n");
-		wake_up_interruptible(&chan->wq);
+		wake_up(&chan->wq);
 		return;
 	}
 
@@ -690,10 +689,6 @@ static int fthd_pci_probe(struct pci_dev *pdev,
 	if (ret)
 		goto fail_v4l2;
 
-	/* Best-effort, and deliberately after everything that can fail: a
-	 * camera with no temperature reading is a working camera. */
-	fthd_hwmon_register(dev_priv);
-
 	/* One line per probe, carrying what the twenty-line bring-up banner
 	 * used to be read for. Everything else on that path is dev_dbg now,
 	 * because runtime PM replays it on every resume. */
@@ -703,10 +698,7 @@ static int fthd_pci_probe(struct pci_dev *pdev,
 	pm_runtime_set_autosuspend_delay(&pdev->dev, FTHD_AUTOSUSPEND_DELAY_MS);
 	pm_runtime_use_autosuspend(&pdev->dev);
 	/* The PCI core forbids runtime PM on a device until either userspace
-	 * (power/control) or the driver opts in.  Opt in unless asked not to:
-	 * an idle ISP that keeps its firmware loaded is pure waste on a
-	 * laptop, and this is now safe because the callbacks below tear the
-	 * hardware down properly. */
+	 * (power/control) or the driver explicitly opts in. */
 	if (runtime_pm)
 		pm_runtime_allow(&pdev->dev);
 	/* pci_device_probe() took a runtime-PM reference and leaves it to the

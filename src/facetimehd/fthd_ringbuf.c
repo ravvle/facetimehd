@@ -125,7 +125,12 @@ int fthd_channel_wait_ready(struct fthd_private *dev_priv, struct fw_channel *ch
 {
 	long ret;
 
-	ret = wait_event_interruptible_timeout(chan->wq,
+	/* A ring submission cannot be cancelled. In particular, allowing SIGTERM
+	 * to abort a channel-STOP wait makes STREAMOFF release the buffers while
+	 * firmware may still DMA into them. Keep the wait bounded but
+	 * uninterruptible. The IRQ completion side must use wake_up(), not
+	 * wake_up_interruptible(), so it can wake this task immediately. */
+	ret = wait_event_timeout(chan->wq,
 			(FTHD_S2_MEM_READ(entry + FTHD_RINGBUF_ADDRESS_FLAGS) & 1) ^
 			(chan->type != 0), msecs_to_jiffies(timeout));
 	if (!ret) {
@@ -133,7 +138,5 @@ int fthd_channel_wait_ready(struct fthd_private *dev_priv, struct fw_channel *ch
 		fthd_channel_ringbuf_dump(dev_priv, chan);
 		return -ETIMEDOUT;
 	}
-	if (ret < 0)
-		return ret;
 	return 0;
 }

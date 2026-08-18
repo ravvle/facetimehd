@@ -63,8 +63,7 @@ The downstream driver retains the original hardware support while adding:
   of open file descriptors during unbind;
 - runtime camera suspend/resume, reliable system sleep while streaming, safe
   shutdown and PCI error handling;
-- a stream that survives suspend: an application capturing when the lid closes
-  keeps capturing when it opens, without being restarted;
+- restoration of a stream that was active across system suspend;
 - wider DDR memory verification and removal of unfinished, unused calibration
   code containing ineffective timeouts and unbounded paths;
 - correct full-sensor scaling at lower resolutions instead of a zoomed crop
@@ -73,16 +72,10 @@ The downstream driver retains the original hardware support while adding:
   V4L2 frame-size, frame-rate, selection and status reporting;
 - controls that are restored when streaming starts, plus optional 50/60 Hz
   anti-banding and automatic/manual exposure controls;
-- manual exposure time, gain and white-balance temperature, which the automatic
-  switches previously offered no way to set, alongside exposure compensation,
-  metering mode, sharpness and a sensor test pattern;
-- backlight compensation, noise reduction and chroma noise suppression;
-- **selectable frame rates** — an application asking for 15 fps now gets 15 fps
-  instead of 30, at any whole division of the sensor's rate;
-- **digital zoom and pan** through `VIDIOC_S_SELECTION`, instead of a crop
-  rectangle fixed at the full sensor;
-- the sensor die temperature through `hwmon` and debugfs;
-- `NV16` offered next to `YUYV` and `YVYU`;
+- selectable frame rates produced by safe frame decimation;
+- digital zoom and pan through `VIDIOC_S_SELECTION`;
+- removal of guessed firmware controls and formats that made firmware read
+  beyond short requests and repeatedly hard-locked a MacBookAir7,2;
 - correct MacBook Air sensor-calibration selection and complete
   `MODULE_FIRMWARE` declarations; and
 - current Linux 5.15+ APIs, quieter diagnostics, Clang builds, Sparse checks
@@ -171,11 +164,24 @@ sudo ./setup.sh
 sudo reboot
 ```
 
-The setup asks whether to install the camera driver and whether to add optional
-fan support. For the camera, it checks the hardware, installs build dependencies
-and matching kernel headers, builds the driver through DKMS, extracts the Apple
-firmware and loads the module. It is safe to run again; an unchanged installed
-driver is not rebuilt unnecessarily.
+The setup asks whether to install the camera driver and whether to add fan
+support; both prompts default to yes, as does the proprietary firmware download.
+For the camera, it checks the hardware, installs build dependencies and matching
+kernel headers, builds the driver through DKMS, extracts the Apple firmware and
+loads the module. It is safe to run again; an unchanged installed driver is not
+rebuilt unnecessarily.
+
+For recovery or controlled testing, `--no-load` installs the DKMS build without
+touching the running module. Combine it with `--runtime-pm off` when isolating a
+power-transition failure. The installer refreshes the early-boot image after
+writing that option because the camera driver may load there before the real
+root filesystem is mounted. Reboot deliberately after reviewing the result.
+
+The full installer enables runtime power management by default now that the
+corrected driver has passed repeated idle cycles and suspend-while-streaming on
+the MacBookAir7,2. It writes the setting into the early-boot image because this
+PCI device may load there. The module's built-in default remains off for manual
+or package-only installs; use `--runtime-pm off` as the recovery opt-out.
 
 ### Verify the installation
 
@@ -275,30 +281,71 @@ password typed at a console and a reboot. Use `install.sh --enroll-mok`.
 Beyond the usual brightness and contrast, the driver exposes:
 
 ```bash
-v4l2-ctl --list-ctrls                       # everything available
-v4l2-ctl --set-parm 15                      # 15 fps instead of 30
-v4l2-ctl --set-ctrl auto_exposure=1,exposure_time_absolute=200
-v4l2-ctl --set-ctrl backlight_compensation=200   # lift a backlit face
-v4l2-ctl --set-ctrl noise_reduction=200          # dim rooms
-v4l2-ctl --set-ctrl power_line_frequency=1       # 50 Hz anti-banding
+v4l2-ctl --list-ctrls
+v4l2-ctl --set-ctrl auto_exposure=1          # manual exposure mode
+v4l2-ctl --set-ctrl power_line_frequency=1   # 50 Hz anti-banding
 ```
 
-Frame rates are any whole division of the sensor's fixed 30 fps — 30, 15, 10,
-7.5, 6, 5 and so on — reported exactly by `v4l2-ctl --list-formats-ext`.
+The inferred firmware-command controls are intentionally absent from the
+driver. The combined newer build repeatedly hard-locked the validation
+MacBook, and registering those controls caused a normal `STREAMON` to replay
+every unvalidated command. Firmware disassembly then proved that several
+payload layouts were incomplete or put values in the wrong fields. See the
+[firmware reverse-engineering notes](src/facetimehd/FIRMWARE-REVERSE-ENGINEERING.md)
+and [`DOWNSTREAM.md`](src/facetimehd/DOWNSTREAM.md).
 
-Digital zoom crops the sensor and lets the ISP scale the result:
+### Raw firmware readbacks
+
+For reverse-engineering and hardware validation, confirmed GET commands are
+available as root-only debugfs files. They work only while the camera is
+already streaming; reading one sends exactly one whitelisted GET and never
+changes or replays a setting. For example, keep a stream open in one terminal:
 
 ```bash
-v4l2-ctl --set-selection=target=crop,left=160,top=90,width=960,height=540
+v4l2-ctl --device /dev/video0 --stream-mmap --stream-count=100000 \
+         --stream-to=/dev/null
 ```
 
-The crop is only settable while nothing is streaming, and never smaller than the
-capture size.
+Then read a value in another terminal (replace the PCI directory if needed):
 
-The sensor die temperature appears under `hwmon` when the firmware reports it in
-a scale the driver can trust; the raw value is always in
-`/sys/kernel/debug/facetimehd/*/sensor_temperature_raw`. See
-[`DOWNSTREAM.md`](src/facetimehd/DOWNSTREAM.md) for why that distinction exists.
+```bash
+sudo cat /sys/kernel/debug/facetimehd/0000:02:00.0/sensor_temperature_raw
+sudo cat /sys/kernel/debug/facetimehd/0000:02:00.0/ae_bias_raw
+```
+
+The numbers are deliberately labelled `raw`: firmware does not document their
+units or ranges. An idle read fails with `EPIPE`; there is no polling or hwmon
+registration. The complete check is
+`sudo ./tests/hw-validate.sh --only readbacks`.
+
+Three deliberately opt-in experiments build on those reads:
+
+```bash
+# Interactive dark/bright, warm/cool, 15/30-fps and warm-up profile (GETs only)
+sudo ./tests/hw-validate.sh --only readback-profile
+
+# One same-value setter only; repeat with another ROUNDTRIPS name afterward
+sudo env ROUNDTRIPS=ae_bias ./tests/hw-validate.sh --only roundtrips
+
+# Interactive, bounded firmware metering-mode semantics test
+sudo ./tests/hw-validate.sh --only metering-modes
+```
+
+The setter nodes are root-write-only and accept only the literal word `same`.
+The kernel reads the current value, writes that exact value once, reads it back,
+and fails if it changed. Nothing is registered with V4L2 or replayed at stream
+start. Valid `ROUNDTRIPS` names are `ae_bias`, `ae_metering_mode`,
+`ae_integration_time_max`, `ae_gain_cap`, and `ae_gain_cap_min`.
+
+After the same-value metering setter passed, `metering-modes` added a separate
+mode-`0200` test node which accepts only the fixed tokens `mode0` through
+`mode3`. The runner uses a fresh stream per token, reads the mode back, retains
+raw frames, reports full/spot/centre/outer luma, restores the original mode
+before STREAMOFF, and then checks restart, runtime resume, and kernel faults.
+The mode-3 baseline must first prove that the central target is at least 20 luma
+above the surround and is not clipped; otherwise the runner stops before the
+non-default modes. This is semantic test scaffolding, not a V4L2 control; no
+mutation occurs unless that section is explicitly selected and confirmed.
 
 ## Optional fan support
 
@@ -356,7 +403,8 @@ Driver fixes belong in `src/facetimehd/`, should be recorded in
 ```text
 setup.sh                       Guided camera/fan setup
 scripts/install.sh             Driver, DKMS, firmware and calibration installer
-                               (also --status, --enroll-mok, --runtime-pm)
+                               (also --status, --enroll-mok, --runtime-pm,
+                               --no-load)
 scripts/uninstall.sh           Complete removal
 scripts/macbook-tune.sh        Optional mbpfan helper
 scripts/extract-firmware.sh    Maintained Apple firmware extractor
@@ -383,7 +431,8 @@ Common answers:
 | Camera present, black image | Firmware not installed | `sudo ./scripts/extract-firmware.sh` |
 | Image works, colours wrong | Calibration files missing | `sudo ./scripts/extract-firmware.sh --calibration-only` |
 | Nothing rebuilt after a kernel update | Kernel headers missing | `apt install linux-headers-$(uname -r)` / `dnf install kernel-devel-$(uname -r)` |
-| Camera unreliable when idle | Driver runtime PM | `sudo ./scripts/install.sh --runtime-pm off` |
+| Camera unreliable when idle | Driver runtime PM explicitly enabled | `sudo ./scripts/install.sh --runtime-pm off` |
+| Live reload freezes the machine | Kernel-driver regression | Reinstall with `--no-load --runtime-pm off`, then reboot deliberately |
 | Install fails at the Apple download | Apple's URL moved | `./scripts/extract-firmware.sh --check-sources` and open an issue |
 
 ### Opening an issue

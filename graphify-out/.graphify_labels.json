@@ -8,7 +8,7 @@
   "6": "hw-validate.sh",
   "7": "fthd_hw.c",
   "8": "FaceTime HD Camera for Linux (project)",
-  "9": "fthd_ringbuf.c",
+  "9": "fthd_debugfs.c",
   "10": "fthd_hw.h",
   "11": "extract-firmware.sh",
   "12": "script-smoke.sh",
@@ -20,10 +20,10 @@
   "18": "Removal of unused DDR shmoo calibration code",
   "19": "build-driver.sh",
   "20": "AGENTS.md",
-  "21": "fthd_s_ctrl",
+  "22": "FaceTimeHD firmware command notes",
   "23": "isp_init",
+  "24": "fthd_firmware_roundtrip",
+  "25": "fthd_s_ctrl",
   "26": "fthd_stop_channel",
-  "27": "fthd_firmware_start",
-  "28": "isp_fill_channel_info",
-  "29": "fthd_set_exposure"
+  "27": "fthd_firmware_start"
 }

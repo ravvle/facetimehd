@@ -41,9 +41,22 @@ FRAMES="${FRAMES:-30}"
 SUSPEND_SECS="${SUSPEND_SECS:-20}"
 LID_TIMEOUT="${LID_TIMEOUT:-180}"
 DEVICE="${DEVICE:-}"
+PROFILE_SETTLE_SECS="${PROFILE_SETTLE_SECS:-5}"
+PROFILE_WARMUP_SECS="${PROFILE_WARMUP_SECS:-600}"
+ROUNDTRIPS="${ROUNDTRIPS:-ae_bias ae_metering_mode ae_integration_time_max ae_gain_cap ae_gain_cap_min}"
+METERING_SETTLE_FRAMES="${METERING_SETTLE_FRAMES:-120}"
+METERING_CAPTURE_FRAMES="${METERING_CAPTURE_FRAMES:-12}"
+METERING_WAIT_SECS="${METERING_WAIT_SECS:-8}"
+METERING_RESTART_AE="${METERING_RESTART_AE:-0}"
+METERING_RESTORE_NODE=""
+METERING_ORIGINAL=""
 
-ALL_SECTIONS="probe timing controls newctrls formats runtimepm suspend wedged"
-SECTIONS="$ALL_SECTIONS"
+# Removed inferred controls and NV16 are intentionally not selectable here.
+# Readbacks are in the normal suite after their first complete fault-free run.
+# Profiling and same-value setter round trips remain explicit hardware work.
+DEFAULT_SECTIONS="probe timing controls runtimepm suspend wedged readbacks"
+ALL_SECTIONS="$DEFAULT_SECTIONS readback-profile roundtrips metering-modes"
+SECTIONS="$DEFAULT_SECTIONS"
 DO_REBOOT=0
 INTERACTIVE=1
 [ -t 0 ] || INTERACTIVE=0
@@ -63,6 +76,7 @@ Usage: sudo $0 [OPTIONS]
   -h, --help         Show this help.
 
 Sections: $ALL_SECTIONS
+  readback-profile, roundtrips and metering-modes are opt-in hardware experiments.
 
 Environment:
   DEVICE        Video node to test (default: the node $MODULE_NAME claims).
@@ -70,6 +84,21 @@ Environment:
   IDLE_WAIT     Seconds to wait for runtime suspend (default: 9).
   SUSPEND_SECS  Seconds to ask you to keep the lid closed (default: 20).
   LID_TIMEOUT   Seconds to wait for the lid before giving up (default: 180).
+  PROFILE_SETTLE_SECS
+                Seconds to let AE/AWB settle per profile phase (default: 5).
+  PROFILE_WARMUP_SECS
+                Streaming warm-up before the final temperature read (default: 600).
+  ROUNDTRIPS    Space-separated same-value setters to test. Default:
+                ae_bias ae_metering_mode ae_integration_time_max
+                ae_gain_cap ae_gain_cap_min
+  METERING_SETTLE_FRAMES
+                Frames discarded after each metering change (default: 120).
+  METERING_CAPTURE_FRAMES
+                Frames retained for each metering mode (default: 12).
+  METERING_WAIT_SECS
+                Seconds before checking each bounded capture (default: 8).
+  METERING_RESTART_AE
+                Set to 1 to stop/restart AE around each mode change (default: 0).
   REPORT        Report path (default: /tmp/facetimehd-hw-validate-DATE.log).
 EOF
 }
@@ -96,6 +125,19 @@ for _s in $SECTIONS; do
         *) die "Unknown section: $_s (valid: $ALL_SECTIONS)" ;;
     esac
 done
+
+for _numeric_name in METERING_SETTLE_FRAMES METERING_CAPTURE_FRAMES \
+                     METERING_WAIT_SECS; do
+    _numeric_value="${!_numeric_name}"
+    case "$_numeric_value" in
+        ''|*[!0-9]*|0) die "$_numeric_name must be a positive integer" ;;
+    esac
+done
+
+case "$METERING_RESTART_AE" in
+    0|1) ;;
+    *) die "METERING_RESTART_AE must be 0 or 1" ;;
+esac
 
 wants() { case " $SECTIONS " in *" $1 "*) return 0 ;; *) return 1 ;; esac; }
 
@@ -274,6 +316,57 @@ mean_luma() {
     rm -f "$tmp"
 }
 
+# Full-frame, central spot, centre-quarter and outer-region means from the last
+# complete packed-YUV frame in a multi-frame capture. Y occupies every even
+# byte in both YUYV and YVYU. The smaller spot verifies that the operator's
+# bright target is actually where the metering experiment expects it.
+frame_luma_metrics() {
+    local file="$1" frame_size="$2" width="$3" height="$4"
+    local size complete
+
+    size="$(stat -c %s "$file" 2>/dev/null || echo 0)"
+    complete=$(( size / frame_size ))
+    [ "$complete" -gt 0 ] || return 1
+
+    dd if="$file" bs="$frame_size" skip=$(( complete - 1 )) count=1 \
+       status=none 2>/dev/null |
+        od -An -tu1 -v |
+        awk -v w="$width" -v h="$height" '
+            {
+                for (i = 1; i <= NF; i++) {
+                    value = $i
+                    if (byte % 2 == 0) {
+                        pixel = byte / 2
+                        x = pixel % w
+                        y = int(pixel / w)
+                        full += value
+                        full_n++
+                        if (x >= int(3 * w / 8) && x < int(5 * w / 8) &&
+                            y >= int(3 * h / 8) && y < int(5 * h / 8)) {
+                            spot += value
+                            spot_n++
+                        }
+                        if (x >= int(w / 4) && x < int(3 * w / 4) &&
+                            y >= int(h / 4) && y < int(3 * h / 4)) {
+                            centre += value
+                            centre_n++
+                        } else {
+                            outer += value
+                            outer_n++
+                        }
+                    }
+                    byte++
+                }
+            }
+            END {
+                if (!full_n || !spot_n || !centre_n || !outer_n)
+                    exit 1
+                printf "full=%.1f spot=%.1f centre=%.1f outer=%.1f", \
+                       full / full_n, spot / spot_n, \
+                       centre / centre_n, outer / outer_n
+            }'
+}
+
 # Dynamic debug turns on the dev_dbg lines - notably "DDR verification passed
 # over N words", which is the only direct measurement of what the widened
 # probe check costs.
@@ -305,7 +398,16 @@ load_module() {
 
 # shellcheck disable=SC2329,SC2317
 cleanup() {
-    [ -n "${STREAM_PID:-}" ] && kill "$STREAM_PID" 2>/dev/null
+    if [ -n "${STREAM_PID:-}" ]; then
+        if [ -n "$METERING_RESTORE_NODE" ] &&
+           [ -n "$METERING_ORIGINAL" ] &&
+           [ -w "$METERING_RESTORE_NODE" ]; then
+            printf 'mode%s\n' "$METERING_ORIGINAL" \
+                >"$METERING_RESTORE_NODE" 2>/dev/null || true
+        fi
+        kill "$STREAM_PID" 2>/dev/null || true
+        wait "$STREAM_PID" 2>/dev/null || true
+    fi
     return 0
 }
 trap cleanup EXIT
@@ -437,16 +539,15 @@ fi
 
 # ============================================================================
 # Section: controls
-# DOWNSTREAM.md - "V4L2_CID_POWER_LINE_FREQUENCY" (inferred Apple ABI 0x8208)
-#                 "V4L2_CID_EXPOSURE_AUTO"
+# DOWNSTREAM.md - V4L2_CID_POWER_LINE_FREQUENCY and
+#                 V4L2_CID_EXPOSURE_AUTO
 #
-# The flicker control is the risky one: 0x8208 is an Apple-private opcode and
-# the payload shape is an inference. The stated failure mode is that the
-# firmware refuses the command and S_CTRL returns an error - so an error here
-# is a real finding, and DOWNSTREAM.md says this is the first thing to revert.
+# Static firmware analysis confirms that opcode 0x8208 reads the one-word
+# payload the driver sends. This section checks accepted values, capture, and
+# (interactively) whether those values actually change mains-light banding.
 # ============================================================================
 if wants controls; then
-    step "controls: the two controls wired to unverified firmware opcodes"
+    step "controls: anti-banding and automatic/manual exposure"
     log_section "SECTION controls"
 
     [ -n "$DEVICE" ] || wait_for_device || true
@@ -455,7 +556,7 @@ if wants controls; then
     else
         v4l2-ctl --device "$DEVICE" --list-ctrls >>"$REPORT" 2>&1 || true
 
-        # --- power_line_frequency: the inferred ABI -------------------------
+        # --- power_line_frequency -------------------------------------------
         if v4l2-ctl --device "$DEVICE" --list-ctrls 2>/dev/null |
                 grep -q power_line_frequency; then
             for val in 0 1 2; do
@@ -476,8 +577,7 @@ if wants controls; then
                             "set succeeded but reads back '$got'"
                     fi
                 else
-                    result FAIL "controls.plf.$label" \
-                        "S_CTRL failed - opcode 0x8208 payload is likely wrong, revert this control"
+                    result FAIL "controls.plf.$label" "S_CTRL failed for opcode 0x8208"
                 fi
                 dmesg_driver >>"$REPORT"
             done
@@ -603,242 +703,6 @@ if wants controls; then
         else
             result SKIP controls.ae "V4L2_CID_EXPOSURE_AUTO (0x009a0901) not exposed"
         fi
-    fi
-fi
-
-# ============================================================================
-# Section: newctrls
-# DOWNSTREAM.md - "Manual exposure and white balance"
-#
-# Every control here is wired to an opcode whose payload layout is inferred,
-# exactly like power_line_frequency above. The stated failure mode is the same:
-# the firmware refuses the command and S_CTRL returns an error. So a FAIL here
-# names the one control to revert, not the whole change set.
-#
-# The clustered controls carry a second question the flicker control does not:
-# V4L2 marks a manual control inactive while its auto leader owns the hardware,
-# so setting one is only expected to succeed after the leader is in manual.
-# Getting that order wrong looks identical to a bad payload, hence the explicit
-# switch to manual before each cluster member is touched.
-# ============================================================================
-if wants newctrls; then
-    step "newctrls: manual exposure, white balance, bias, metering, sharpness, test pattern"
-    log_section "SECTION newctrls"
-
-    [ -n "$DEVICE" ] || wait_for_device || true
-    if [ -z "$DEVICE" ]; then
-        result SKIP newctrls "no video node"
-    else
-        CTRLS="$(v4l2-ctl --device "$DEVICE" --list-ctrls 2>/dev/null || true)"
-        printf '%s\n' "$CTRLS" >>"$REPORT"
-
-        # v4l-utils has renamed several of these over the years, so accept
-        # either spelling rather than pinning one release's vocabulary.
-        ctrl_name() {
-            for n in "$@"; do
-                if printf '%s\n' "$CTRLS" | grep -qE "^[[:space:]]*${n}[[:space:]]+0x"; then
-                    printf '%s' "$n"
-                    return 0
-                fi
-            done
-            return 1
-        }
-
-        # set_ctrl <report-label> <control> <value...>
-        # Reports one PASS/FAIL per value, and reads the value back where the
-        # control is not write-only, because a set that silently does nothing
-        # is the failure this whole section exists to catch.
-        set_ctrl() {
-            _label="$1"; _ctrl="$2"; shift 2
-            for _v in "$@"; do
-                dmesg_mark
-                if v4l2-ctl --device "$DEVICE" \
-                        --set-ctrl "$_ctrl=$_v" >>"$REPORT" 2>&1; then
-                    _got="$(v4l2-ctl --device "$DEVICE" --get-ctrl "$_ctrl" \
-                            2>/dev/null | sed -n "s/^$_ctrl: //p")"
-                    if [ -z "$_got" ] || [ "$_got" = "$_v" ]; then
-                        result PASS "newctrls.$_label.$_v" "accepted"
-                    else
-                        result FAIL "newctrls.$_label.$_v" \
-                            "set succeeded but reads back '$_got'"
-                    fi
-                else
-                    result FAIL "newctrls.$_label.$_v" \
-                        "S_CTRL failed - inferred payload for this control is likely wrong"
-                fi
-                dmesg_driver >>"$REPORT"
-            done
-        }
-
-        # --- exposure cluster ----------------------------------------------
-        AE_NAME="$(ctrl_name auto_exposure exposure_auto || true)"
-        EXP_NAME="$(ctrl_name exposure_time_absolute exposure_absolute || true)"
-        GAIN_NAME="$(ctrl_name gain || true)"
-        if [ -n "$AE_NAME" ] && [ -n "$EXP_NAME" ]; then
-            # 1 = MANUAL. The cluster members are inactive until this lands.
-            v4l2-ctl --device "$DEVICE" --set-ctrl "$AE_NAME=1" >>"$REPORT" 2>&1 || true
-            set_ctrl exposure "$EXP_NAME" 50 150 300
-            [ -n "$GAIN_NAME" ] && set_ctrl gain "$GAIN_NAME" 0 64 255
-
-            if capture_ok 10; then
-                result PASS newctrls.exposure.stream "capture works with manual exposure"
-            else
-                result FAIL newctrls.exposure.stream "capture broke under manual exposure"
-            fi
-            v4l2-ctl --device "$DEVICE" --set-ctrl "$AE_NAME=0" >>"$REPORT" 2>&1 || true
-        else
-            result SKIP newctrls.exposure "manual exposure controls not exposed"
-        fi
-
-        # --- white balance cluster -----------------------------------------
-        AWB_NAME="$(ctrl_name white_balance_automatic auto_white_balance || true)"
-        WBT_NAME="$(ctrl_name white_balance_temperature || true)"
-        if [ -n "$AWB_NAME" ] && [ -n "$WBT_NAME" ]; then
-            v4l2-ctl --device "$DEVICE" --set-ctrl "$AWB_NAME=0" >>"$REPORT" 2>&1 || true
-            set_ctrl wbtemp "$WBT_NAME" 2800 5000 8000
-
-            if capture_ok 10; then
-                result PASS newctrls.wbtemp.stream "capture works with manual white balance"
-            else
-                result FAIL newctrls.wbtemp.stream "capture broke under manual white balance"
-            fi
-            v4l2-ctl --device "$DEVICE" --set-ctrl "$AWB_NAME=1" >>"$REPORT" 2>&1 || true
-        else
-            result SKIP newctrls.wbtemp "manual white balance controls not exposed"
-        fi
-
-        # --- standalone controls -------------------------------------------
-        BIAS_NAME="$(ctrl_name auto_exposure_bias || true)"
-        if [ -n "$BIAS_NAME" ]; then
-            set_ctrl bias "$BIAS_NAME" 0 6 12
-        else
-            result SKIP newctrls.bias "auto_exposure_bias not exposed"
-        fi
-
-        MET_NAME="$(ctrl_name exposure_metering || true)"
-        if [ -n "$MET_NAME" ]; then
-            set_ctrl metering "$MET_NAME" 0 1 2 3
-            # Mode 3 is what the driver used to pin unconditionally, so it is
-            # the one value that must still work.
-            v4l2-ctl --device "$DEVICE" --set-ctrl "$MET_NAME=3" >>"$REPORT" 2>&1 || true
-        else
-            result SKIP newctrls.metering "exposure_metering not exposed"
-        fi
-
-        SHARP_NAME="$(ctrl_name sharpness || true)"
-        if [ -n "$SHARP_NAME" ]; then
-            set_ctrl sharpness "$SHARP_NAME" 0 128 255
-            v4l2-ctl --device "$DEVICE" --set-ctrl "$SHARP_NAME=128" >>"$REPORT" 2>&1 || true
-        else
-            result SKIP newctrls.sharpness "sharpness not exposed"
-        fi
-
-        # Only "Disabled" is claimed to work. The other indices are guesses and
-        # a failure on them is the expected result, not a regression - so they
-        # are probed separately and reported as INFO either way.
-        TP_NAME="$(ctrl_name test_pattern || true)"
-        if [ -n "$TP_NAME" ]; then
-            set_ctrl testpattern "$TP_NAME" 0
-            for tp in 1 2 3; do
-                if v4l2-ctl --device "$DEVICE" \
-                        --set-ctrl "$TP_NAME=$tp" >>"$REPORT" 2>&1; then
-                    result INFO "newctrls.testpattern.$tp" \
-                        "accepted - this index is implemented, keep it in the menu"
-                else
-                    result INFO "newctrls.testpattern.$tp" \
-                        "refused - drop this index from fthd_test_pattern_menu[]"
-                fi
-            done
-            v4l2-ctl --device "$DEVICE" --set-ctrl "$TP_NAME=0" >>"$REPORT" 2>&1 || true
-        else
-            result SKIP newctrls.testpattern "test_pattern not exposed"
-        fi
-
-        if capture_ok 10; then
-            result PASS newctrls.stream "capture still works after exercising every new control"
-        else
-            result FAIL newctrls.stream "capture broke after exercising the new controls"
-        fi
-    fi
-fi
-
-# ============================================================================
-# Section: formats
-# DOWNSTREAM.md - "Pixel formats"
-#
-# NV16 is offered as a single-planar format whose chroma plane sits at
-# bytesperline * height inside the same buffer. Two things need confirming that
-# only hardware can answer: that the ISP accepts output format code 0 at all,
-# and that the frame it writes is exactly sizeimage bytes. A short frame means
-# the offset is wrong; an over-long one means the ISP is writing past the
-# mapping, which is the reason NV12 was left out entirely.
-# ============================================================================
-if wants formats; then
-    step "formats: does NV16 negotiate and capture at the expected size?"
-    log_section "SECTION formats"
-
-    [ -n "$DEVICE" ] || wait_for_device || true
-    if [ -z "$DEVICE" ]; then
-        result SKIP formats "no video node"
-    else
-        v4l2-ctl --device "$DEVICE" --list-formats-ext >>"$REPORT" 2>&1 || true
-
-        for fourcc in YUYV YVYU NV16; do
-            if v4l2-ctl --device "$DEVICE" --list-formats 2>/dev/null |
-                    grep -q "'$fourcc'"; then
-                result PASS "formats.enum.$fourcc" "advertised by ENUM_FMT"
-            else
-                result FAIL "formats.enum.$fourcc" "missing from ENUM_FMT"
-            fi
-        done
-
-        # Capture one frame of each and check its size against what G_FMT says
-        # sizeimage is. v4l2-ctl writes exactly the payload vb2 reports.
-        for fourcc in YUYV NV16; do
-            raw="/tmp/facetimehd-fmt-$fourcc.raw"
-            rm -f "$raw"
-            dmesg_mark
-            if ! v4l2-ctl --device "$DEVICE" \
-                    --set-fmt-video="width=1280,height=720,pixelformat=$fourcc" \
-                    >>"$REPORT" 2>&1; then
-                result FAIL "formats.$fourcc.sfmt" "S_FMT rejected $fourcc"
-                continue
-            fi
-
-            want="$(v4l2-ctl --device "$DEVICE" --get-fmt-video 2>/dev/null |
-                    sed -n 's/.*Size Image *: *\([0-9]*\).*/\1/p' | head -1)"
-            # Both formats are two bytes per pixel: YUYV packs them, NV16
-            # splits them into a W*H luma plane and a W*H chroma plane. The
-            # buffer is the same size either way, which is also why NV16 buys
-            # no bandwidth over YUYV - it is offered for consumers that want
-            # semi-planar, not to move fewer bytes.
-            expect=$(( 1280 * 720 * 2 ))
-            if [ "$want" = "$expect" ]; then
-                result PASS "formats.$fourcc.sizeimage" "sizeimage=$want as expected"
-            else
-                result FAIL "formats.$fourcc.sizeimage" \
-                    "sizeimage=$want, expected $expect"
-            fi
-
-            if v4l2-ctl --device "$DEVICE" --stream-mmap --stream-count=1 \
-                    --stream-to="$raw" >>"$REPORT" 2>&1 && [ -s "$raw" ]; then
-                got="$(wc -c <"$raw" | tr -d ' ')"
-                if [ "$got" = "$want" ]; then
-                    result PASS "formats.$fourcc.capture" "one frame, $got bytes"
-                else
-                    result FAIL "formats.$fourcc.capture" \
-                        "frame is $got bytes, G_FMT says $want - plane offset is wrong"
-                fi
-            else
-                result FAIL "formats.$fourcc.capture" "no frame captured as $fourcc"
-            fi
-            dmesg_driver >>"$REPORT"
-            rm -f "$raw"
-        done
-
-        v4l2-ctl --device "$DEVICE" \
-            --set-fmt-video="width=1280,height=720,pixelformat=YUYV" \
-            >/dev/null 2>&1 || true
     fi
 fi
 
@@ -1077,7 +941,17 @@ if wants suspend; then
             else
                 result FAIL suspend.recover "camera does not recover after resume"
             fi
-            dmesg_driver >>"$REPORT"
+            post_suspend_log="$(dmesg_since || true)"
+            printf '%s\n' "$post_suspend_log" >>"$REPORT"
+            if grep -Eqi \
+                    'failed to stop firmware channel|buffer return.*(invalid state|unknown tag)|DMAR:.*\bfault\b|IOMMU.*\bfault\b' \
+                    <<<"$post_suspend_log"; then
+                result FAIL suspend.post_faults \
+                    "driver/DMA faults appeared while stopping or recovering the resumed stream"
+            else
+                result PASS suspend.post_faults \
+                    "no channel-stop, buffer-tag, IOMMU or DMAR faults after resume"
+            fi
         fi
     fi
 fi
@@ -1105,15 +979,607 @@ if wants wedged; then
         result PASS wedged.timeout "no firmware timeout observed"
     fi
 
-    if printf '%s' "$full" | grep -qi "unknown tag\|wrong entry count\|unreadable descriptor"; then
+    if grep -Eqi \
+            'unknown tag|invalid state|wrong entry count|unreadable descriptor|failed to stop firmware channel' \
+            <<<"$full"; then
         result FAIL wedged.buffers \
-            "buffer-return mismatches logged - firmware returned tags we did not submit"
+            "stream teardown or buffer-return mismatch was logged"
     else
-        result PASS wedged.buffers "no buffer-return mismatches"
+        result PASS wedged.buffers "no stream-teardown or buffer-return mismatches"
+    fi
+
+    all_kernel="$(dmesg 2>/dev/null || true)"
+    if grep -Eqi 'DMAR:.*\bfault\b|IOMMU.*\bfault\b' <<<"$all_kernel"; then
+        result FAIL wedged.dma "IOMMU/DMAR fault logged - hardware DMA escaped a live mapping"
+    else
+        result PASS wedged.dma "no IOMMU/DMAR faults"
     fi
 
     if printf '%s' "$full" | grep -qi "Firmware did not establish the required IPC channels"; then
         result FAIL wedged.ipc "IPC channel validation rejected the firmware's table"
+    fi
+fi
+
+# ============================================================================
+# Section: readbacks
+#
+# Each debugfs read issues one reverse-engineered GET while a channel is already
+# streaming. No setter, control replay, or arbitrary opcode path is involved.
+# The first full run confirmed every response and a fault-free teardown on this
+# firmware, so this read-only section is now part of the default suite.
+# ============================================================================
+if wants readbacks; then
+    step "readbacks: testing root-only firmware GETs during a live stream"
+    log_section "SECTION readbacks"
+
+    [ -n "$DEVICE" ] || wait_for_device || die "no video node to stream from"
+    DEBUGFS_DEVICE="/sys/kernel/debug/facetimehd/${SLOT}"
+    if [ ! -d "$DEBUGFS_DEVICE" ]; then
+        result SKIP readbacks.debugfs \
+            "debugfs device directory is unavailable (mount debugfs first)"
+    else
+        dmesg_mark
+        v4l2-ctl --device "$DEVICE" --stream-mmap --stream-count=100000 \
+                 --stream-to=/dev/null >>"$REPORT" 2>&1 &
+        STREAM_PID=$!
+        sleep 2
+        if ! kill -0 "$STREAM_PID" 2>/dev/null; then
+            result FAIL readbacks.stream "stream exited before GET testing"
+        else
+            while read -r node; do
+                [ -n "$node" ] || continue
+                if value="$(cat "$DEBUGFS_DEVICE/$node" 2>>"$REPORT")"; then
+                    result PASS "readbacks.$node" "$value"
+                else
+                    result FAIL "readbacks.$node" "GET failed"
+                fi
+            done <<'EOF'
+sensor_temperature_raw
+awb_cct_raw
+ae_bias_raw
+ae_gain_cap_raw
+ae_gain_cap_min_raw
+ae_gain_cap_max_with_exp_raw
+ae_gain_cap_off_raw
+ae_integration_time_max_raw
+ae_sensor_integration_time_min_raw
+ae_sensor_integration_time_max_raw
+ae_metering_mode_raw
+EOF
+        fi
+        kill "$STREAM_PID" 2>/dev/null || true
+        wait "$STREAM_PID" 2>/dev/null || true
+        STREAM_PID=""
+        dmesg_driver >>"$REPORT"
+        if dmesg_since | grep -Eqi \
+                'firmware stopped responding|failed to stop firmware channel|unknown tag|IOMMU.*fault|DMAR:.*fault'; then
+            result FAIL readbacks.post_faults \
+                "firmware, teardown, or DMA fault followed a GET"
+        else
+            result PASS readbacks.post_faults \
+                "all GETs left streaming and teardown fault-free"
+        fi
+    fi
+fi
+
+# ============================================================================
+# Section: readback-profile (opt-in, interactive)
+#
+# Observe firmware state under controlled lighting, frame rate and warm-up.
+# This sends GETs only. The labels intentionally describe conditions rather
+# than assigning units that the firmware ABI has not proved.
+# ============================================================================
+if wants readback-profile; then
+    step "readback-profile: characterising raw firmware values"
+    log_section "SECTION readback-profile"
+
+    [ -n "$DEVICE" ] || wait_for_device || die "no video node to stream from"
+    DEBUGFS_DEVICE="/sys/kernel/debug/facetimehd/${SLOT}"
+    if [ ! -d "$DEBUGFS_DEVICE" ]; then
+        result SKIP profile.debugfs \
+            "debugfs device directory is unavailable (mount debugfs first)"
+    elif [ "$INTERACTIVE" != 1 ]; then
+        result SKIP profile.interactive \
+            "lighting profile needs a person (--no-interactive was selected)"
+    else
+        profile_snapshot() {
+            local label="$1" node value
+            shift
+            for node in "$@"; do
+                if value="$(cat "$DEBUGFS_DEVICE/$node" 2>>"$REPORT")"; then
+                    result INFO "profile.$label.$node" "$value"
+                else
+                    result FAIL "profile.$label.$node" "GET failed"
+                fi
+            done
+        }
+
+        profile_prompt() {
+            printf '\n%s\nPress Enter when ready: ' "$1"
+            read -r _profile_reply
+            sleep "$PROFILE_SETTLE_SECS"
+        }
+
+        v4l2-ctl --device "$DEVICE" --set-parm=30 >>"$REPORT" 2>&1 ||
+            result WARN profile.fps30 "could not request 30 fps; using current rate"
+        if [ "$(cat /sys/module/$MODULE_NAME/parameters/runtime_pm 2>/dev/null)" = Y ]; then
+            info "Waiting ${IDLE_WAIT}s for a cold runtime-resume baseline."
+            sleep "$IDLE_WAIT"
+        fi
+        dmesg_mark
+        v4l2-ctl --device "$DEVICE" --stream-mmap --stream-count=100000 \
+                 --stream-to=/dev/null >>"$REPORT" 2>&1 &
+        STREAM_PID=$!
+        sleep 2
+        if ! kill -0 "$STREAM_PID" 2>/dev/null; then
+            result FAIL profile.stream30 "30 fps profile stream exited"
+        else
+            profile_snapshot ambient30 \
+                sensor_temperature_raw awb_cct_raw ae_bias_raw \
+                ae_gain_cap_raw ae_gain_cap_min_raw \
+                ae_integration_time_max_raw \
+                ae_sensor_integration_time_min_raw \
+                ae_sensor_integration_time_max_raw ae_metering_mode_raw
+
+            profile_prompt \
+                "Uncover the camera and brightly illuminate the scene with a neutral/white light."
+            profile_snapshot bright30 awb_cct_raw ae_bias_raw \
+                ae_gain_cap_raw ae_gain_cap_min_raw \
+                ae_integration_time_max_raw
+
+            profile_prompt \
+                "Cover the camera completely so the frame is as dark as possible."
+            profile_snapshot dark30 awb_cct_raw ae_bias_raw ae_gain_cap_raw \
+                ae_gain_cap_min_raw ae_integration_time_max_raw
+
+            profile_prompt \
+                "Uncover it and illuminate the scene with a warm/yellow light."
+            profile_snapshot warm_light awb_cct_raw ae_bias_raw
+
+            profile_prompt \
+                "Now illuminate the same scene with a cool/blue-white light."
+            profile_snapshot cool_light awb_cct_raw ae_bias_raw
+
+            profile_prompt \
+                "Return to ordinary room lighting for the warm-up measurement."
+            info "Keeping the stream open for ${PROFILE_WARMUP_SECS}s."
+            sleep "$PROFILE_WARMUP_SECS"
+            profile_snapshot warmed30 sensor_temperature_raw awb_cct_raw \
+                ae_gain_cap_raw ae_integration_time_max_raw
+        fi
+        kill "$STREAM_PID" 2>/dev/null || true
+        wait "$STREAM_PID" 2>/dev/null || true
+        STREAM_PID=""
+
+        if v4l2-ctl --device "$DEVICE" --set-parm=15 >>"$REPORT" 2>&1; then
+            v4l2-ctl --device "$DEVICE" --stream-mmap --stream-count=100000 \
+                     --stream-to=/dev/null >>"$REPORT" 2>&1 &
+            STREAM_PID=$!
+            sleep "$PROFILE_SETTLE_SECS"
+            if kill -0 "$STREAM_PID" 2>/dev/null; then
+                profile_snapshot ambient15 ae_bias_raw ae_gain_cap_raw \
+                    ae_gain_cap_min_raw ae_integration_time_max_raw \
+                    ae_sensor_integration_time_min_raw \
+                    ae_sensor_integration_time_max_raw
+            else
+                result FAIL profile.stream15 "15 fps profile stream exited"
+            fi
+            kill "$STREAM_PID" 2>/dev/null || true
+            wait "$STREAM_PID" 2>/dev/null || true
+            STREAM_PID=""
+        else
+            result SKIP profile.fps15 "driver rejected a 15 fps request"
+        fi
+        v4l2-ctl --device "$DEVICE" --set-parm=30 >>"$REPORT" 2>&1 || true
+
+        if dmesg_since | grep -Eqi \
+                'firmware stopped responding|failed to stop firmware channel|unknown tag|IOMMU.*fault|DMAR:.*fault'; then
+            result FAIL profile.post_faults \
+                "firmware, teardown, or DMA fault followed profiling"
+        else
+            result PASS profile.post_faults \
+                "profiling left streaming and teardown fault-free"
+        fi
+        unset -f profile_snapshot profile_prompt
+    fi
+fi
+
+# ============================================================================
+# Section: roundtrips (opt-in, writes exact current values only)
+#
+# Each write accepts only "same". The kernel performs GET -> SET(current) -> GET
+# and rejects a changed result. The runner starts and tears down a fresh stream,
+# captures again, and exercises runtime resume after every individual setter.
+# ============================================================================
+if wants roundtrips; then
+    step "roundtrips: same-value GET/SET/GET validation"
+    log_section "SECTION roundtrips"
+
+    [ -n "$DEVICE" ] || wait_for_device || die "no video node to stream from"
+    DEBUGFS_DEVICE="/sys/kernel/debug/facetimehd/${SLOT}"
+    if [ ! -d "$DEBUGFS_DEVICE" ]; then
+        result SKIP roundtrips.debugfs \
+            "debugfs device directory is unavailable (mount debugfs first)"
+    elif [ "$INTERACTIVE" = 1 ] &&
+         ! confirm "Issue same-value firmware setters one at a time?"; then
+        result SKIP roundtrips.confirm "operator declined setter testing"
+    else
+        for action in $ROUNDTRIPS; do
+            action_failed=0
+            case "$action" in
+                ae_bias)
+                    roundtrip_node=roundtrip_ae_bias
+                    readback_node=ae_bias_raw ;;
+                ae_metering_mode)
+                    roundtrip_node=roundtrip_ae_metering_mode
+                    readback_node=ae_metering_mode_raw ;;
+                ae_integration_time_max)
+                    roundtrip_node=roundtrip_ae_integration_time_max
+                    readback_node=ae_integration_time_max_raw ;;
+                ae_gain_cap)
+                    roundtrip_node=roundtrip_ae_gain_cap
+                    readback_node=ae_gain_cap_raw ;;
+                ae_gain_cap_min)
+                    roundtrip_node=roundtrip_ae_gain_cap_min
+                    readback_node=ae_gain_cap_min_raw ;;
+                *) die "Unknown ROUNDTRIPS item: $action" ;;
+            esac
+
+            step "roundtrip: $action"
+            log_section "ROUNDTRIP $action"
+            dmesg_mark
+            v4l2-ctl --device "$DEVICE" --stream-mmap --stream-count=100000 \
+                     --stream-to=/dev/null >>"$REPORT" 2>&1 &
+            STREAM_PID=$!
+            sleep 2
+            if ! kill -0 "$STREAM_PID" 2>/dev/null; then
+                result FAIL "roundtrip.$action.stream" \
+                    "stream exited before the setter"
+                STREAM_PID=""
+                break
+            fi
+
+            before="$(cat "$DEBUGFS_DEVICE/$readback_node" 2>>"$REPORT")" || {
+                result FAIL "roundtrip.$action.before" "initial GET failed"
+                kill "$STREAM_PID" 2>/dev/null || true
+                wait "$STREAM_PID" 2>/dev/null || true
+                STREAM_PID=""
+                break
+            }
+            result INFO "roundtrip.$action.armed" \
+                "about to SET the current value: $before"
+            sync -f "$REPORT"
+            sync -f "$REPORT.results"
+
+            if ! printf 'same\n' >"$DEBUGFS_DEVICE/$roundtrip_node"; then
+                result FAIL "roundtrip.$action.set" \
+                    "same-value kernel round trip failed"
+                kill "$STREAM_PID" 2>/dev/null || true
+                wait "$STREAM_PID" 2>/dev/null || true
+                STREAM_PID=""
+                break
+            fi
+
+            after="$(cat "$DEBUGFS_DEVICE/$readback_node" 2>>"$REPORT")" || {
+                result FAIL "roundtrip.$action.after" "final GET failed"
+                kill "$STREAM_PID" 2>/dev/null || true
+                wait "$STREAM_PID" 2>/dev/null || true
+                STREAM_PID=""
+                break
+            }
+            if [ "$before" != "$after" ]; then
+                result FAIL "roundtrip.$action.value" \
+                    "value changed: before '$before', after '$after'"
+                action_failed=1
+            else
+                result PASS "roundtrip.$action.value" \
+                    "GET/SET/GET remained $after"
+            fi
+            if kill -0 "$STREAM_PID" 2>/dev/null; then
+                result PASS "roundtrip.$action.live" \
+                    "original stream remained alive"
+            else
+                result FAIL "roundtrip.$action.live" \
+                    "stream exited after the setter"
+                action_failed=1
+            fi
+            kill "$STREAM_PID" 2>/dev/null || true
+            wait "$STREAM_PID" 2>/dev/null || true
+            STREAM_PID=""
+
+            if capture_ok 10; then
+                result PASS "roundtrip.$action.restart" \
+                    "capture works after STREAMOFF and restart"
+            else
+                result FAIL "roundtrip.$action.restart" \
+                    "capture failed after stream restart"
+                action_failed=1
+            fi
+
+            if [ "$(cat /sys/module/$MODULE_NAME/parameters/runtime_pm 2>/dev/null)" = Y ]; then
+                sleep "$IDLE_WAIT"
+                if capture_ok 10; then
+                    result PASS "roundtrip.$action.runtime" \
+                        "capture works after an idle runtime cycle"
+                else
+                    result FAIL "roundtrip.$action.runtime" \
+                        "capture failed after an idle runtime cycle"
+                    action_failed=1
+                fi
+            else
+                result SKIP "roundtrip.$action.runtime" \
+                    "runtime_pm is disabled"
+            fi
+
+            dmesg_driver >>"$REPORT"
+            if dmesg_since | grep -Eqi \
+                    'firmware stopped responding|failed to stop firmware channel|unknown tag|IOMMU.*fault|DMAR:.*fault|channel stop failed'; then
+                result FAIL "roundtrip.$action.faults" \
+                    "firmware, teardown, or DMA fault followed the setter"
+                action_failed=1
+            else
+                result PASS "roundtrip.$action.faults" \
+                    "no firmware, teardown, IOMMU, or DMAR faults"
+            fi
+            sync -f "$REPORT"
+            sync -f "$REPORT.results"
+            if [ "$action_failed" -ne 0 ]; then
+                warn "Stopping before the next setter because $action failed."
+                break
+            fi
+        done
+    fi
+fi
+
+# ============================================================================
+# Section: metering-modes (opt-in, bounded mutation)
+#
+# The firmware dispatcher proves that only modes 0..3 exist, and the exact
+# current-value write has passed hardware validation. This next stage changes
+# one mode at a time through a fixed-token debugfs endpoint. A fresh stream is
+# used per mode; its original mode is restored while that stream is still live.
+# The retained frames and spatial luma measurements establish whether those
+# four firmware values honestly map to the standard V4L2 metering menu.
+# ============================================================================
+if wants metering-modes; then
+    step "metering-modes: bounded AE metering mutation"
+    log_section "SECTION metering-modes"
+
+    [ -n "$DEVICE" ] || wait_for_device || die "no video node to stream from"
+    DEBUGFS_DEVICE="/sys/kernel/debug/facetimehd/${SLOT}"
+    if [ "$METERING_RESTART_AE" = 1 ]; then
+        metering_node="$DEBUGFS_DEVICE/test_ae_metering_mode_restart"
+        metering_sequence="stop AE, set mode, restart AE"
+    else
+        metering_node="$DEBUGFS_DEVICE/test_ae_metering_mode"
+        metering_sequence="set mode while AE remains live"
+    fi
+    metering_readback="$DEBUGFS_DEVICE/ae_metering_mode_raw"
+
+    if [ ! -w "$metering_node" ] || [ ! -r "$metering_readback" ]; then
+        result SKIP metering.debugfs \
+            "bounded metering test nodes are unavailable"
+    elif [ "$INTERACTIVE" != 1 ]; then
+        result SKIP metering.interactive \
+            "metering semantics need a fixed high-contrast scene"
+    elif ! confirm "Test only firmware metering modes 0, 1, 2 and 3, restoring the original after each?"; then
+        result SKIP metering.confirm "operator declined bounded setter testing"
+    else
+        fmt_text="$(v4l2-ctl --device "$DEVICE" --get-fmt-video 2>>"$REPORT")"
+        dimensions="$(printf '%s\n' "$fmt_text" | sed -n \
+            's/^[[:space:]]*Width\/Height[[:space:]]*:[[:space:]]*\([0-9][0-9]*\)\/\([0-9][0-9]*\).*/\1 \2/p' | head -1)"
+        read -r metering_width metering_height <<<"$dimensions"
+        metering_fourcc="$(printf '%s\n' "$fmt_text" | sed -n \
+            "s/^[[:space:]]*Pixel Format[[:space:]]*:[[:space:]]*'\([^']*\)'.*/\1/p" | head -1)"
+        metering_frame_size="$(printf '%s\n' "$fmt_text" | sed -n \
+            's/^[[:space:]]*Size Image[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' | head -1)"
+
+        if [ -z "$metering_width" ] || [ -z "$metering_height" ] ||
+           [ -z "$metering_frame_size" ]; then
+            result FAIL metering.format "could not parse capture dimensions"
+        elif [ "$metering_fourcc" != YUYV ] && [ "$metering_fourcc" != YVYU ]; then
+            result SKIP metering.format \
+                "luma parser does not support $metering_fourcc"
+        else
+            METERING_DIR="$(mktemp -d -p /tmp facetimehd-metering.XXXXXXXX)"
+            result INFO metering.frames \
+                "retaining raw mode captures in $METERING_DIR"
+            result INFO metering.sequence "$metering_sequence"
+            info "Set up one stationary, high-contrast scene: put a bright"
+            info "white target exactly in the middle of the image with a much"
+            info "darker surround. Make the target fill about one quarter of"
+            info "the image width and height, without clipping to solid white."
+            info "Keep the camera, target and lighting fixed."
+            printf 'Press Enter when ready: '
+            read -r _metering_reply
+
+            v4l2-ctl --device "$DEVICE" --set-parm=30 >>"$REPORT" 2>&1 ||
+                result WARN metering.fps "could not request 30 fps"
+
+            # Mode 3 first is the known startup baseline. Each following run
+            # starts a new channel, which independently resets firmware to 3.
+            for metering_mode in 3 0 1 2; do
+                action_failed=0
+                metering_raw="$METERING_DIR/mode${metering_mode}.raw"
+                : >"$metering_raw"
+                dmesg_mark
+
+                # v4l2-ctl's sleep counter includes --stream-skip buffers,
+                # although its stream-count does not. Pause only after both
+                # the settling frames and retained frames have been dequeued.
+                metering_sleep_count=$(( METERING_SETTLE_FRAMES +
+                                          METERING_CAPTURE_FRAMES ))
+                metering_mode_wait=$(( (metering_sleep_count + 29) / 30 + 3 ))
+                if [ "$metering_mode_wait" -lt "$METERING_WAIT_SECS" ]; then
+                    metering_mode_wait="$METERING_WAIT_SECS"
+                fi
+
+                v4l2-ctl --device "$DEVICE" --stream-mmap \
+                    --stream-count=100000 \
+                    --stream-skip="$METERING_SETTLE_FRAMES" \
+                    --stream-sleep="count=${metering_sleep_count},sleep=0,mode=0" \
+                    --stream-to="$metering_raw" >>"$REPORT" 2>&1 &
+                STREAM_PID=$!
+
+                metering_original=""
+                for _metering_try in $(seq 1 40); do
+                    if metering_original="$(cat "$metering_readback" 2>>"$REPORT")"; then
+                        case "$metering_original" in
+                            0|1|2|3) break ;;
+                            *) metering_original="" ;;
+                        esac
+                    fi
+                    sleep 0.1
+                done
+
+                if [ -z "$metering_original" ]; then
+                    result FAIL "metering.mode${metering_mode}.start" \
+                        "stream never exposed a valid original mode"
+                    action_failed=1
+                else
+                    METERING_RESTORE_NODE="$metering_node"
+                    METERING_ORIGINAL="$metering_original"
+                    result INFO "metering.mode${metering_mode}.armed" \
+                        "original=$metering_original; about to request mode $metering_mode"
+                    sync -f "$REPORT"
+                    sync -f "$REPORT.results"
+
+                    if printf 'mode%s\n' "$metering_mode" >"$metering_node"; then
+                        metering_after="$(cat "$metering_readback" 2>>"$REPORT" || true)"
+                        if [ "$metering_after" = "$metering_mode" ]; then
+                            result PASS "metering.mode${metering_mode}.set" \
+                                "firmware readback is $metering_after"
+                        else
+                            result FAIL "metering.mode${metering_mode}.set" \
+                                "requested $metering_mode, read back '$metering_after'"
+                            action_failed=1
+                        fi
+                    else
+                        result FAIL "metering.mode${metering_mode}.set" \
+                            "bounded firmware setter failed"
+                        action_failed=1
+                    fi
+                fi
+
+                sleep "$metering_mode_wait"
+                if kill -0 "$STREAM_PID" 2>/dev/null; then
+                    result PASS "metering.mode${metering_mode}.live" \
+                        "stream remained alive through settle and capture"
+                    metering_steady="$(cat "$metering_readback" 2>>"$REPORT" || true)"
+                    if [ "$metering_steady" != "$metering_mode" ]; then
+                        result FAIL "metering.mode${metering_mode}.steady" \
+                            "mode changed before restore: '$metering_steady'"
+                        action_failed=1
+                    else
+                        result PASS "metering.mode${metering_mode}.steady" \
+                            "mode remained $metering_steady until restore"
+                    fi
+                else
+                    result FAIL "metering.mode${metering_mode}.live" \
+                        "capture process exited before restoration"
+                    action_failed=1
+                fi
+
+                metering_restored=""
+                if [ -n "$metering_original" ] &&
+                   kill -0 "$STREAM_PID" 2>/dev/null &&
+                   printf 'mode%s\n' "$metering_original" >"$metering_node"; then
+                    metering_restored="$(cat "$metering_readback" 2>>"$REPORT" || true)"
+                fi
+                if [ -n "$metering_original" ] &&
+                   [ "$metering_restored" = "$metering_original" ]; then
+                    result PASS "metering.mode${metering_mode}.restore" \
+                        "restored original mode $metering_original before STREAMOFF"
+                    METERING_RESTORE_NODE=""
+                    METERING_ORIGINAL=""
+                else
+                    result FAIL "metering.mode${metering_mode}.restore" \
+                        "could not verify original mode restoration"
+                    action_failed=1
+                fi
+
+                kill "$STREAM_PID" 2>/dev/null || true
+                wait "$STREAM_PID" 2>/dev/null || true
+                STREAM_PID=""
+                METERING_RESTORE_NODE=""
+                METERING_ORIGINAL=""
+
+                metering_bytes="$(stat -c %s "$metering_raw" 2>/dev/null || echo 0)"
+                metering_complete=$(( metering_bytes / metering_frame_size ))
+                if [ "$metering_complete" -gt 0 ] &&
+                   metering_metrics="$(frame_luma_metrics "$metering_raw" \
+                       "$metering_frame_size" "$metering_width" \
+                       "$metering_height")"; then
+                    result INFO "metering.mode${metering_mode}.luma" \
+                        "$metering_metrics frames=$metering_complete"
+                    if [ "$metering_mode" -eq 3 ]; then
+                        metering_spot="$(printf '%s\n' "$metering_metrics" |
+                            sed -n 's/.*spot=\([0-9.][0-9.]*\).*/\1/p')"
+                        metering_outer="$(printf '%s\n' "$metering_metrics" |
+                            sed -n 's/.*outer=\([0-9.][0-9.]*\).*/\1/p')"
+                        if [ -n "$metering_spot" ] &&
+                           [ -n "$metering_outer" ] &&
+                           awk -v s="$metering_spot" -v o="$metering_outer" \
+                               'BEGIN { exit !(s >= o + 20 && s < 235) }'; then
+                            result PASS metering.scene \
+                                "bright central spot is distinct and unclipped ($metering_spot vs outer $metering_outer)"
+                        else
+                            result FAIL metering.scene \
+                                "central spot must be 20+ luma above outer and below 235 (spot=$metering_spot outer=$metering_outer); reposition or dim target"
+                            action_failed=1
+                        fi
+                    fi
+                else
+                    result FAIL "metering.mode${metering_mode}.luma" \
+                        "no complete frame available for measurement"
+                    action_failed=1
+                fi
+
+                if capture_ok 10; then
+                    result PASS "metering.mode${metering_mode}.restart" \
+                        "capture works after restore and STREAMOFF"
+                else
+                    result FAIL "metering.mode${metering_mode}.restart" \
+                        "capture failed after restore and STREAMOFF"
+                    action_failed=1
+                fi
+
+                if [ "$(cat /sys/module/$MODULE_NAME/parameters/runtime_pm 2>/dev/null)" = Y ]; then
+                    sleep "$IDLE_WAIT"
+                    if capture_ok 10; then
+                        result PASS "metering.mode${metering_mode}.runtime" \
+                            "capture works after an idle runtime cycle"
+                    else
+                        result FAIL "metering.mode${metering_mode}.runtime" \
+                            "capture failed after an idle runtime cycle"
+                        action_failed=1
+                    fi
+                else
+                    result SKIP "metering.mode${metering_mode}.runtime" \
+                        "runtime_pm is disabled"
+                fi
+
+                dmesg_driver >>"$REPORT"
+                if dmesg_since | grep -Eqi \
+                        'firmware stopped responding|failed to stop firmware channel|unknown tag|IOMMU.*fault|DMAR:.*fault|channel stop failed'; then
+                    result FAIL "metering.mode${metering_mode}.faults" \
+                        "firmware, teardown, or DMA fault followed the mutation"
+                    action_failed=1
+                else
+                    result PASS "metering.mode${metering_mode}.faults" \
+                        "no firmware, teardown, IOMMU, or DMAR faults"
+                fi
+                sync -f "$REPORT"
+                sync -f "$REPORT.results"
+
+                if [ "$action_failed" -ne 0 ]; then
+                    warn "Stopping before the next metering mode."
+                    break
+                fi
+            done
+            result INFO metering.interpretation \
+                "compare full/spot/centre/outer luma across modes; semantics are not assigned automatically"
+        fi
     fi
 fi
 

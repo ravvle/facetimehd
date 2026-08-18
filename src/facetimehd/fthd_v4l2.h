@@ -20,11 +20,6 @@ struct fthd_fmt {
 	struct v4l2_pix_format fmt;
 	const char *desc;
 	int range; /* CISP_COMMAND_CH_OUTPUT_CONFIG_SET */
-	/* Number of plane addresses the ISP is given, not the number of vb2
-	 * planes - the queue is single-planar and always has exactly one.  A
-	 * semi-planar format sets this to 2 and carries its chroma plane at an
-	 * offset inside that same buffer. */
-	int planes;
 	int x1; /* for CISP_CMD_CH_CROP_SET */
 	int y1;
 	int x2;

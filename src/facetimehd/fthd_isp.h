@@ -673,87 +673,100 @@ struct isp_cmd_channel_ae_metering_mode_set {
 	u32 mode;
 };
 
-/* Payload layout inferred from the uniform shape of the other per-channel
- * setters; @freq is the mains frequency in Hz.  See patch 0016. */
+/* Firmware opcode 0x8208 reads this 32-bit value at command offset +0x0c.
+ * The accepted values have been hardware-tested; visible anti-banding effect
+ * under controlled lighting remains to be demonstrated. */
 struct isp_cmd_channel_ae_flicker_freq_set {
 	u32 channel;
 	u32 freq;
 };
 
 /*
- * The payloads below follow the same inference as the flicker-frequency
- * command above: the opcodes are real, taken from the ISP's own command
- * enumeration, but Apple documents none of their argument layouts.  Each one
- * uses the shape every other per-channel setter uses - a u32 channel followed
- * by the value - and a wrong guess is refused by the firmware, so it surfaces
- * as an error from S_CTRL rather than as a wedged ISP.  Every one of these is
- * a hardware-validation target; see DOWNSTREAM.md.
+ * The dormant payload definitions below record layouts recovered from this
+ * machine's firmware. Apple documents neither their units nor their semantic
+ * ranges. Setters are deliberately not connected to V4L2, debugfs, hwmon, or
+ * automatic stream setup. A small set of proven GET layouts is exposed only
+ * through root-readable, active-stream debugfs files; see
+ * FIRMWARE-REVERSE-ENGINEERING.md.
  */
 
-/* Signed exposure compensation applied while AE is running, in millis of an
- * EV step (so -1000 is -1 EV). */
+/* Firmware reads a 16-bit value and a 32-bit tag. The encoding and tag
+ * semantics are not known; see FIRMWARE-REVERSE-ENGINEERING.md. */
 struct isp_cmd_channel_ae_bias_set {
 	u32 channel;
-	s32 bias;
+	u16 bias;
+	u16 reserved;
+	u32 tag;
 };
 
-/* Manual sensor integration time, in microseconds. */
+/* The corresponding GET writes the same bias/tag pair after the channel. */
+struct isp_cmd_channel_ae_bias_get {
+	u32 channel;
+	u16 bias;
+	u16 reserved;
+	u32 tag;
+};
+
+/* Scalar AE and AWB commands carry one firmware-native word after channel. */
+struct isp_cmd_channel_u32 {
+	u32 channel;
+	u32 value;
+};
+
+/* Apple AE metering-mode GET writes one byte at command offset +0x0c. */
+struct isp_cmd_channel_ae_metering_mode_get {
+	u32 channel;
+	u8 mode;
+	u8 reserved[3];
+};
+
+/* Manual sensor integration time. The wire width is proven; units are not. */
 struct isp_cmd_channel_ae_integration_time_set {
 	u32 channel;
 	u32 time;
 };
 
-/* Manual sensor gain.  Sent to both the min and max gain-cap opcodes, which
- * is how an AE engine is pinned to one fixed gain. */
-struct isp_cmd_channel_ae_gain_set {
-	u32 channel;
-	u32 gain;
-};
-
-/* Manual white-balance correlated colour temperature, in kelvin. */
+/* Firmware consumes both words after the channel. The first appears to be CCT
+ * and the second is likely a tag, but neither semantic is yet an ABI. */
 struct isp_cmd_channel_awb_cct_manual {
 	u32 channel;
 	u32 cct;
-};
-
-/* Manual white-balance channel gains, Q10 fixed point (1024 is unity). */
-struct isp_cmd_channel_awb_gain_manual {
-	u32 channel;
-	u32 red;
-	u32 blue;
+	u32 tag;
 };
 
 struct isp_cmd_channel_sharpness_set {
 	u32 channel;
-	u32 sharpness;
+	u8 sharpness;
+	u8 reserved[3];
 };
 
 struct isp_cmd_channel_test_pattern_config {
 	u32 channel;
-	u32 pattern;
+	u16 unknown;
+	u16 pattern;
 };
 
-/* Spatial noise reduction strength.  Same inferred-payload caveat as the
- * block above: the opcode is real, the argument layout is the shape every
- * other per-channel setter uses. */
+/* Spatial noise-reduction byte. */
 struct isp_cmd_channel_noise_reduction_set {
 	u32 channel;
-	u32 strength;
+	u8 strength;
+	u8 reserved[3];
 };
 
-/* Chroma noise suppression strength. */
+/* Firmware consumes three distinct bytes. Their meanings are unknown, so this
+ * structure must not be exposed as one generic strength control. */
 struct isp_cmd_channel_chroma_suppression_set {
 	u32 channel;
-	u32 strength;
+	u8 field0;
+	u8 field1;
+	u8 field2;
 };
 
-/* Dynamic range compression strength.  DRC is already started unconditionally
- * by fthd_start_channel(); this sets how hard it pulls shadows up, which is
- * what V4L2_CID_BACKLIGHT_COMPENSATION means on a camera that has no
- * backlight-specific hardware. */
+/* Dynamic-range-compression byte. */
 struct isp_cmd_channel_drc_set {
 	u32 channel;
-	u32 strength;
+	u8 strength;
+	u8 reserved[3];
 };
 
 /* Sensor die temperature.  A GET: @temperature is written by the firmware.
@@ -855,12 +868,25 @@ extern int fthd_isp_cmd_channel_temporal_filter_disable(struct fthd_private *dev
 extern int fthd_isp_cmd_channel_motion_history_start(struct fthd_private *dev_priv, int channel);
 extern int fthd_isp_cmd_channel_motion_history_stop(struct fthd_private *dev_priv, int channel);
 extern int fthd_isp_cmd_channel_ae_metering_mode_set(struct fthd_private *dev_priv, int channel, int mode);
+extern int fthd_isp_cmd_channel_ae_metering_mode_get(struct fthd_private *dev_priv, int channel, u8 *mode);
 extern int fthd_isp_cmd_channel_ae_flicker_freq_set(struct fthd_private *dev_priv, int channel, int freq);
 extern int fthd_isp_cmd_channel_ae_bias_set(struct fthd_private *dev_priv, int channel, int bias);
+extern int fthd_isp_cmd_channel_ae_bias_set_raw(struct fthd_private *dev_priv, int channel, u16 bias, u32 tag);
+extern int fthd_isp_cmd_channel_ae_bias_get(struct fthd_private *dev_priv, int channel, u16 *bias, u32 *tag);
+extern int fthd_isp_cmd_channel_ae_gain_cap_get(struct fthd_private *dev_priv, int channel, u32 *value);
+extern int fthd_isp_cmd_channel_ae_gain_cap_set_raw(struct fthd_private *dev_priv, int channel, u32 value);
+extern int fthd_isp_cmd_channel_ae_gain_cap_min_get(struct fthd_private *dev_priv, int channel, u32 *value);
+extern int fthd_isp_cmd_channel_ae_gain_cap_min_set_raw(struct fthd_private *dev_priv, int channel, u32 value);
+extern int fthd_isp_cmd_channel_ae_gain_cap_max_with_exp_get(struct fthd_private *dev_priv, int channel, u32 *value);
+extern int fthd_isp_cmd_channel_ae_gain_cap_off_get(struct fthd_private *dev_priv, int channel, u32 *value);
+extern int fthd_isp_cmd_channel_ae_integration_time_max_get(struct fthd_private *dev_priv, int channel, u32 *value);
+extern int fthd_isp_cmd_channel_ae_integration_time_max_set_raw(struct fthd_private *dev_priv, int channel, u32 value);
+extern int fthd_isp_cmd_channel_ae_sensor_integration_time_min_get(struct fthd_private *dev_priv, int channel, u32 *value);
+extern int fthd_isp_cmd_channel_ae_sensor_integration_time_max_get(struct fthd_private *dev_priv, int channel, u32 *value);
 extern int fthd_isp_cmd_channel_ae_integration_time_set(struct fthd_private *dev_priv, int channel, unsigned int usec);
 extern int fthd_isp_cmd_channel_ae_gain_set(struct fthd_private *dev_priv, int channel, unsigned int gain);
+extern int fthd_isp_cmd_channel_awb_cct_get(struct fthd_private *dev_priv, int channel, u32 *value);
 extern int fthd_isp_cmd_channel_awb_cct_manual(struct fthd_private *dev_priv, int channel, unsigned int cct);
-extern int fthd_isp_cmd_channel_awb_gain_manual(struct fthd_private *dev_priv, int channel, unsigned int red, unsigned int blue);
 extern int fthd_isp_cmd_channel_sharpness_set(struct fthd_private *dev_priv, int channel, int sharpness);
 extern int fthd_isp_cmd_channel_test_pattern_config(struct fthd_private *dev_priv, int channel, int pattern);
 extern int fthd_isp_cmd_channel_noise_reduction_set(struct fthd_private *dev_priv, int channel, int strength);

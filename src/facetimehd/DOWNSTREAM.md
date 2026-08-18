@@ -34,11 +34,10 @@ This directory is the driver built and installed by this project. It is a
 
 ## Power management and lifecycle
 
-- The driver now provides runtime and system `dev_pm_ops`. An open video file
-  holds a runtime-PM reference; after the final close the camera autosuspends,
-  then reloads its firmware on the next open.
-- `facetimehd.runtime_pm=0` remains available as an escape hatch for machines
-  where runtime PM is unreliable.
+- The driver provides runtime and system `dev_pm_ops`. Runtime PM is opt-in
+  with `facetimehd.runtime_pm=1`: when enabled, an open video file holds a
+  reference, after the final close the camera autosuspends, and the next open
+  reloads its firmware. The default leaves the PCI device powered.
 - System suspend no longer fails with `-EBUSY` when the camera is streaming.
   Streaming is stopped and the stale ISP mappings are invalidated before the
   hardware goes down.
@@ -221,48 +220,57 @@ after they are changed. Their visible effect has not yet been proven under
 controlled lighting, so they should still be treated as hardware-validation
 targets.
 
-## Manual exposure and white balance
+## Removed inferred firmware controls
+
+The manual-exposure, manual-white-balance and image-quality controls added by
+the post-`20bdd61` feature series have been removed, including their module
+parameter gate. Registering them made `v4l2_ctrl_handler_setup()` send every
+default command at ordinary `STREAMON`, and the combined build repeatedly
+hard-locked the MacBookAir7,2. Static firmware analysis then proved that
+several payloads were malformed rather than merely untested. The complete
+wire-layout evidence is in
+[`FIRMWARE-REVERSE-ENGINEERING.md`](FIRMWARE-REVERSE-ENGINEERING.md).
+
+The stable brightness, contrast, saturation, hue, automatic white balance,
+anti-banding and automatic/manual exposure switches remain available and use
+their hardware-tested command paths.
 
 `V4L2_CID_EXPOSURE_AUTO` and `V4L2_CID_AUTO_WHITE_BALANCE` each used to
 advertise only half a feature: both could be switched to manual, and neither
 had anything to set once they were. Selecting manual exposure simply froze the
 picture wherever the automatic loop had last left it.
 
-- `V4L2_CID_EXPOSURE_ABSOLUTE` and `V4L2_CID_GAIN` now sit in a
+- The attempted `V4L2_CID_EXPOSURE_ABSOLUTE` and `V4L2_CID_GAIN` sat in a
   `v4l2_ctrl_auto_cluster()` led by `V4L2_CID_EXPOSURE_AUTO`, so they are
   marked inactive while the ISP owns the exposure and become settable when it
   does not. The ISP has no "set the gain" command, only a gain-cap pair;
   collapsing its minimum and maximum onto one value is what pins a fixed gain.
-- `V4L2_CID_WHITE_BALANCE_TEMPERATURE` is clustered against
+- The attempted `V4L2_CID_WHITE_BALANCE_TEMPERATURE` was clustered against
   `V4L2_CID_AUTO_WHITE_BALANCE` the same way.
-- `V4L2_CID_AUTO_EXPOSURE_BIAS` offers ±2 EV in thirds. Unlike the cluster
-  above it applies with automatic exposure still running, which makes it the
-  control that actually helps a backlit subject.
-- `V4L2_CID_EXPOSURE_METERING` replaces the metering mode `fthd_start_channel()`
-  used to pin to 3 on every channel start. The control's default is that same
-  mode, so out-of-the-box behaviour is unchanged; the hardcoded call was removed
-  for the reason the brightness and contrast ones were, namely that
-  `v4l2_ctrl_handler_setup()` replays the handler immediately afterwards and
-  would otherwise be overridden.
-- `V4L2_CID_SHARPNESS` and a `V4L2_CID_TEST_PATTERN` menu are exposed.
+- The attempted `V4L2_CID_AUTO_EXPOSURE_BIAS` claimed ±2 EV in thirds without
+  evidence for that unit. Firmware actually reads a 16-bit bias and a separate
+  32-bit tag; the request omitted the tag and was four bytes short.
+- The attempted `V4L2_CID_EXPOSURE_METERING` replaced the established mode 3.
+  The fixed, hardware-tested command has been restored.
+- `V4L2_CID_SHARPNESS` and a `V4L2_CID_TEST_PATTERN` menu were attempted.
   The test pattern is worth having as a diagnostic: it is the only way to
   separate "the sensor or firmware is not producing frames" from "the ring, the
   IOMMU mapping or buffer return is broken" without a lit room or a subject.
 
 ## Image-quality controls
 
-Three more of the ISP's processing blocks are exposed. All follow the same rule
-as the block above: the opcodes are real, the payload layouts are inferred from
-the shape every other per-channel setter uses, and a wrong guess is refused by
-the firmware rather than being destructive.
+Three more ISP processing blocks had been placed behind the same module gate.
+They are no longer exposed. Firmware disassembly shows that sharpness, noise
+reduction and DRC consume one byte, while chroma suppression consumes three
+independent bytes and cannot honestly be represented by one generic strength.
 
-- `V4L2_CID_BACKLIGHT_COMPENSATION` drives `CISP_CMD_CH_DRC_SET`. Dynamic range
+- The attempted `V4L2_CID_BACKLIGHT_COMPENSATION` drove `CISP_CMD_CH_DRC_SET`. Dynamic range
   compression is already started unconditionally by `fthd_start_channel()`; this
   is the separate opcode that says how hard it pulls the shadows up, which is
   what backlight compensation means on a camera with no backlight-specific
   hardware of its own.
 - Noise reduction (`CISP_CMD_CH_NOISE_REDUCTION_SET`) and chroma suppression
-  (`CISP_CMD_CH_CHROMA_SUPPRESSION_SET`) are exposed as **driver-private**
+  (`CISP_CMD_CH_CHROMA_SUPPRESSION_SET`) were exposed as **driver-private**
   controls at `V4L2_CID_USER_BASE | 0x1001` and `| 0x1002`. V4L2 has no standard
   CID for either. `V4L2_CID_IMAGE_STABILIZATION` was the tempting place to put
   denoising and would have been wrong: an application asking for stabilisation
@@ -271,61 +279,111 @@ the firmware rather than being destructive.
 
 ## Sensor temperature
 
-`CISP_CMD_CH_SENSOR_TEMPERATURE_GET` is read and exposed two ways, because its
-*scale* is undocumented - celsius, deci-celsius and a raw sensor code are all
-plausible readings of the same number.
+Firmware disassembly confirms that `CISP_CMD_CH_SENSOR_TEMPERATURE_GET` returns
+a signed 16-bit sensor value, sign-extended into the response word after the
+channel. Its scale remains unknown. It is therefore exposed only through the
+root-readable `sensor_temperature_raw` debugfs file, and only while a stream is
+already active. Each read sends one GET; nothing polls it. It remains absent
+from hwmon because that ABI requires millidegrees Celsius, and plausibility
+filtering cannot establish a unit.
 
-- `hwmon` publishes `temp1_input`, which is millidegrees celsius by definition.
-  A number in the wrong scale there is not a caveat, it is a wrong reading in
-  every monitoring tool on the system. So the driver publishes a value only when
-  the firmware returns something that can only sensibly be celsius (-40..125)
-  and returns `-EIO` otherwise, with a rate-limited warning carrying the raw
-  value.
-- `debugfs/facetimehd/<dev>/sensor_temperature_raw` always reports the number
-  exactly as the firmware gave it. That is the file to read when working out
-  what the scale really is.
-- Reading either powers a runtime-suspended camera up, the same documented
-  trade-off the other debugfs accessors make. That is also why this is not a
-  volatile V4L2 control: `G_CTRL` is not expected to spin up hardware.
+The same active-stream, mode-`0400` boundary exposes confirmed readbacks for
+AWB CCT, AE bias/tag, gain-cap states, AE integration limits, and Apple AE
+metering mode. Reads hold `ioctl_lock` across one firmware transaction so a
+concurrent STREAMOFF cannot tear down the channel underneath it. Nominal GET
+slots for sharpness, noise reduction, chroma suppression, and DRC are not
+exposed: this firmware's dispatcher routes those opcodes to its unsupported
+command path even though their names exist in the recovered enum.
 
-`CISP_CMD_CH_AWB_1ST_GAIN_MANUAL` is deliberately **not** exposed as
-`V4L2_CID_RED_BALANCE`/`BLUE_BALANCE`. The colour temperature and the
-per-channel gains are two ways of writing the same white-balance state, so
-putting both in one cluster would make the replay order decide which wins —
-and runtime PM replays the whole handler on every idle cycle. One unambiguous
-control is better than two that quietly fight.
+The first complete readback run on 2026-08-18 returned temperature `-1`, AWB
+CCT `4697`, AE bias/tag `256/0`, gain cap/minimum `8192/256`, integration
+maximum `33`, sensor integration bounds `38..1000000`, and metering mode `3`.
+All GETs completed during one stream and the subsequent teardown logged no
+firmware, channel, IOMMU, or DMAR fault. Temperature `-1` may be an unavailable
+sentinel; the other apparent fixed-point/unit interpretations remain hypotheses.
 
-`fthd_isp_cmd_channel_awb_gain_manual()` is nevertheless kept, unused and
-commented as such. The choice between the two is a choice between two writable
-representations of one piece of state, not between a working and a broken one -
-so anyone reconsidering it (say, because hardware shows the CCT command is the
-one the firmware ignores) needs this side implemented to compare against.
+A follow-up controlled profile sampled bright, dark, warm, and cool scenes,
+requested 30 and 15 fps, and a ten-minute continuous stream. AWB CCT changed
+from `2652` under warm/yellow light to `5777` under cool/blue-white light,
+strongly supporting a current kelvin CCT interpretation on this machine. Bias
+and tag stayed `256/0`, gain cap/minimum stayed `8192/256`, and AE integration
+maximum stayed `33` under every sampled lighting condition; these are
+configuration limits, not current-exposure telemetry. Keeping `33` at requested
+15 fps is also consistent with host-side decimation leaving the 30 fps sensor
+and AE configuration unchanged. Sensor integration limits stayed
+`38..1000000`. Temperature remained `-1` after ten minutes, strengthening the
+unavailable-sentinel interpretation. The 29.97/14.98-fps streams and teardown
+were fault-free. The durable report is
+`/tmp/facetimehd-hw-validate-20260818-144108.log` on the test machine.
 
-As with the anti-banding command, the opcodes above are real but Apple
-documents none of their argument layouts, so each payload follows the shape
-every other per-channel setter uses. A wrong guess is refused by the firmware
-and surfaces as an error from `S_CTRL` rather than as a wedged ISP. All of
-them are hardware-validation targets.
+For the next validation stage, five mode-`0200` debugfs files accept only
+`same`. Each holds `ioctl_lock`, requires a running channel, GETs the current
+value, SETs that exact value once, GETs again, and returns an error on mismatch.
+They cover AE bias with its returned tag, metering mode, AE integration maximum,
+gain cap, and minimum gain cap. They are test scaffolding only: no arbitrary
+value is accepted, nothing calls them automatically, and no V4L2 control is
+registered. `tests/hw-validate.sh --only roundtrips` adds persistent pre-write
+markers, a fresh stream per setter, restart capture, runtime cycling, and fault
+checks. All five paths subsequently passed individually on the MacBookAir7,2:
+their GET/SET/GET values matched, the live stream survived, capture restarted,
+runtime resume captured, and no firmware, channel-stop, IOMMU, or DMAR fault
+appeared. The reports are timestamped `145904`, `145932`, `145959`, `150018`,
+and `150103` under `/tmp/facetimehd-hw-validate-20260818-*.log`. This validates
+the payloads with their current values only; units, ranges, non-current values,
+and multi-command sequencing remain unvalidated, so no V4L2 exposure or replay
+is justified yet.
+
+The next opt-in stage is deliberately limited to AE metering modes `0..3`, the
+closed domain recovered from this firmware. A mode-`0200` test node accepts only
+four fixed `modeN` tokens, SETs one under the stream/lock/runtime-PM boundary,
+GETs it back, and rejects a mismatch. `hw-validate.sh --only metering-modes`
+uses a fresh stream and an armed marker for each mode, discards settling frames,
+records spatial luma and raw frames from a fixed high-contrast scene, restores
+and verifies the original mode before STREAMOFF, then validates restart,
+runtime resume, and fault logs. This remains semantics-test scaffolding: the
+standard V4L2 metering menu is not registered until hardware results justify a
+mapping.
+
+The first bounded run accepted and read back all four non-current/current
+values, restored mode `3` after each, passed restart and runtime-PM capture, and
+logged no firmware or DMA fault. Its centre-quarter luma was nevertheless below
+the outer-region luma in every capture (`37..39` versus `55..59`), so the scene
+did not provide the requested bright central target; modes `0` and `1` also
+differed by less than one luma. The run validates bounded setter safety but not
+the menu semantics. The runner now measures a smaller central spot and requires
+it to be at least 20 luma above the outer region and below clipping in the
+mode-3 baseline, stopping before modes `0..2` if that precondition is not met.
+
+The controlled rerun (`/tmp/facetimehd-hw-validate-20260818-152753.log`) met
+that precondition: mode `3` measured spot/outer `99.8/40.0`. All four modes
+again read back exactly, restored to `3`, survived restart and runtime PM, and
+remained fault-free. They were nevertheless visually indistinguishable: across
+modes the full-frame mean varied by at most `1.2`, the central spot by `0.7`,
+the centre quarter by `0.6`, and the outer region by `1.5` luma. That is not
+enough evidence to map the firmware values onto the standard V4L2 menu.
+
+Because the normal channel sequence programs metering before AE starts but the
+first semantics test mutates it while AE is already running, an optional second
+test path now stops AE, sets one of the same four compile-time modes, restarts
+AE, and verifies the GET. `METERING_RESTART_AE=1 ./tests/hw-validate.sh --only
+metering-modes` selects it. The root-only endpoint uses the same stream, lock,
+runtime-PM and restoration boundaries, and it does not register or replay a
+production control.
+
+The same analysis proved the unused AWB first-gain helper wrong: firmware reads
+four packed halfwords at offsets that the attempted red/blue `u32` structure
+did not provide. The helper was removed; its recovered layout is recorded in
+the reverse-engineering notes.
 
 ## Pixel formats
 
-- `V4L2_PIX_FMT_NV16` is offered again, as a **single-planar** format. It was
-  disabled upstream pending multiplanar support, but V4L2 defines NV16 as one
-  buffer holding a luma plane followed by an interleaved CbCr plane of the same
-  size, so no multiplanar queue is needed — only a second address for the ISP.
-  `iommu_allocate_sgtable()` maps each buffer into one contiguous run of S2 IOVA
-  pages, so that address is a byte offset from the start of the same mapping.
-- The vb2 queue is therefore always single-planar. `struct fthd_fmt.planes`
-  counts the addresses handed to the ISP, not vb2 planes; `queue_setup()` used
-  to return it directly, which would have asked a `V4L2_BUF_TYPE_VIDEO_CAPTURE`
-  queue for two planes.
-- `V4L2_PIX_FMT_NV12` is **not** offered. The ISP's output-format codes are
-  known only for the three formats the driver enumerates (NV16 is 0, YUYV 1,
-  YVYU 2) and nothing identifies a 4:2:0 code. This is not a guess of the same
-  kind as a command payload, where a wrong value is simply refused: sizing a
-  buffer for 4:2:0 at 1.5 bytes per pixel while the ISP still writes 4:2:2 at 2
-  would have the hardware DMA past the end of the mapping. It stays out until
-  hardware can confirm a code.
+Only YUYV and YVYU are advertised. NV16 output code zero dates back to the 2015
+upstream driver, but upstream disabled it because that implementation mixed a
+two-plane model with the single-planar capture API. The newer contiguous-buffer
+layout is technically coherent but has not actually been validated: the old
+hardware test silently negotiated YUYV and produced a false NV16 pass because
+both formats use two bytes per pixel. NV16 was removed until a test verifies
+the returned fourcc and both luma/chroma regions. NV12 remains unsupported.
 
 ## Kernel integration, diagnostics and testing
 
@@ -375,27 +433,67 @@ Ubuntu kernel 7.0.0-29-generic. They confirmed:
 - the widened DDR probe check, with total module load around 640 ms; and
 - firmware acceptance of all anti-banding and exposure-auto values.
 
+A corrected-build reboot on 2026-08-18 then confirmed that the driver loads
+normally with all inferred firmware interfaces removed and runtime PM off. It
+captured 30 frames, passed all 57 applicable `v4l2-compliance` tests, captured
+after every retained control value, captured both packed formats, accepted and
+captured a centered 640x480 crop, and delivered a requested 15 fps decimated
+stream. No FaceTimeHD, IOMMU, timeout, oops, or firmware-fault record appeared.
+See `FIRMWARE-REVERSE-ENGINEERING.md` for the exact values and incident record.
+
+A following boot with runtime PM enabled completed five consecutive
+runtime-suspended -> ten-frame capture -> runtime-suspended cycles. The PCI
+runtime counters advanced normally and no driver, firmware, IOMMU, or kernel
+fault appeared. Runtime PM is therefore validated on this corrected build and
+MacBookAir7,2. The full installer now selects it by default, with
+`--runtime-pm off` retained as the recovery path; the module's bare default
+remains off for installs that bypass the project installer.
+
+The first subsequent suspend-while-streaming test visibly resumed the original
+viewer and a fresh capture, but its detailed log exposed a failed channel stop,
+invalid/unknown buffer tags, and four DMAR writes to unmapped address zero when
+the test terminated the viewer. SIGTERM had interrupted the completion wait
+for an already-submitted firmware STOP command (`-ERESTARTSYS`), after which
+STREAMOFF released mappings firmware could still use. Firmware-ring waits are
+now bounded but non-interruptible, paired with non-restrictive IRQ wakeups, and
+the validator treats any matching
+channel, tag, or DMA fault as a failure.
+
+On the final paired-wakeup build, terminating a confirmed live stream completed
+in 715 ms, an immediate 30-frame capture recovered, runtime PM suspended the
+device again, and none of those channel, tag, or DMA faults appeared. This
+directly validates signal-time STREAMOFF.
+
+The repeat lid test on that final module then passed every criterion: deep
+suspend was entered, the original viewer continued capturing after resume, a
+fresh capture recovered, runtime PM returned to suspended, and neither the
+validator nor an independent boot-log scan found any channel, tag, DMA, or
+kernel fault. Stream restoration across full system suspend is therefore
+validated on this MacBookAir7,2.
+
 This validates one machine, model and kernel rather than the complete
 2013–2015 Mac range. Still untested or unproven are:
 
+- the combined post-`20bdd61` feature build repeatedly hard-locked this
+  MacBookAir7,2 after a successful probe and before a panic could reach the
+  journal or pstore. The lock persisted with runtime PM and hwmon registration
+  disabled, ruling both out as the sole cause. The strongest remaining
+  automatic path was control replay at `STREAMON`: it issued every inferred
+  firmware command simply because the controls were registered. Firmware
+  disassembly subsequently proved multiple layouts malformed, including an
+  AE-bias request four bytes shorter than the fields firmware reads. The
+  controls and their module gate have been removed; the non-firmware frame-rate
+  and buffer work remains enabled;
+
 - the visible effect of anti-banding and exposure mode under controlled light;
-- the resumed stream: that an application capturing when the lid closes is
-  still receiving frames after it opens, without restarting and without an
-  error, and that the firmware accepts the channel restart and the resubmitted
-  buffers on the resume path. `tests/hw-validate.sh --only suspend` checks
-  exactly this — its `suspend.viewer` result is the verdict;
 - orderly reboot or kexec while actively streaming;
 - recovery from a real firmware command timeout, which has not been reproduced;
-- every command backing the manual exposure, white balance, exposure bias,
-  metering, sharpness and test-pattern controls. The opcodes are real but their
-  payload layouts are inferred, so each needs confirming that the firmware
-  accepts it and that the picture changes as expected. The test pattern menu
-  lists four entries; only "Disabled" is known to be implemented, and the
-  indices that are not should be removed once hardware says which those are;
-- NV16 capture: that the ISP accepts output format code 0 through the current
-  `S_FMT` path, that the chroma plane really does land at
-  `bytesperline * height` into the buffer, and that no frame is written past
-  `sizeimage`;
+- any future reimplementation of manual exposure, white balance, exposure
+  bias, sharpness or test-pattern controls. Recovered layouts and remaining
+  semantic questions are recorded in `FIRMWARE-REVERSE-ENGINEERING.md`;
+- any future NV16 implementation: that the ISP accepts output format code 0,
+  that the returned fourcc remains NV16, that chroma lands at the expected
+  offset, and that no frame is written past `sizeimage`;
 - frame-rate selection: that a decimated stream really arrives at the requested
   rate with even spacing, that the requeue worker keeps up without starving the
   ISP of buffers at low divisors (only four exist), and that `STREAMOFF` during
@@ -405,15 +503,12 @@ This validates one machine, model and kernel rather than the complete
   rectangle needs an alignment stricter than the eight pixels assumed here, and
   whether the scaler will upscale (which would make the "crop is never smaller
   than the output" rule unnecessary rather than merely conservative);
-- backlight compensation, noise reduction and chroma suppression: the same
-  inferred-payload question as the controls above, plus whether their visible
-  effect matches their names;
-- the sensor temperature: what scale the firmware reports it in. Read
-  `debugfs/facetimehd/<dev>/sensor_temperature_raw` on a warm camera and a cold
-  one; if the values look like celsius the hwmon device is already correct, and
-  if they do not the conversion in `fthd_hwmon_read()` needs writing. Also
-  whether the command works at all with no channel running, which decides
-  whether `sensors` is useful when the camera is idle.
+- any future backlight-compensation, noise-reduction or chroma-suppression
+  controls: their visible effect and an honest mapping for every firmware
+  field. They are not currently exposed;
+- whether any supported sensor returns something other than the `-1`
+  unavailable temperature sentinel, and its scale if so. Only the root-only,
+  active-stream raw debugfs read is currently exposed.
 
 Remove entries from this document when the corresponding fixes are accepted
 upstream.

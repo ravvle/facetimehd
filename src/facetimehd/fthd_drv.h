@@ -165,9 +165,6 @@ struct fthd_private {
 	 * unfreed; the next open() reloads firmware via fthd_pm_up(). */
 	bool wedged;
 	struct dentry *debugfs;
-	/* devm-managed, so it needs no explicit teardown; NULL if registration
-	 * failed, which is not fatal. */
-	struct device *hwmon;
 };
 
 bool fthd_get(struct fthd_private *dev_priv);
