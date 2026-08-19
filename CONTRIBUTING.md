@@ -1,8 +1,7 @@
 # Contributing
 
 The most valuable contribution to this project is not code. It is a report from
-a MacBook that is not a MacBookAir7,2 — see
-[Hardware reports](#hardware-reports) below.
+a MacBook that is not a MacBookAir7,2 — see [Hardware reports](#hardware-reports).
 
 ## Before you start
 
@@ -27,9 +26,9 @@ sudo ./tests/hw-validate.sh          # a few minutes, one section per open item
 ```
 
 Open a **Hardware report** issue with the output. A failing report is as useful
-as a passing one; several entries in
-[`src/facetimehd/DOWNSTREAM.md`](src/facetimehd/DOWNSTREAM.md) under "Hardware
-validation status" are waiting on exactly this.
+as a passing one; several entries under "Hardware validation status" in
+[`src/facetimehd/DOWNSTREAM.md`](src/facetimehd/DOWNSTREAM.md) are waiting on
+exactly this.
 
 ## Code
 
@@ -39,6 +38,7 @@ shellcheck -x --source-path=SCRIPTDIR \
     setup.sh \
     scripts/install.sh scripts/uninstall.sh scripts/macbook-tune.sh \
     scripts/extract-firmware.sh scripts/collect-diagnostics.sh \
+    packaging/build-deb.sh packaging/build-rpm.sh \
     tests/build-driver.sh tests/smoke-capture.sh tests/hw-validate.sh \
     tests/script-smoke.sh
 
@@ -47,6 +47,9 @@ W=1 WERROR=1 ./tests/build-driver.sh           # warnings are errors
 SPARSE=1 W=1 ./tests/build-driver.sh           # semantic checks
 ./tests/script-smoke.sh                        # installer/uninstaller plumbing
 ```
+
+Every tracked `*.sh` outside `scripts/lib/` must appear in that shellcheck
+list; CI fails if one does not.
 
 Conventions:
 
@@ -61,7 +64,9 @@ Conventions:
 
 **A change to `src/facetimehd/` is not finished until `DOWNSTREAM.md` says
 why.** The fork carries no patch headers, so that file is the entire review
-record for its divergence from upstream. Describe the reasoning, not the diff.
+record for its divergence from upstream. Describe the reasoning, not the diff,
+and write it as the current state of the driver rather than as a history of how
+it got there.
 
 Please also propose driver fixes upstream at
 [patjak/facetimehd](https://github.com/patjak/facetimehd) where they apply
@@ -69,12 +74,19 @@ there. This fork exists because upstream is quiet, not because it is wrong.
 
 ### Guessing at firmware
 
-Several ISP commands are exposed whose payload layouts Apple never documented.
-The rule that makes that acceptable is: **a wrong guess must be refused, not
-destructive.** A command payload the firmware rejects surfaces as an error from
-`S_CTRL`. A wrongly sized buffer has the hardware DMA past the end of a
-mapping. The first is a fine thing to ship behind a hardware-validation note;
-the second is not, which is why `V4L2_PIX_FMT_NV12` is still not offered.
+Several ISP commands have payload layouts Apple never documented. The rules
+that make working on them acceptable are in
+[`src/facetimehd/FIRMWARE-REVERSE-ENGINEERING.md`](src/facetimehd/FIRMWARE-REVERSE-ENGINEERING.md),
+"Rules for any reimplementation". Read them first — the short version is:
+
+- A registered V4L2 control's default is replayed at every `STREAMON`, so
+  registering one is the same as sending its command unprompted. That is what
+  hard-locked the validation machine.
+- Firmware does not enforce a per-opcode minimum request length, so a payload
+  that is too short makes it read past the request. A wrong guess must be
+  refused, not destructive.
+- GET first. A recovered value may reach V4L2 only as a **read-only** control,
+  and only once hardware evidence supports its meaning.
 
 Anything inferred goes in DOWNSTREAM.md's "Hardware validation status" list
 until hardware confirms it.

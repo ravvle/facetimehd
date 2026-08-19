@@ -716,7 +716,7 @@ info "Report: $REPORT"
 
 # ============================================================================
 # Section: probe
-# DOWNSTREAM.md - "Hardware-failure propagation"
+# DOWNSTREAM.md - "Safety and correctness"
 #
 # PLL, DDR and memory-verification failures used to be logged and ignored;
 # they now fail probe. The regression this is hunting for is a machine that
@@ -768,12 +768,12 @@ fi
 
 # ============================================================================
 # Section: timing
-# DOWNSTREAM.md - "MEM_VERIFY_NUM_PROBE costs unmeasured time at probe"
+# DOWNSTREAM.md - "DDR handling"
 #
-# 64K words is 64K non-posted PCIe reads. The estimate in DOWNSTREAM.md is
-# "tens of milliseconds" and nobody has ever timed it. This times the whole
-# probe, then prints a per-line delta profile so the DDR verification step can
-# be read off directly rather than inferred.
+# 64K words is 64K non-posted PCIe reads. Total module load measured around
+# 640 ms on the MacBookAir7,2; this times the whole probe and prints a per-line
+# delta profile so the DDR verification step can be read off directly rather
+# than inferred.
 # ============================================================================
 if wants timing; then
     step "timing: what does the widened DDR check cost at probe?"
@@ -997,7 +997,7 @@ fi
 
 # ============================================================================
 # Section: runtimepm
-# DOWNSTREAM.md - "Runtime power management"
+# DOWNSTREAM.md - "Power management and lifecycle"
 #
 # The failure mode to catch: camera works on first use after boot but not
 # after sitting idle. So the test is idle -> suspended -> open -> capture,
@@ -1247,7 +1247,7 @@ fi
 
 # ============================================================================
 # Section: wedged
-# DOWNSTREAM.md - "A firmware command timeout (dev_priv->wedged)"
+# DOWNSTREAM.md - "Safety and correctness", firmware command timeouts
 #
 # There is no known way to make the firmware stop answering, so this cannot be
 # provoked. It is observational: scan for the message and for the rate-limited
@@ -2784,7 +2784,7 @@ fi
 
 # ============================================================================
 # Section: reboot (opt-in, two-phase)
-# DOWNSTREAM.md - "Rebooting/kexec'ing with the camera streaming"
+# DOWNSTREAM.md - "Hardware validation status", reboot/kexec while streaming
 #
 # fthd_pci_shutdown() runs at reboot instead of fthd_pci_remove(). It cannot
 # be tested without actually rebooting, so this arms a marker, starts a

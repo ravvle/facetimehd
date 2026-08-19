@@ -1382,7 +1382,7 @@ static void fthd_v4l2_set_crop(struct fthd_private *dev_priv,
 	 * Clamping rather than refusing, because S_SELECTION is an adjusting
 	 * call and this driver already rounds the rectangle: G_SELECTION
 	 * reports what was programmed, so an application can see what it got.
-	 * See DOWNSTREAM.md, "Frame-rate decimation and cropping".
+	 * See DOWNSTREAM.md, "Cropping and digital zoom".
 	 */
 	max_left = (max_w - r->width)  / 2;
 	max_top  = (max_h - r->height) / 2;

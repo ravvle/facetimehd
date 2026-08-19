@@ -1,8 +1,12 @@
 # FaceTime HD Camera for Linux
 
 Enable the built-in Apple FaceTime HD camera on 2013–2015 Intel MacBooks
-running Ubuntu, Fedora, AlmaLinux or a compatible Linux distribution. Main improvements over
-[patjak/facetimehd](https://github.com/patjak/facetimehd) is **working suspend/resume**, **safer code**, **image resolution/scaling fixes**, **auto calibration** and exposing the extra controls to user programs. It also uses more modern kernel tie ins and drops support for kernels older than 5.15.
+running Ubuntu, Fedora, AlmaLinux or a compatible Linux distribution. The main
+improvements over [patjak/facetimehd](https://github.com/patjak/facetimehd) are
+**working suspend/resume**, **safer code**, **image resolution and scaling
+fixes**, **automatic sensor calibration** and extra controls exposed to
+applications. It uses current kernel interfaces and drops support for kernels
+older than 5.15.
 
 [![CI](https://github.com/ravvle/facetimehd/actions/workflows/ci.yml/badge.svg)](https://github.com/ravvle/facetimehd/actions/workflows/ci.yml)
 [![License](https://img.shields.io/github/license/ravvle/facetimehd)](LICENSE)
@@ -15,43 +19,36 @@ This project is derived from the work of **Patrik Jakobsson (`patjak`) and the
 facetimehd contributors**:
 
 - [patjak/facetimehd](https://github.com/patjak/facetimehd) provides the
-  original Linux driver for the Broadcom 1570 PCIe camera.
+  original Linux driver for the Broadcom 1570 PCIe camera. The driver here is a
+  fork of commit
+  [`364b1c6`](https://github.com/patjak/facetimehd/commit/364b1c663583e64e27f07ed0257a7584bef095fc).
 - [patjak/facetimehd-firmware](https://github.com/patjak/facetimehd-firmware)
   provided the firmware-extraction work maintained here as
   [`scripts/extract-firmware.sh`](scripts/extract-firmware.sh).
 - [godwill1224/facetimehd-ubuntu-macbook](https://github.com/godwill1224/facetimehd-ubuntu-macbook)
-  for the base the install scripts were made from
+  provided the base for the install scripts.
 - [linux-on-mac/mbpfan](https://github.com/linux-on-mac/mbpfan) provides the
   optional fan daemon used by the setup helper.
 
-The installer, driver fork, audits, tests and documentation were
-developed with assistance from **Claude Code** and **ChatGPT
-Codex**. The driver was forked @ [patjak/facetimehd](https://github.com/patjak/facetimehd)
-[`364b1c6`](https://github.com/patjak/facetimehd/commit/364b1c663583e64e27f07ed0257a7584bef095fc).
+The installer, driver fork, tests and documentation were developed with
+assistance from **Claude Code** and **ChatGPT Codex**.
 
 ## What this project does
 
-The repository packages everything needed to make the PCIe FaceTime HD camera
-usable and mbpfan to improve cpu thermals:
-
-- builds the `facetimehd` driver;
+- builds the `facetimehd` driver from
+  [`src/facetimehd/`](src/facetimehd/), which is included in this repository;
 - registers it with DKMS so it is rebuilt after kernel updates;
-- downloads an Apple update and safely extracts the proprietary camera
-  firmware, which cannot be redistributed in this repository;
-- installs the matching sensor calibration files (`unar` is a required
-  dependency for this); and
-- optionally installs and enables `mbpfan` on Apple hardware.
+- downloads an Apple update and extracts the proprietary camera firmware, which
+  cannot be redistributed here;
+- installs the matching sensor calibration files where `unar` is available; and
+- optionally installs and enables `mbpfan` to improve thermals.
 
-The driver built by this project lives in
-[`src/facetimehd/`](src/facetimehd/). It is a fork of
-`patjak/facetimehd` at
-[`364b1c6`](https://github.com/patjak/facetimehd/commit/364b1c663583e64e27f07ed0257a7584bef095fc),
-with a concise record of its changes in
+The fork's divergence from upstream is recorded in
 [`src/facetimehd/DOWNSTREAM.md`](src/facetimehd/DOWNSTREAM.md).
 
 ## Improvements over the original patjak driver
 
-The downstream driver retains the original hardware support while adding:
+The fork keeps the original hardware support and adds:
 
 - bounds checks for hardware-register access and validation of data returned by
   firmware;
@@ -64,16 +61,18 @@ The downstream driver retains the original hardware support while adding:
 - runtime camera suspend/resume, reliable system sleep while streaming, safe
   shutdown and PCI error handling;
 - restoration of a stream that was active across system suspend;
-- wider DDR memory verification and removal of unfinished, unused calibration
-  code containing ineffective timeouts and unbounded paths;
+- wider DDR memory verification, and removal of unfinished calibration code
+  containing ineffective timeouts and unbounded paths;
 - correct full-sensor scaling at lower resolutions instead of a zoomed crop
   from the top-left corner;
 - model-specific sensor-size detection, correct format limits and improved
   V4L2 frame-size, frame-rate, selection and status reporting;
-- controls that are restored when streaming starts, plus optional 50/60 Hz
-  anti-banding and automatic/manual exposure controls;
+- controls that are restored when streaming starts, plus 50/60 Hz anti-banding
+  and automatic/manual exposure;
 - selectable frame rates produced by safe frame decimation;
 - digital zoom and pan through `VIDIOC_S_SELECTION`;
+- NV12 output alongside the packed YUYV/YVYU formats, with the correct 4:2:0
+  sizing and destination row stride;
 - removal of guessed firmware controls and formats that made firmware read
   beyond short requests and repeatedly hard-locked a MacBookAir7,2;
 - correct MacBook Air sensor-calibration selection and complete
@@ -81,9 +80,9 @@ The downstream driver retains the original hardware support while adding:
 - current Linux 5.15+ APIs, quieter diagnostics, Clang builds, Sparse checks
   and on-hardware validation scripts.
 
-Core probing, capture, runtime suspend/resume and system suspend recovery have
-been tested repeatedly on a MacBookAir7,2. The complete change list and current
-hardware-validation limits are documented in
+Core probing, capture, runtime suspend/resume and system suspend recovery are
+tested on a MacBookAir7,2. The complete change list and current
+hardware-validation limits are in
 [`DOWNSTREAM.md`](src/facetimehd/DOWNSTREAM.md).
 
 ## Compatibility
@@ -165,23 +164,22 @@ sudo reboot
 ```
 
 The setup asks whether to install the camera driver and whether to add fan
-support; both prompts default to yes, as does the proprietary firmware download.
-For the camera, it checks the hardware, installs build dependencies and matching
-kernel headers, builds the driver through DKMS, extracts the Apple firmware and
-loads the module. It is safe to run again; an unchanged installed driver is not
-rebuilt unnecessarily.
+support; both prompts default to yes, as does the proprietary firmware
+download. For the camera, it checks the hardware, installs build dependencies
+and matching kernel headers, builds the driver through DKMS, extracts the Apple
+firmware and loads the module. It is safe to run again; an unchanged installed
+driver is not rebuilt.
+
+The full installer enables the driver's runtime power management by default.
+The module's own default remains off, so a manual or package-only install does
+not get it. `--runtime-pm off` is the recovery opt-out. Either way the
+installer refreshes the early-boot image afterwards, because this PCI driver
+can load from the initramfs before the real root filesystem and its
+`/etc/modprobe.d` are mounted.
 
 For recovery or controlled testing, `--no-load` installs the DKMS build without
-touching the running module. Combine it with `--runtime-pm off` when isolating a
-power-transition failure. The installer refreshes the early-boot image after
-writing that option because the camera driver may load there before the real
-root filesystem is mounted. Reboot deliberately after reviewing the result.
-
-The full installer enables runtime power management by default now that the
-corrected driver has passed repeated idle cycles and suspend-while-streaming on
-the MacBookAir7,2. It writes the setting into the early-boot image because this
-PCI device may load there. The module's built-in default remains off for manual
-or package-only installs; use `--runtime-pm off` as the recovery opt-out.
+touching the running module; combine it with `--runtime-pm off` when isolating
+a power-transition failure, then reboot deliberately.
 
 ### Verify the installation
 
@@ -235,24 +233,26 @@ installing:
 /usr/lib/firmware/facetimehd/firmware.bin
 ```
 
-Calibration files come from a separate Apple Boot Camp package. They are not
-required for capture, but missing calibration can produce incorrect colours.
-`install.sh` fetches them on every run where `unar` is available — which is
-every distribution in the table above, `unar` being a normal dependency of the
-install. That download currently carries files for four of the nine sensors
-the driver recognises; a machine whose sensor needs one of the other five sees
-this in `dmesg` (`no sensor calibration file ...`), and `install.sh --status`
-surfaces the same thing. If the step instead failed outright (no network
-access to Apple's Boot Camp download, or a distribution that does not package
-`unar`), retry it directly once the cause is fixed:
+Sensor calibration files come from a separate Apple Boot Camp package and need
+`unar` to unpack. They are not required for capture, but missing calibration
+produces incorrect colours, so `install.sh` fetches them on every run where
+`unar` is present. Two things can leave a machine without them:
+
+- **`unar` is missing**, which on Enterprise Linux means EPEL has not rebuilt
+  it for that release. The installer warns and continues.
+- **Your sensor is not one of the four the download carries.** The driver
+  recognises nine; a machine needing one of the other five logs
+  `no sensor calibration file ...` in `dmesg`, and `install.sh --status`
+  reports the same.
+
+Once the cause is fixed, retry the calibration step on its own:
 
 ```bash
 sudo ./scripts/extract-firmware.sh --calibration-only
 ```
 
-These Apple downloads are the only installation steps that require network
-access beyond installing distribution packages; the driver source is already
-included in the repository.
+These Apple downloads are the only installation steps needing network access
+beyond distribution packages; the driver source is already in the repository.
 
 ## Installing as a package
 
@@ -278,7 +278,7 @@ password typed at a console and a reboot. Use `install.sh --enroll-mok`.
 
 ## Camera controls
 
-Beyond the usual brightness and contrast, the driver exposes:
+Beyond the usual brightness, contrast, saturation and hue, the driver exposes:
 
 ```bash
 v4l2-ctl --list-ctrls
@@ -296,11 +296,12 @@ driver-private control rather than the standard
 application asks the camera to *assume*, and this camera has no validated way
 to be told one.
 
-The inferred firmware-command controls are intentionally absent from the
-driver. The combined newer build repeatedly hard-locked the validation
-MacBook, and registering those controls caused a normal `STREAMON` to replay
-every unvalidated command. Firmware disassembly then proved that several
-payload layouts were incomplete or put values in the wrong fields. See the
+Controls for inferred firmware commands — manual exposure, manual white
+balance, sharpness, test pattern, noise reduction, chroma suppression and
+backlight compensation — are intentionally absent. Registering them made an
+ordinary `STREAMON` replay every unvalidated command, which repeatedly
+hard-locked the validation MacBook, and firmware disassembly then proved
+several payload layouts incomplete or misplaced. See the
 [firmware reverse-engineering notes](src/facetimehd/FIRMWARE-REVERSE-ENGINEERING.md)
 and [`DOWNSTREAM.md`](src/facetimehd/DOWNSTREAM.md).
 
@@ -317,37 +318,36 @@ formats, so applications that take the first format available are unaffected.
 
 ### Raw firmware readbacks
 
-For reverse-engineering and hardware validation, confirmed GET commands are
-available as root-only debugfs files. They work only while the camera is
-already streaming; reading one sends exactly one whitelisted GET and never
-changes or replays a setting. For example, keep a stream open in one terminal:
+For reverse-engineering and hardware validation, confirmed firmware GET
+commands are available as root-only debugfs files. They work only while the
+camera is already streaming; reading one sends exactly one whitelisted GET and
+never changes or replays a setting. Keep a stream open in one terminal:
 
 ```bash
 v4l2-ctl --device /dev/video0 --stream-mmap --stream-count=100000 \
          --stream-to=/dev/null
 ```
 
-Then read a value in another terminal (replace the PCI directory if needed):
+Then read a value in another (replace the PCI directory if needed):
 
 ```bash
-sudo cat /sys/kernel/debug/facetimehd/0000:02:00.0/sensor_temperature_raw
-sudo cat /sys/kernel/debug/facetimehd/0000:02:00.0/ae_bias_raw
+sudo ls /sys/kernel/debug/facetimehd/0000:02:00.0/
+sudo cat /sys/kernel/debug/facetimehd/0000:02:00.0/awb_cct_raw
+sudo cat /sys/kernel/debug/facetimehd/0000:02:00.0/crop_raw
 ```
 
-The numbers are deliberately labelled `raw`: firmware does not document their
-units or ranges. An idle read fails with `EPIPE`; there is no polling or hwmon
-registration. The complete check is
-`sudo ./tests/hw-validate.sh --only readbacks`.
+The numbers are labelled `raw` because firmware documents no units or ranges.
+An idle read fails with `EPIPE`; there is no polling or hwmon registration. The
+complete check is `sudo ./tests/hw-validate.sh --only readbacks`.
 
-Two of these have since been resolved. `sensor_temperature_raw` prints
-`-1 (unavailable)` on the validation MacBook: repeated sampling — cold, after
-ten minutes of streaming, and under every lighting condition — never returned
-anything else, which is a not-supported sentinel rather than a reading on an
-unknown scale. It will never become an hwmon channel on such a sensor. The AWB
-colour temperature did track lighting properly, so it is also available to
-ordinary applications as the `awb_cct_estimate` control described above.
+Two readbacks have known meanings. `sensor_temperature_raw` prints
+`-1 (unavailable)` on the validation MacBook — repeated sampling never returned
+anything else, so it is a not-supported sentinel rather than a reading on an
+unknown scale, and it will never become an hwmon channel on such a sensor. The
+AWB colour temperature does track lighting, so it is also available to ordinary
+applications as the `awb_cct_estimate` control above.
 
-Three deliberately opt-in experiments build on those reads:
+Three opt-in experiments build on those reads:
 
 ```bash
 # Interactive dark/bright, warm/cool, 15/30-fps and warm-up profile (GETs only)
@@ -361,20 +361,20 @@ sudo ./tests/hw-validate.sh --only metering-modes
 ```
 
 The setter nodes are root-write-only and accept only the literal word `same`.
-The kernel reads the current value, writes that exact value once, reads it back,
-and fails if it changed. Nothing is registered with V4L2 or replayed at stream
-start. Valid `ROUNDTRIPS` names are `ae_bias`, `ae_metering_mode`,
-`ae_integration_time_max`, `ae_gain_cap`, and `ae_gain_cap_min`.
+The kernel reads the current value, writes that exact value once, reads it
+back, and fails if it changed. Nothing is registered with V4L2 or replayed at
+stream start. Valid `ROUNDTRIPS` names are `ae_bias`, `ae_metering_mode`,
+`ae_integration_time_max`, `ae_gain_cap` and `ae_gain_cap_min`.
 
-After the same-value metering setter passed, `metering-modes` added a separate
-mode-`0200` test node which accepts only the fixed tokens `mode0` through
+The `metering-modes` section is the one experiment that writes a value the
+firmware was not already using, and it is limited to the four modes firmware
+disassembly proved valid. Its test node accepts only the tokens `mode0` through
 `mode3`. The runner uses a fresh stream per token, reads the mode back, retains
-raw frames, reports full/spot/centre/outer luma, restores the original mode
-before STREAMOFF, and then checks restart, runtime resume, and kernel faults.
-The mode-3 baseline must first prove that the central target is at least 20 luma
-above the surround and is not clipped; otherwise the runner stops before the
-non-default modes. This is semantic test scaffolding, not a V4L2 control; no
-mutation occurs unless that section is explicitly selected and confirmed.
+raw frames, reports full/spot/centre/outer luma, and restores the original mode
+before `STREAMOFF`, then checks restart, runtime resume and kernel faults. It
+requires a fixed high-contrast scene: the mode-3 baseline must show the central
+target at least 20 luma above the surround without clipping, or the runner
+stops before the other modes. This is test scaffolding, not a V4L2 control.
 
 ## Optional fan support
 
@@ -422,7 +422,8 @@ sudo ./scripts/uninstall.sh --keep-tuning
   fingerprint, and stages the result under `/usr/src/`.
 - DKMS rebuilds the module for future kernel updates automatically.
 - CI runs shell checks, GCC and Clang kernel builds, and Sparse analysis across
-  the supported distribution matrix.
+  the supported distribution matrix, plus a weekly watchdog on Apple's
+  downloads.
 
 Driver fixes belong in `src/facetimehd/`, should be recorded in
 `DOWNSTREAM.md`, and should also be proposed upstream where possible.
@@ -440,6 +441,8 @@ scripts/extract-firmware.sh    Maintained Apple firmware extractor
 scripts/collect-diagnostics.sh One-file bug report
 packaging/                     .deb and .rpm builders
 src/facetimehd/                Maintained driver built by the installer
+driver-patches/                The same change set as a patch series against
+                               upstream, regenerated by hand
 tests/                         Build, capture, script and hardware-validation
                                scripts
 ```
@@ -495,9 +498,9 @@ are unaffected.
 
 That writes one file with the model, distribution, kernel, PCI device, DKMS
 state, module parameters, firmware, Secure Boot state and kernel messages. It
-removes the DMI serial number and UUID; please skim it before posting. Attach it
-to a [GitHub issue](https://github.com/ravvle/facetimehd/issues) — the templates
-ask for it.
+removes the DMI serial number and UUID; please skim it before posting. Attach
+it to a [GitHub issue](https://github.com/ravvle/facetimehd/issues) — the
+templates ask for it.
 
 **Reports from MacBook models other than the MacBookAir7,2 are the single most
 useful contribution to this project**, whether the camera worked or not. See
