@@ -1,17 +1,73 @@
 # FaceTime HD Camera for Linux
 
-Enable the built-in Apple FaceTime HD camera on 2013–2015 Intel MacBooks
-running Ubuntu, Fedora, AlmaLinux or a compatible Linux distribution. The main
-improvements over [patjak/facetimehd](https://github.com/patjak/facetimehd) are
-**working suspend/resume**, **safer code**, **image resolution and scaling
-fixes**, **automatic sensor calibration** and extra controls exposed to
-applications. It uses current kernel interfaces and drops support for kernels
-older than 5.15.
+Get the built-in Apple FaceTime HD camera working on 2013–2015 Intel MacBooks
+running Ubuntu, Fedora, AlmaLinux or a compatible Linux distribution — one
+command to install, and it keeps working across kernel updates.
 
 [![CI](https://github.com/ravvle/facetimehd/actions/workflows/ci.yml/badge.svg)](https://github.com/ravvle/facetimehd/actions/workflows/ci.yml)
 [![License](https://img.shields.io/github/license/ravvle/facetimehd)](LICENSE)
 [![Distros](https://img.shields.io/badge/distros-Ubuntu%20%7C%20Fedora%20%7C%20AlmaLinux-orange)](#distribution-compatibility)
 [![Kernel](https://img.shields.io/badge/kernel-5.15%2B-blue)](https://kernel.org)
+
+## What you get
+
+The driver here is a maintained fork of
+[patjak/facetimehd](https://github.com/patjak/facetimehd). Roughly in the order
+you are likely to notice them, these are the differences from the original:
+
+- **The camera survives a closed lid.** Upstream errored the video stream on
+  suspend, so a call that went to sleep came back to a dead camera and most
+  applications just reported a failure. The stream is now parked and resumed
+  into the same buffers, so the call continues.
+- **It builds on current kernels.** CI compiles the driver against every
+  supported distribution — kernel 5.15 through 7.1 — every week, so a kernel
+  upgrade should not leave you without a camera. DKMS rebuilds it for you.
+  Kernels older than 5.15 are no longer supported.
+- **The picture is right at every resolution.** Ask for 640x480 and you get the
+  whole scene scaled down. Upstream cropped a zoomed rectangle out of the
+  top-left corner instead.
+- **The frame rate you ask for is the one you get.** Upstream accepted any rate
+  and always delivered 30 fps, which is what made GStreamer's `pipewiresrc`
+  compute negative frame durations and stall after a single frame. Ask for
+  15 fps and you get 15 fps.
+- **Colours are set up for you.** The installer extracts Apple's sensor
+  calibration data alongside the firmware, and picks the right file on MacBook
+  Air models, which upstream got wrong. Four of the nine sensors the driver
+  knows about are covered — see
+  [Firmware and sensor calibration](#firmware-and-sensor-calibration).
+- **It works on the 12-inch MacBook.** The sensor size is detected at runtime
+  rather than assumed, so the 848x588 array in MacBook8,1 no longer drives the
+  sensor interface into errors.
+- **Digital zoom and pan**, through `VIDIOC_S_SELECTION`, on a camera that was
+  previously pinned to the full sensor array.
+- **NV12 as well as YUYV and YVYU**, so encoders and conferencing apps that
+  want 4:2:0 need not convert every frame. It is offered last, so anything that
+  takes the first format available is unaffected.
+- **Anti-banding and exposure controls.** 50/60 Hz anti-banding and
+  automatic/manual exposure are exposed to applications; upstream exposed
+  neither. Firmware accepts every value and capture continues after a change,
+  though the visible effect is still a hardware-validation target.
+- **A stuck camera no longer takes your application down with it.** Firmware
+  and streaming failures surface as errors instead of leaving a capture blocked
+  indefinitely, and the camera powers itself down when nothing is using it.
+
+Under the hood there is a good deal more — bounds-checked register access,
+validation of everything firmware hands back, symmetric probe/suspend/resume
+teardown, bounded IRQ and ring processing, and the removal of guessed firmware
+commands that could hard-lock the machine. Core probing, capture, runtime
+suspend/resume and system suspend recovery are tested on a MacBookAir7,2. The
+complete change list and the current hardware-validation limits are in
+[`DOWNSTREAM.md`](src/facetimehd/DOWNSTREAM.md).
+
+## What the installer does
+
+- builds the `facetimehd` driver from [`src/facetimehd/`](src/facetimehd/),
+  which is included in this repository;
+- registers it with DKMS so it is rebuilt after kernel updates;
+- downloads an Apple update and extracts the proprietary camera firmware, which
+  cannot be redistributed here;
+- installs the matching sensor calibration files where `unar` is available; and
+- optionally installs and enables `mbpfan` to improve thermals.
 
 ## Origins and acknowledgements
 
@@ -32,58 +88,6 @@ facetimehd contributors**:
 
 The installer, driver fork, tests and documentation were developed with
 assistance from **Claude Code** and **ChatGPT Codex**.
-
-## What this project does
-
-- builds the `facetimehd` driver from
-  [`src/facetimehd/`](src/facetimehd/), which is included in this repository;
-- registers it with DKMS so it is rebuilt after kernel updates;
-- downloads an Apple update and extracts the proprietary camera firmware, which
-  cannot be redistributed here;
-- installs the matching sensor calibration files where `unar` is available; and
-- optionally installs and enables `mbpfan` to improve thermals.
-
-The fork's divergence from upstream is recorded in
-[`src/facetimehd/DOWNSTREAM.md`](src/facetimehd/DOWNSTREAM.md).
-
-## Improvements over the original patjak driver
-
-The fork keeps the original hardware support and adds:
-
-- bounds checks for hardware-register access and validation of data returned by
-  firmware;
-- safer ISP memory tracking, scatterlist handling and pointer-free VB2 buffer
-  tags;
-- bounded IRQ/ring processing and reliable propagation of hardware, firmware
-  and streaming failures;
-- symmetric probe, removal, suspend and resume cleanup, including safe handling
-  of open file descriptors during unbind;
-- runtime camera suspend/resume, reliable system sleep while streaming, safe
-  shutdown and PCI error handling;
-- restoration of a stream that was active across system suspend;
-- wider DDR memory verification, and removal of unfinished calibration code
-  containing ineffective timeouts and unbounded paths;
-- correct full-sensor scaling at lower resolutions instead of a zoomed crop
-  from the top-left corner;
-- model-specific sensor-size detection, correct format limits and improved
-  V4L2 frame-size, frame-rate, selection and status reporting;
-- controls that are restored when streaming starts, plus 50/60 Hz anti-banding
-  and automatic/manual exposure;
-- selectable frame rates produced by safe frame decimation;
-- digital zoom and pan through `VIDIOC_S_SELECTION`;
-- NV12 output alongside the packed YUYV/YVYU formats, with the correct 4:2:0
-  sizing and destination row stride;
-- removal of guessed firmware controls and formats that made firmware read
-  beyond short requests and repeatedly hard-locked a MacBookAir7,2;
-- correct MacBook Air sensor-calibration selection and complete
-  `MODULE_FIRMWARE` declarations; and
-- current Linux 5.15+ APIs, quieter diagnostics, Clang builds, Sparse checks
-  and on-hardware validation scripts.
-
-Core probing, capture, runtime suspend/resume and system suspend recovery are
-tested on a MacBookAir7,2. The complete change list and current
-hardware-validation limits are in
-[`DOWNSTREAM.md`](src/facetimehd/DOWNSTREAM.md).
 
 ## Compatibility
 
