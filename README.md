@@ -1,62 +1,60 @@
 # FaceTime HD Camera for Linux
 
-Get the built-in Apple FaceTime HD camera working on 2013–2015 Intel MacBooks
-running Ubuntu, Fedora, AlmaLinux or a compatible Linux distribution — one
-command to install, and it keeps working across kernel updates.
+A driver and installer for the built-in Apple FaceTime HD camera in 2013–2015
+Intel MacBooks, for Ubuntu, Fedora, AlmaLinux and compatible Linux
+distributions.
 
 [![CI](https://github.com/ravvle/facetimehd/actions/workflows/ci.yml/badge.svg)](https://github.com/ravvle/facetimehd/actions/workflows/ci.yml)
 [![License](https://img.shields.io/github/license/ravvle/facetimehd)](LICENSE)
 [![Distros](https://img.shields.io/badge/distros-Ubuntu%20%7C%20Fedora%20%7C%20AlmaLinux-orange)](#distribution-compatibility)
 [![Kernel](https://img.shields.io/badge/kernel-5.15%2B-blue)](https://kernel.org)
 
-## What you get
+## Differences from the original driver
 
 The driver here is a maintained fork of
-[patjak/facetimehd](https://github.com/patjak/facetimehd). Roughly in the order
-you are likely to notice them, these are the differences from the original:
+[patjak/facetimehd](https://github.com/patjak/facetimehd). It differs as
+follows.
 
-- **The camera survives a closed lid.** Upstream errored the video stream on
-  suspend, so a call that went to sleep came back to a dead camera and most
-  applications just reported a failure. The stream is now parked and resumed
-  into the same buffers, so the call continues.
-- **It builds on current kernels.** CI compiles the driver against every
-  supported distribution — kernel 5.15 through 7.1 — every week, so a kernel
-  upgrade should not leave you without a camera. DKMS rebuilds it for you.
-  Kernels older than 5.15 are no longer supported.
-- **The picture is right at every resolution.** Ask for 640x480 and you get the
-  whole scene scaled down. Upstream cropped a zoomed rectangle out of the
-  top-left corner instead.
-- **The frame rate you ask for is the one you get.** Upstream accepted any rate
-  and always delivered 30 fps, which is what made GStreamer's `pipewiresrc`
-  compute negative frame durations and stall after a single frame. Ask for
-  15 fps and you get 15 fps.
-- **Colours are set up for you.** The installer extracts Apple's sensor
-  calibration data alongside the firmware, and picks the right file on MacBook
-  Air models, which upstream got wrong. Four of the nine sensors the driver
-  knows about are covered — see
+- **Streams survive system suspend.** Upstream errored the vb2 queue on
+  suspend, so an application woke to `-EIO` and could only recover by
+  restarting the stream; most reported a camera failure instead. The stream is
+  now parked and resumed into the same buffers.
+- **Current kernels are supported.** CI builds the driver weekly against kernel
+  5.15 through 7.1 across the supported distributions, and DKMS rebuilds it
+  after a kernel update. Kernels older than 5.15 are not supported.
+- **Lower resolutions use the full sensor.** A 640x480 request is the whole
+  scene scaled down; upstream cropped that rectangle out of the top-left
+  corner, giving a zoomed and off-centre picture.
+- **Requested frame rates are delivered.** Upstream accepted any rate and
+  delivered 30 fps regardless, which made GStreamer's `pipewiresrc` compute
+  negative frame durations and stall after one frame. Rates are now produced by
+  frame decimation.
+- **Sensor calibration is installed.** The installer extracts Apple's
+  calibration data alongside the firmware, and selects the correct file on
+  MacBook Air models, which upstream did not. Four of the nine sensors the
+  driver recognises are covered — see
   [Firmware and sensor calibration](#firmware-and-sensor-calibration).
-- **It works on the 12-inch MacBook.** The sensor size is detected at runtime
-  rather than assumed, so the 848x588 array in MacBook8,1 no longer drives the
-  sensor interface into errors.
-- **Digital zoom and pan**, through `VIDIOC_S_SELECTION`, on a camera that was
-  previously pinned to the full sensor array.
-- **NV12 as well as YUYV and YVYU**, so encoders and conferencing apps that
-  want 4:2:0 need not convert every frame. It is offered last, so anything that
-  takes the first format available is unaffected.
-- **Anti-banding and exposure controls.** 50/60 Hz anti-banding and
-  automatic/manual exposure are exposed to applications; upstream exposed
-  neither. Firmware accepts every value and capture continues after a change,
-  though the visible effect is still a hardware-validation target.
-- **A stuck camera no longer takes your application down with it.** Firmware
-  and streaming failures surface as errors instead of leaving a capture blocked
-  indefinitely, and the camera powers itself down when nothing is using it.
+- **MacBook8,1 is usable.** Sensor dimensions are detected at runtime rather
+  than assumed, so the 848x588 array in the 12-inch MacBook no longer drives
+  the sensor interface into errors.
+- **Digital zoom and pan** through `VIDIOC_S_SELECTION`. Upstream pinned the
+  crop to the full sensor array.
+- **NV12 alongside YUYV and YVYU.** It is enumerated last, so applications that
+  take the first format offered are unaffected.
+- **Anti-banding and exposure controls are exposed.** 50/60 Hz anti-banding and
+  automatic/manual exposure; upstream exposed neither. Firmware accepts every
+  value and capture continues after a change, but the visible effect is still a
+  hardware-validation target.
+- **Firmware and streaming failures surface as errors** rather than leaving a
+  capture blocked indefinitely, and the camera runtime-suspends when nothing is
+  using it.
 
-Under the hood there is a good deal more — bounds-checked register access,
-validation of everything firmware hands back, symmetric probe/suspend/resume
-teardown, bounded IRQ and ring processing, and the removal of guessed firmware
-commands that could hard-lock the machine. Core probing, capture, runtime
-suspend/resume and system suspend recovery are tested on a MacBookAir7,2. The
-complete change list and the current hardware-validation limits are in
+Beyond those: bounds-checked register access, validation of the data firmware
+returns, symmetric probe/suspend/resume teardown, bounded IRQ and ring
+processing, and the removal of guessed firmware commands that could hard-lock
+the machine. Core probing, capture, runtime suspend/resume and system suspend
+recovery are tested on a MacBookAir7,2. The complete change list and the
+current hardware-validation limits are in
 [`DOWNSTREAM.md`](src/facetimehd/DOWNSTREAM.md).
 
 ## What the installer does
