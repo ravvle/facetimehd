@@ -191,11 +191,12 @@ doing crop-and-scale, only the rectangle was constant.
 
 ### The crop origin is clamped to the array centre
 
-A rectangle whose origin sits past the centred position is accepted by
-firmware, stored exactly, and then delivers no frames at all - the capture sits
+A rectangle whose origin sits past the centred position would be accepted by
+firmware, stored exactly, and then deliver no frames at all - the capture sits
 in `vb2_wait_for_done_vb` while the device stays runtime-active, and every
-subsequent `STREAMON` returns `-EIO` until the firmware is reloaded. So
-`fthd_v4l2_set_crop()` clamps the origin to:
+subsequent `STREAMON` returns `-EIO` until the firmware is reloaded. No such
+rectangle ever reaches firmware, because `fthd_v4l2_set_crop()` clamps the
+origin to:
 
 ```text
 left <= (sensor_width  - crop_width)  / 2
@@ -204,7 +205,20 @@ top  <= (sensor_height - crop_height) / 2
 
 Equivalently `left + right <= sensor_width` and `top + bottom <=
 sensor_height`: **the crop's centre may not pass the sensor's centre**.
-Equality on both axes at once is fine - the centred rectangle streams.
+Equality on both axes at once is fine - the centred rectangle streams, so a
+clamped crop always streams. The clamp is the fix for the starvation, not a
+symptom of it: what an application loses is the framing it asked for, never the
+frames.
+
+The containment is structural. `dev_priv->fmt.x1`/`y1`/`x2`/`y2` are written
+nowhere but the tail of `fthd_v4l2_set_crop()`, and the one place the rectangle
+reaches firmware - `fthd_start_channel()` - calls `fthd_v4l2_refresh_crop()`
+immediately before reading those four fields, which routes back through the
+same clamp. That second pass is not redundant: `max_w`/`max_h` fall back to
+`FTHD_MAX_WIDTH`/`HEIGHT` while the sensor geometry is still unknown, so a
+rectangle clamped against the 1280x720 fallback can be past-centre for the
+12-inch MacBook's real 848x588 array. Re-fitting once the true geometry is
+known is what closes that gap.
 
 The rule is measured, not inferred. Across three crop widths (1280, 640, 320),
 three crop heights (720, 360, 240) and offsets from 0 to 640 it predicts 20 of

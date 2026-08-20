@@ -471,10 +471,11 @@ Common answers:
 ### The crop origin is limited to the array centre
 
 If you set a crop rectangle, the driver may move its origin left or up. That is
-deliberate. On this firmware a crop whose origin sits past the middle of the
-sensor is accepted and then produces no frames at all, and the camera stays
-unusable — for every application, not just yours — until the driver reloads. So
-the origin is clamped to:
+deliberate, and it is what keeps the camera working: on this firmware a crop
+whose origin sat past the middle of the sensor *would be* accepted and then
+deliver no frames at all, leaving the camera unusable — for every application,
+not just yours — until the driver reloaded. The driver never programs such a
+rectangle, because the origin is clamped to:
 
 ```text
 left <= (sensor_width  - crop_width)  / 2
@@ -485,6 +486,10 @@ Equivalently, the crop's centre may not pass the sensor's centre. Landing
 exactly on the limit is fine — a centred rectangle is the furthest right and
 furthest down you can go, and a smaller crop can start further along than a
 larger one. `left` is also rounded to a multiple of eight pixels.
+
+A clamped crop streams normally. The only thing you lose is the framing you
+asked for, so the camera does not stop working because the driver moved your
+rectangle — moving it is what stops that from happening.
 
 `VIDIOC_G_SELECTION` always reports the rectangle that was actually programmed,
 so read it back if the framing matters. Most applications never set a crop and

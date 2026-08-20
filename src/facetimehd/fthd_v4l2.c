@@ -1370,14 +1370,16 @@ static void fthd_v4l2_set_crop(struct fthd_private *dev_priv,
 
 	/*
 	 * The origin may not pass the centred position on either axis.  A
-	 * rectangle beyond it is accepted by firmware and stored exactly - the
-	 * crop_raw readback confirms that - and then delivers no buffers at
-	 * all, wedging the channel until the firmware is reloaded.  Measured on
-	 * a MacBookAir7,2 across crop widths 1280/640/320 and heights
-	 * 720/360/240: streaming at or left of centre and starved past it,
-	 * exact to eight pixels horizontally and to a single pixel vertically
-	 * (top 180 streams, 181 starves).  Equivalently left + right must not
-	 * exceed the array width, nor top + bottom its height.
+	 * rectangle beyond it would be accepted by firmware and stored exactly
+	 * - the crop_raw readback confirms that - and would then deliver no
+	 * buffers at all, wedging the channel until the firmware is reloaded.
+	 * Clamping here is what keeps one from being programmed, so a clamped
+	 * rectangle streams normally.  Measured on a MacBookAir7,2 across crop
+	 * widths 1280/640/320 and heights 720/360/240: streaming at or left of
+	 * centre and starved past it, exact to eight pixels horizontally and to
+	 * a single pixel vertically (top 180 streams, 181 starves).
+	 * Equivalently left + right must not exceed the array width, nor
+	 * top + bottom its height.
 	 *
 	 * Clamping rather than refusing, because S_SELECTION is an adjusting
 	 * call and this driver already rounds the rectangle: G_SELECTION
