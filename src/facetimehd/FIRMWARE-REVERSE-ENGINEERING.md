@@ -479,10 +479,19 @@ ISP addr1    = mapped buffer base + width * height
 The driver's IOMMU allocator gives the scatterlist one contiguous ISP
 virtual-address range, so the chroma plane needs no mapping of its own. NV12 is
 advertised on that evidence, and - once it had streamed at the 4:2:0 sizeimage
-without a blank row or a fault - made the default format, enumerated first.
-That it is the ISP's own output rather than a conversion is the argument for
-putting it there. NV16 is not offered, because no output-format code produces
-it.
+without a blank row or a fault - made the default format, enumerated first, on
+the grounds that it is three quarters the bytes and that index 0 is read mostly
+by code feeding a display or a 4:2:0 encoder. NV16 is not offered, because no
+output-format code produces it.
+
+**Whether code 0 is the pipeline's native sampling is still open.** Everything
+above measures what the ISP *wrote*; none of it distinguishes a natively 4:2:0
+pipeline from a 4:2:2 one downsampling on the way out. The chroma agreement
+with YUYV is between *means*, which are identical under either. Deciding it
+needs a scene with fine horizontal chroma structure captured in both formats,
+comparing chroma row against chroma row: identical adjacent rows in the YUYV
+capture would mean the packed format is upsampling something already 4:2:0,
+while crisply differing rows would mean NV12 is a real downsample.
 
 The intuition that guessing 4:2:0 was the dangerous direction — sizing a
 buffer at 1.5 bytes per pixel while the ISP wrote 2 would overrun the mapping —

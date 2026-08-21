@@ -39,9 +39,9 @@ follows.
   the sensor interface into errors.
 - **Digital zoom and pan** through `VIDIOC_S_SELECTION`. Upstream pinned the
   crop to the full sensor array.
-- **NV12 is the default format**, alongside YUYV and YVYU. It is what the ISP
-  natively produces and three quarters the size of a packed frame; the packed
-  formats are still enumerated and still accepted.
+- **NV12 is the default format**, alongside YUYV and YVYU. A frame is three
+  quarters the size of a packed one; the packed formats are still enumerated
+  and still accepted, so anything that asks for one by name is unaffected.
 - **Anti-banding and exposure controls are exposed.** 50/60 Hz anti-banding and
   automatic/manual exposure; upstream exposed neither. Firmware accepts every
   value and capture continues after a change, but the visible effect is still a
@@ -310,17 +310,16 @@ and [`DOWNSTREAM.md`](src/facetimehd/DOWNSTREAM.md).
 
 ### Pixel formats
 
-`YUYV` and `YVYU` are offered, both 4:2:2 packed at the sensor's native size or
-any smaller 8-pixel-aligned width.
-
 `NV12` (semi-planar 4:2:0) is the default: it is enumerated first and is what a
-freshly opened device reports. It is the ISP's own output — the packed formats
-are a conversion on the far side of it — and a frame is three quarters the size,
-which is that much less DMA and less to copy or hand to a codec.
+freshly opened device reports. A frame is three quarters the size of the packed
+equivalent, and the code that takes whatever format is offered first is usually
+feeding a display or a video encoder that wants 4:2:0 anyway.
 
-Nothing was withdrawn to make room for it. An application that asks for `YUYV`
-or `YVYU` by name gets exactly what it always got; only one that takes whatever
-is offered first sees the change.
+`YUYV` and `YVYU` are also offered, both 4:2:2 packed. Either is available at
+the sensor's native size or any smaller 8-pixel-aligned width, and nothing was
+withdrawn to make room for NV12 — an application that asks for one by name gets
+exactly what it always got. Only one that takes whatever is offered first sees
+the change.
 
 `NV16` is not offered: the camera's semi-planar output was measured writing
 4:2:0, so nothing it produces is 4:2:2 semi-planar.

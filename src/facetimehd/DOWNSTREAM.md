@@ -268,11 +268,22 @@ unsupported request to, and what a freshly probed device reports through
 `G_FMT`. All three are the same value on purpose - a default that is not
 enumerated first is how an application negotiates a format nobody tested. It
 was enumerated last while the 4:2:0 sizing was still new on this hardware; the
-validation below is what moved it to the front. The reason it belongs there is
-that code 0 is what the ISP actually produces, with the packed formats a
-conversion on the far side of it, and a frame is three quarters the size - less
-DMA, less to copy, and the layout a 4:2:0 codec wants anyway. Neither packed
-format was withdrawn, so an application that names one is unaffected.
+validation below is what moved it to the front.
+
+Two things put it there, and they are not equally strong. The measured one is
+size: 1.5 bytes per pixel against 2, so a frame is three quarters of the packed
+one, in DMA and in whatever copies it afterwards. The other is a judgement
+about who reads index 0 - anything that negotiates walks the whole list and
+names its format, so ordering does not reach it, while the simple code that
+does take index 0 is mostly feeding a display or a 4:2:0 encoder that would
+have downsampled the chroma regardless. Neither packed format was withdrawn, so
+an application that names one is unaffected.
+
+It is tempting to add that code 0 is the ISP's native output and the packed
+formats are a conversion on the far side of it. **That is not established.**
+The evidence for 4:2:0 is plane extents plus chroma means matching a YUYV
+reference, and a mean cannot distinguish native 4:2:0 from a downsample of a
+true 4:2:2 chroma stream. The ordering argument above does not rest on it.
 
 The sampling is a hardware result. Capturing through code 0 and mapping the
 frame row by row gives a `width * height` luma plane followed by exactly
@@ -624,6 +635,15 @@ Still open:
   offered format will negotiate, and no run has exercised the suite end to end
   from that starting state. `hw-validate.sh` gained `probe.default_fmt` and
   `nv12.first` for it; neither has hardware behind it yet.
+- **Whether code 0 is the pipeline's native sampling**, or a downsample of a
+  genuinely 4:2:2 chroma stream. Every measurement so far is of what the ISP
+  wrote - plane extents, and chroma *means* agreeing with a YUYV reference -
+  and means are identical either way. It decides nothing about the format's
+  correctness and nothing about the enumeration order; it decides whether an
+  application that takes index 0 and displays it is losing chroma detail that
+  YUYV would have kept. `FIRMWARE-REVERSE-ENGINEERING.md` describes the
+  capture that would settle it: fine horizontal chroma structure, compared
+  chroma row against chroma row in both formats rather than by mean.
 - The visible effect of anti-banding and exposure mode under controlled light.
 - Whether AE metering modes `0..3` are visibly distinct. They are accepted and
   persistent, but across a controlled high-contrast scene the largest cross-mode

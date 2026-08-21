@@ -86,16 +86,26 @@
  * buffer or DMA fault - so the format is advertised normally.
  *
  * It is now enumerated first and is the format a freshly opened device
- * reports, because it is what the ISP natively produces: output code 0 is the
- * semi-planar path and the packed formats are a conversion on the far side of
- * it.  A frame is three quarters the size of the packed equivalent, which is
- * that much less DMA, less to copy in the application, and less to hand a
- * codec that wants 4:2:0 anyway.
+ * reports.  The measured part of that argument is the size: 1.5 bytes per
+ * pixel against 2, so a frame is three quarters of the packed one and costs
+ * that much less DMA and that much less to copy.  The rest is about who reads
+ * index 0.  Anything that negotiates - GStreamer, ffmpeg, a browser - walks
+ * the whole list and names what it wants, so the order does not reach it;
+ * index 0 is what simple code takes, and simple code here overwhelmingly feeds
+ * a display or a 4:2:0 encoder, which would have downsampled the chroma
+ * itself.
+ *
+ * What is *not* established is that code 0 is the pipeline's native sampling
+ * rather than a downsample of a genuinely 4:2:2 chroma stream.  The evidence
+ * for 4:2:0 is plane extents and chroma *means* matching a YUYV reference, and
+ * a mean cannot see vertical chroma resolution.  If it turns out to be a
+ * downsample, that costs detail only for an application taking index 0 and
+ * displaying it; nothing above depends on which way it goes, but do not write
+ * the stronger claim into this comment without the measurement behind it.
  *
  * Nothing is withdrawn - YUYV and YVYU are still enumerated and still accepted
  * - so an application that names one gets exactly what it always got.  Only
- * one that takes whatever comes first sees the change, and NV12 has been the
- * universally handled V4L2 capture format for a long time.
+ * one that takes whatever comes first sees the change.
  */
 
 /* The only rate the sensor delivers.  Everything the driver reports is derived
