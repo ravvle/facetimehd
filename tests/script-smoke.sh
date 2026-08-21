@@ -366,6 +366,17 @@ code_only() {
     sed -e 's://.*::' -e '/^[[:space:]]*\*/d' -e '/^[[:space:]]*\/\*/d' "$1"
 }
 
+# Read it once into a variable, and match against that with here-strings rather
+# than piping code_only into each reader. A reader that stops early - `grep -q`
+# the moment it matches, or an `awk` with an `exit` - closes the pipe while sed
+# still has most of the file to write, sed dies of EPIPE, and `pipefail` makes
+# the whole pipeline non-zero. That is worse than a crash: the guards below are
+# written `if ! ... grep -q <the thing that must not be there>`, so the EPIPE
+# status inverts to *true* and the check congratulates itself precisely when the
+# forbidden thing is present. It is also a race against the 64K pipe buffer, so
+# it passes locally and fails in CI.
+v4l2_code="$(code_only "$v4l2")"
+
 if ! grep -Rq 'module_param(\(experimental_controls\|experimental_formats\|hwmon\)' \
         "$REPO_DIR/src/facetimehd"; then
     result ok "unsafe firmware interfaces have no module-parameter entry point"
@@ -454,8 +465,8 @@ else
     result bad "metering mutation bypasses its fixed-value or restoration boundary"
 fi
 
-if ! code_only "$v4l2" |
-        grep -q 'V4L2_CID_AUTO_EXPOSURE_BIAS\|V4L2_CID_WHITE_BALANCE_TEMPERATURE\|V4L2_CID_TEST_PATTERN\|FTHD_CID_NOISE_REDUCTION\|FTHD_CID_CHROMA_SUPPRESSION'; then
+if ! grep -q 'V4L2_CID_AUTO_EXPOSURE_BIAS\|V4L2_CID_WHITE_BALANCE_TEMPERATURE\|V4L2_CID_TEST_PATTERN\|FTHD_CID_NOISE_REDUCTION\|FTHD_CID_CHROMA_SUPPRESSION' \
+        <<<"$v4l2_code"; then
     result ok "malformed or semantically unknown controls are not registered"
 else
     result bad "an unvalidated firmware control is still registered"
@@ -482,7 +493,7 @@ fi
 # unwritten zeros - and NV16 must not come back on the strength of its old name.
 if grep -qF 'pixelformat == V4L2_PIX_FMT_NV12;' "$v4l2" &&
    grep -qF 'pix->bytesperline * pix->height * 3 / 2' "$v4l2" &&
-   ! code_only "$v4l2" | grep -q 'V4L2_PIX_FMT_NV16' &&
+   ! grep -q 'V4L2_PIX_FMT_NV16' <<<"$v4l2_code" &&
    ! grep -q 'module_param(nv1[26]' "$v4l2" &&
    grep -q 'nv12.gfmt' "$REPO_DIR/tests/hw-validate.sh" &&
    grep -q 'nv12.stride_rows' "$REPO_DIR/tests/hw-validate.sh" &&
@@ -497,10 +508,10 @@ fi
 # three have to agree - a default that is not enumerated first, or an
 # enumeration order that does not match what the device actually reports, is
 # how an application ends up negotiating a format nobody tested.
-nv12_enum_first="$(code_only "$v4l2" | awk '
+nv12_enum_first="$(awk '
     /enum_fmt_vid_cap/ { in_fn = 1 }
     in_fn && /case 0:/ { want = 1; next }
-    want && /pixelformat = / { print; exit }')"
+    want && /pixelformat = / && !found { print; found = 1 }' <<<"$v4l2_code")"
 if printf '%s' "$nv12_enum_first" | grep -q 'V4L2_PIX_FMT_NV12' &&
    grep -qF 'pix->pixelformat = V4L2_PIX_FMT_NV12;' "$v4l2" &&
    grep -qF 'dev_priv->fmt.fmt.pixelformat = V4L2_PIX_FMT_NV12;' "$v4l2" &&
