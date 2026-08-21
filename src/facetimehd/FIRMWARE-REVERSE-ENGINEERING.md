@@ -478,8 +478,11 @@ ISP addr1    = mapped buffer base + width * height
 
 The driver's IOMMU allocator gives the scatterlist one contiguous ISP
 virtual-address range, so the chroma plane needs no mapping of its own. NV12 is
-advertised on that evidence, enumerated last; NV16 is not offered, because no
-output-format code produces it.
+advertised on that evidence, and - once it had streamed at the 4:2:0 sizeimage
+without a blank row or a fault - made the default format, enumerated first.
+That it is the ISP's own output rather than a conversion is the argument for
+putting it there. NV16 is not offered, because no output-format code produces
+it.
 
 The intuition that guessing 4:2:0 was the dangerous direction — sizing a
 buffer at 1.5 bytes per pixel while the ISP wrote 2 would overrun the mapping —

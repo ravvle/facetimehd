@@ -1749,6 +1749,12 @@ int fthd_start_channel(struct fthd_private *dev_priv, int channel)
 		pixelformat = 0;
 		break;
 	default:
+		/* Unreachable: fthd_v4l2_adjust_format() coerces anything else
+		 * to the driver default before it is stored.  The fallback is
+		 * the packed code rather than the default one, because
+		 * bytesperline and sizeimage below were computed for a packed
+		 * frame - asking the ISP for the semi-planar layout with a
+		 * packed stride is what writes luma rows at double spacing. */
 		pixelformat = 1;
 		WARN_ON(1);
 	}

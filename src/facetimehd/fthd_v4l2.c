@@ -83,9 +83,19 @@
  * sizeimage cut to the 4:2:0 size, since the measurements above came from an
  * over-sized buffer.  That run passed - correct sizeimage, no blank luma rows,
  * chroma at 127.2 against a YUYV reference midpoint of 126.8, and no firmware,
- * buffer or DMA fault - so the format is advertised normally and the parameter
- * is gone.  It is enumerated after YUYV and YVYU, so an application that takes
- * the first format offered still gets what it always got.
+ * buffer or DMA fault - so the format is advertised normally.
+ *
+ * It is now enumerated first and is the format a freshly opened device
+ * reports, because it is what the ISP natively produces: output code 0 is the
+ * semi-planar path and the packed formats are a conversion on the far side of
+ * it.  A frame is three quarters the size of the packed equivalent, which is
+ * that much less DMA, less to copy in the application, and less to hand a
+ * codec that wants 4:2:0 anyway.
+ *
+ * Nothing is withdrawn - YUYV and YVYU are still enumerated and still accepted
+ * - so an application that names one gets exactly what it always got.  Only
+ * one that takes whatever comes first sees the change, and NV12 has been the
+ * universally handled V4L2 capture format for a long time.
  */
 
 /* The only rate the sensor delivers.  Everything the driver reports is derived
@@ -1045,16 +1055,16 @@ static int fthd_v4l2_ioctl_enum_fmt_vid_cap(struct file *filp, void *priv,
 
 	switch (fmt->index) {
 	case 0:
+		fmt->pixelformat = V4L2_PIX_FMT_NV12;
+		desc = "NV12";
+		break;
+	case 1:
 		fmt->pixelformat = V4L2_PIX_FMT_YUYV;
 		desc = "YUYV";
 		break;
-	case 1:
+	case 2:
 		fmt->pixelformat = V4L2_PIX_FMT_YVYU;
 		desc = "YVYU";
-		break;
-	case 2:
-		fmt->pixelformat = V4L2_PIX_FMT_NV12;
-		desc = "NV12";
 		break;
 	default:
 		return -EINVAL;
@@ -1076,8 +1086,11 @@ static int fthd_v4l2_adjust_format(struct fthd_private *dev_priv,
 	unsigned int max_w = dev_priv->sensor_width  ? : FTHD_MAX_WIDTH;
 	unsigned int max_h = dev_priv->sensor_height ? : FTHD_MAX_HEIGHT;
 
+	/* Coerce an unsupported request to the default rather than refusing it:
+	 * TRY_FMT and S_FMT are adjusting calls, and the caller reads back what
+	 * it got. */
 	if (!fthd_format_supported(pix->pixelformat))
-		pix->pixelformat = V4L2_PIX_FMT_YUYV;
+		pix->pixelformat = V4L2_PIX_FMT_NV12;
 
 	if (pix->width < FTHD_MIN_WIDTH)
 		pix->width = FTHD_MIN_WIDTH;
@@ -1758,7 +1771,7 @@ int fthd_v4l2_register(struct fthd_private *dev_priv)
 	 * device node: userspace may open it as soon as registration succeeds. */
 	dev_priv->fmt.fmt.width = dev_priv->sensor_width ? : FTHD_MAX_WIDTH;
 	dev_priv->fmt.fmt.height = dev_priv->sensor_height ? : FTHD_MAX_HEIGHT;
-	dev_priv->fmt.fmt.pixelformat = V4L2_PIX_FMT_YUYV;
+	dev_priv->fmt.fmt.pixelformat = V4L2_PIX_FMT_NV12;
 	fthd_v4l2_adjust_format(dev_priv, &dev_priv->fmt.fmt);
 	/* After the format, because the crop's lower bound is the output size.
 	 * G_SELECTION is answerable from the first open either way; the channel

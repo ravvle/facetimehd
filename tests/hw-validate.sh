@@ -340,6 +340,19 @@ capture_ok() {
                  --stream-to=/dev/null >>"$REPORT" 2>&1
 }
 
+# Ask for a packed format before parsing pixels out of a capture. NV12 is the
+# driver's default, so a capture nobody has configured is now semi-planar and
+# every "byte 0 of each pair is Y" parser below would read chroma as luma. It
+# is done per capture rather than once per run because reloading the module -
+# which the timing, runtimepm and suspend sections all do - puts the device
+# back on its default. Width and height are left out deliberately: v4l2-ctl
+# fills the unmentioned fields from the current format, so whatever geometry a
+# section has set up survives.
+use_packed_format() {
+    v4l2-ctl --device "$DEVICE" --set-fmt-video=pixelformat=YUYV \
+        >/dev/null 2>&1
+}
+
 # Mean luma of one frame, sampled across the whole image rather than the head
 # of the file. Taking the first 200KB of a 1280-wide YUYV frame only covers
 # the top ~78 rows, so a hand entering the bottom of the shot, or a ceiling
@@ -347,10 +360,11 @@ capture_ok() {
 # the auto-exposure verdict rests on. Six chunks spread through the frame cost
 # the same and actually represent it.
 #
-# Assumes a packed YUV format where byte 0 of each pair is Y - true for the
-# YUYV this driver offers, and this is a relative comparison anyway.
+# Assumes a packed YUV format where byte 0 of each pair is Y, so it asks for
+# one first; this is a relative comparison anyway.
 mean_luma() {
     local tmp size chunk i off
+    use_packed_format || return 1
     tmp="$(mktemp)"
     if ! v4l2-ctl --device "$DEVICE" --stream-mmap --stream-count=1 \
                   --stream-to="$tmp" >/dev/null 2>&1; then
@@ -730,6 +744,19 @@ if wants probe; then
     if load_module >>"$REPORT" 2>&1; then
         if wait_for_device; then
             result PASS probe.load "module loaded, $MODULE_NAME claims $DEVICE"
+            # The driver's default format is NV12, the ISP's own output. This
+            # is the section that can check it: it reloads the module, and the
+            # format is device-wide state that any later section may have
+            # changed by the time it runs.
+            probe_fmt="$(fmt_field 'Pixel Format')"
+            case "$probe_fmt" in
+                *NV12*)
+                    result PASS probe.default_fmt \
+                        "a freshly loaded driver reports NV12" ;;
+                *)
+                    result FAIL probe.default_fmt \
+                        "a freshly loaded driver reports '$probe_fmt', not NV12" ;;
+            esac
         else
             result FAIL probe.node "module loaded but no video node appeared"
         fi
@@ -1731,6 +1758,11 @@ if wants metering-modes; then
     elif ! confirm "Test only firmware metering modes 0, 1, 2 and 3, restoring the original after each?"; then
         result SKIP metering.confirm "operator declined bounded setter testing"
     else
+        # The luma parser below wants a packed frame; the driver's default is
+        # NV12. The fourcc check that follows stays as the real guard, since it
+        # reads back what the device ended up with rather than what was asked.
+        use_packed_format || result WARN metering.format \
+            "could not select a packed format for the luma parser"
         fmt_text="$(v4l2-ctl --device "$DEVICE" --get-fmt-video 2>>"$REPORT")"
         dimensions="$(printf '%s\n' "$fmt_text" | sed -n \
             's/^[[:space:]]*Width\/Height[[:space:]]*:[[:space:]]*\([0-9][0-9]*\)\/\([0-9][0-9]*\).*/\1 \2/p' | head -1)"
@@ -2639,6 +2671,18 @@ if wants nv12; then
             result FAIL nv12.enum "ENUM_FMT does not advertise NV12"
         fi
 
+        # Index 0 is what an application that takes the first format offered
+        # ends up with, and NV12 is meant to be that format now.
+        nv12_first="$(v4l2-ctl --device "$DEVICE" --list-formats 2>/dev/null |
+            sed -n "s/^[[:space:]]*Pixel Format[[:space:]]*:[[:space:]]*'\([^']*\)'.*/\1/p" |
+            head -1)"
+        if [ "$nv12_first" = NV12 ]; then
+            result PASS nv12.first "NV12 is the first format enumerated"
+        else
+            result FAIL nv12.first \
+                "ENUM_FMT index 0 is '${nv12_first:-unknown}', not NV12"
+        fi
+
         dmesg_mark
         v4l2-ctl --device "$DEVICE" --set-fmt-video=pixelformat=NV12 \
             >>"$REPORT" 2>&1 || true
@@ -2776,9 +2820,10 @@ if wants nv12; then
             result PASS nv12.faults \
                 "no firmware, buffer, IOMMU or DMAR faults during NV12 capture"
         fi
-        # Leave the node on the format everything else in this run expects.
-        v4l2-ctl --device "$DEVICE" --set-fmt-video=pixelformat=YUYV \
-        >>"$REPORT" 2>&1 || true
+        # Leave the node on a packed format. Nothing depends on it any more -
+        # every section that parses pixels asks for one itself - but leaving a
+        # run's device on the format its parsers want costs nothing.
+        use_packed_format || true
     fi
 fi
 

@@ -258,12 +258,21 @@ not look like it: `left=648, width=632` rounds to `+640+0` 640x360.
 
 ## Pixel formats
 
-YUYV, YVYU and **NV12** are advertised. The ISP's semi-planar output, format
-code 0, is NV12 - 4:2:0, not the 4:2:2 that upstream's 2015 comment ("plane 0 Y
-plane 1 UV", with no sampling given) was read as for a decade. NV12 is
-enumerated last, so an application that takes the first format offered still
-gets what it always got. NV16 is not offered: no output-format code produces
-it.
+**NV12**, YUYV and YVYU are advertised, in that order. The ISP's semi-planar
+output, format code 0, is NV12 - 4:2:0, not the 4:2:2 that upstream's 2015
+comment ("plane 0 Y plane 1 UV", with no sampling given) was read as for a
+decade. NV16 is not offered: no output-format code produces it.
+
+NV12 is the default: `ENUM_FMT` index 0, what `TRY_FMT`/`S_FMT` coerce an
+unsupported request to, and what a freshly probed device reports through
+`G_FMT`. All three are the same value on purpose - a default that is not
+enumerated first is how an application negotiates a format nobody tested. It
+was enumerated last while the 4:2:0 sizing was still new on this hardware; the
+validation below is what moved it to the front. The reason it belongs there is
+that code 0 is what the ISP actually produces, with the packed formats a
+conversion on the far side of it, and a frame is three quarters the size - less
+DMA, less to copy, and the layout a 4:2:0 codec wants anyway. Neither packed
+format was withdrawn, so an application that names one is unaffected.
 
 The sampling is a hardware result. Capturing through code 0 and mapping the
 frame row by row gives a `width * height` luma plane followed by exactly
@@ -609,6 +618,12 @@ Still open:
   rectangle being the sensor array, the crop centre rule, and
   `awb_cct_estimate` reading kelvin (read-only, so a wrong unit misinforms
   rather than misconfigures).
+- **The format default itself.** Every NV12 capture check above passed, but it
+  passed for a format an application had to name. It is now what
+  `v4l2-compliance`, `tests/smoke-capture.sh` and anything that takes the first
+  offered format will negotiate, and no run has exercised the suite end to end
+  from that starting state. `hw-validate.sh` gained `probe.default_fmt` and
+  `nv12.first` for it; neither has hardware behind it yet.
 - The visible effect of anti-banding and exposure mode under controlled light.
 - Whether AE metering modes `0..3` are visibly distinct. They are accepted and
   persistent, but across a controlled high-contrast scene the largest cross-mode

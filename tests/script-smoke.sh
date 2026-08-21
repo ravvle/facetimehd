@@ -492,6 +492,35 @@ else
     result bad "NV12 is missing, mis-sized, or has no hardware test"
 fi
 
+# NV12 is the default format: index 0 of ENUM_FMT, what an unsupported request
+# is coerced to, and what a freshly probed device reports through G_FMT. All
+# three have to agree - a default that is not enumerated first, or an
+# enumeration order that does not match what the device actually reports, is
+# how an application ends up negotiating a format nobody tested.
+nv12_enum_first="$(code_only "$v4l2" | awk '
+    /enum_fmt_vid_cap/ { in_fn = 1 }
+    in_fn && /case 0:/ { want = 1; next }
+    want && /pixelformat = / { print; exit }')"
+if printf '%s' "$nv12_enum_first" | grep -q 'V4L2_PIX_FMT_NV12' &&
+   grep -qF 'pix->pixelformat = V4L2_PIX_FMT_NV12;' "$v4l2" &&
+   grep -qF 'dev_priv->fmt.fmt.pixelformat = V4L2_PIX_FMT_NV12;' "$v4l2" &&
+   grep -q 'probe.default_fmt' "$REPO_DIR/tests/hw-validate.sh" &&
+   grep -q 'nv12.first' "$REPO_DIR/tests/hw-validate.sh"; then
+    result ok "NV12 is enumerated first, is the probe default, and is the fallback"
+else
+    result bad "the NV12 default is inconsistent between ENUM_FMT, probe and the fallback"
+fi
+
+# Every parser in the hardware suite that reads pixels out of a capture assumes
+# a packed layout, and the device no longer defaults to one. mean_luma() is the
+# parser that captures for itself, so it is the one that must ask.
+if grep -q '^use_packed_format() {' "$REPO_DIR/tests/hw-validate.sh" &&
+   grep -qF 'use_packed_format || return 1' "$REPO_DIR/tests/hw-validate.sh"; then
+    result ok "the hardware suite's luma parsers pin a packed format first"
+else
+    result bad "a hardware luma parser can now be handed a semi-planar frame"
+fi
+
 # x2 in CISP_CMD_CH_OUTPUT_CONFIG_SET is the destination row stride. Hardcoding
 # width*2 made the ISP write luma rows at double spacing for the one-byte-per-
 # pixel plane, blanking half the frame with no IOMMU fault to show for it.
