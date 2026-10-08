@@ -707,9 +707,14 @@ static int fthd_v4l2_ioctl_enum_frameintervals(struct file *filp, void *priv,
 	    || interval->height > max_h)
 		return -EINVAL;
 
-	interval->type = V4L2_FRMIVAL_TYPE_DISCRETE;
-	interval->discrete.numerator = 1;
-	interval->discrete.denominator = 30;
+	/* Continuous over the range S_PARM accepts. */
+	interval->type = V4L2_FRMIVAL_TYPE_CONTINUOUS;
+	interval->stepwise.min.numerator = FTHD_FRAME_RATE_SCALE;
+	interval->stepwise.min.denominator = FTHD_FRAME_RATE_MAX;
+	interval->stepwise.max.numerator = FTHD_FRAME_RATE_SCALE;
+	interval->stepwise.max.denominator = FTHD_FRAME_RATE_MIN;
+	interval->stepwise.step.numerator = 1;
+	interval->stepwise.step.denominator = 1;
 
 	return 0;
 }
