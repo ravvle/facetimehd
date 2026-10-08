@@ -579,6 +579,8 @@ static int fthd_v4l2_ioctl_s_fmt_vid_cap(struct file *filp, void *priv,
 		 fmt->fmt.pix.pixelformat >> 16, fmt->fmt.pix.pixelformat >> 24);
 
 	dev_priv->fmt.fmt = fmt->fmt.pix;
+	/* A new output size starts again from the default crop. */
+	dev_priv->fmt.crop_set = false;
 
 	switch (fmt->fmt.pix.pixelformat) {
 	case V4L2_PIX_FMT_NV16:
@@ -637,8 +639,8 @@ static int fthd_v4l2_ioctl_s_parm(struct file *filp, void *priv,
 	return ret;
 }
 
-/* Report the sensor area the scaler reads from. V4L2_SEL_TGT_CROP is left
- * out: the window in use depends on the negotiated format.
+/* Report the sensor area the scaler reads from: the crop in use, or the whole
+ * sensor for the default and bounds targets.
  */
 static int fthd_v4l2_ioctl_g_selection(struct file *filp, void *priv,
 		struct v4l2_selection *sel)
@@ -649,6 +651,12 @@ static int fthd_v4l2_ioctl_g_selection(struct file *filp, void *priv,
 		return -EINVAL;
 
 	switch (sel->target) {
+	case V4L2_SEL_TGT_CROP:
+		if (dev_priv->fmt.crop_set)
+			sel->r = dev_priv->fmt.crop;
+		else
+			fthd_isp_default_crop(dev_priv, &sel->r);
+		return 0;
 	case V4L2_SEL_TGT_CROP_DEFAULT:
 	case V4L2_SEL_TGT_CROP_BOUNDS:
 		break;
@@ -661,6 +669,39 @@ static int fthd_v4l2_ioctl_g_selection(struct file *filp, void *priv,
 	sel->r.width = dev_priv->sensor_width ? : FTHD_MAX_WIDTH;
 	sel->r.height = dev_priv->sensor_height ? : FTHD_MAX_HEIGHT;
 
+	return 0;
+}
+
+/* Digital zoom and pan: the ISP crops this rectangle and scales it to the
+ * output.  The firmware accepts a window that leaves the sensor and then
+ * delivers no frames, so the rectangle is kept on the sensor; it is never
+ * smaller than the output, and its width is kept even so the offset and
+ * width are never both odd.
+ */
+static int fthd_v4l2_ioctl_s_selection(struct file *filp, void *priv,
+		struct v4l2_selection *sel)
+{
+	struct fthd_private *dev_priv = video_drvdata(filp);
+	unsigned int sw = dev_priv->sensor_width  ? : FTHD_MAX_WIDTH;
+	unsigned int sh = dev_priv->sensor_height ? : FTHD_MAX_HEIGHT;
+	struct v4l2_rect *r = &sel->r;
+
+	if (sel->type != V4L2_BUF_TYPE_VIDEO_CAPTURE ||
+	    sel->target != V4L2_SEL_TGT_CROP)
+		return -EINVAL;
+	if (sel->flags & (V4L2_SEL_FLAG_GE | V4L2_SEL_FLAG_LE))
+		return -ERANGE;
+	/* The crop only reaches the firmware at channel start. */
+	if (vb2_is_busy(&dev_priv->vb2_queue))
+		return -EBUSY;
+
+	r->width = clamp_t(u32, r->width, dev_priv->fmt.fmt.width, sw) & ~1u;
+	r->height = clamp_t(u32, r->height, dev_priv->fmt.fmt.height, sh);
+	r->left = clamp_t(s32, r->left, 0, sw - r->width);
+	r->top = clamp_t(s32, r->top, 0, sh - r->height);
+
+	dev_priv->fmt.crop = *r;
+	dev_priv->fmt.crop_set = true;
 	return 0;
 }
 
@@ -749,6 +790,7 @@ static struct v4l2_ioctl_ops fthd_ioctl_ops = {
 	.vidioc_g_parm          = fthd_v4l2_ioctl_g_parm,
 	.vidioc_s_parm          = fthd_v4l2_ioctl_s_parm,
 	.vidioc_g_selection     = fthd_v4l2_ioctl_g_selection,
+	.vidioc_s_selection     = fthd_v4l2_ioctl_s_selection,
 	.vidioc_enum_framesizes = fthd_v4l2_ioctl_enum_framesizes,
 	.vidioc_enum_frameintervals = fthd_v4l2_ioctl_enum_frameintervals,
 

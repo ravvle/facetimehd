@@ -1187,17 +1187,9 @@ int fthd_isp_ae_frame_rate_min(struct fthd_private *dev_priv, bool auto_priority
 	return rate;
 }
 
-int fthd_start_channel(struct fthd_private *dev_priv, int channel)
+void fthd_isp_default_crop(struct fthd_private *dev_priv, struct v4l2_rect *r)
 {
 	unsigned int sw, sh, ow, oh, cw, ch;
-	int ret, x, y, pixelformat;
-
-	ret = fthd_isp_cmd_channel_camera_config(dev_priv);
-	if (ret)
-		return ret;
-	ret = fthd_isp_cmd_channel_camera_config_select(dev_priv, 0, 0);
-	if (ret)
-		return ret;
 
 	/* Crop the largest centred window with the output's aspect ratio and
 	 * let the ISP scale it down. The window and its offset are derived
@@ -1228,10 +1220,31 @@ int fthd_start_channel(struct fthd_private *dev_priv, int channel)
 	cw = min(cw, sw) & ~1u;
 	ch = min(ch, sh);
 
-	x = (sw - cw) / 2;
-	y = (sh - ch) / 2;
+	r->left = (sw - cw) / 2;
+	r->top = (sh - ch) / 2;
+	r->width = cw;
+	r->height = ch;
+}
 
-	ret = fthd_isp_cmd_channel_crop_set(dev_priv, 0, x, y, cw, ch);
+int fthd_start_channel(struct fthd_private *dev_priv, int channel)
+{
+	struct v4l2_rect r;
+	int ret, pixelformat;
+
+	ret = fthd_isp_cmd_channel_camera_config(dev_priv);
+	if (ret)
+		return ret;
+	ret = fthd_isp_cmd_channel_camera_config_select(dev_priv, 0, 0);
+	if (ret)
+		return ret;
+
+	if (dev_priv->fmt.crop_set)
+		r = dev_priv->fmt.crop;
+	else
+		fthd_isp_default_crop(dev_priv, &r);
+
+	ret = fthd_isp_cmd_channel_crop_set(dev_priv, 0, r.left, r.top,
+					    r.width, r.height);
 	if (ret)
 		return ret;
 

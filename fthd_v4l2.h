@@ -25,6 +25,8 @@ struct fthd_fmt {
 	int y1;
 	int x2;
 	int y2;
+	struct v4l2_rect crop;	/* set by S_SELECTION */
+	bool crop_set;
 };
 
 struct fthd_private;
