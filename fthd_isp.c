@@ -759,12 +759,12 @@ int fthd_isp_cmd_channel_output_config_set(struct fthd_private *dev_priv, int ch
 	memset(&cmd, 0, sizeof(cmd));
 	cmd.channel = channel;
 	cmd.x1 = x; /* Y size */
-	cmd.x2 = x * 2; /* Chroma size? */
+	cmd.x2 = dev_priv->fmt.fmt.bytesperline; /* row stride in bytes */
 	cmd.x3 = x;
 	cmd.y1 = y;
 
 	/* pixel formats:
-	 * 0 - plane 0 Y plane 1 UV
+	 * 0 - NV12: plane 0 Y, plane 1 interleaved CbCr at half height
 	   1 - YUYV
 	   2 - YVYU
 	*/
@@ -1242,7 +1242,7 @@ int fthd_start_channel(struct fthd_private *dev_priv, int channel)
 	case V4L2_PIX_FMT_YVYU:
 		pixelformat = 2;
 		break;
-	case V4L2_PIX_FMT_NV16:
+	case V4L2_PIX_FMT_NV12:
 		pixelformat = 0;
 		break;
 	default:

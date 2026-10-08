@@ -270,6 +270,11 @@ static int fthd_buffer_prepare(struct vb2_buffer *vb)
 	if (dev_priv->fmt.planes >= 3)
 		dma_list->desc[0].addr2 = (ctx->plane[2]->offset << 12) | 0xc0000000;
 
+	/* NV12's chroma plane follows luma in the same contiguous mapping. */
+	if (dev_priv->fmt.fmt.pixelformat == V4L2_PIX_FMT_NV12)
+		dma_list->desc[0].addr1 = dma_list->desc[0].addr0 +
+			dev_priv->fmt.fmt.bytesperline * dev_priv->fmt.fmt.height;
+
 	dma_list->desc[0].tag = (u64)ctx;
 	init_waitqueue_head(&ctx->wq);
 	return 0;
@@ -469,6 +474,12 @@ static int fthd_v4l2_ioctl_enum_fmt_vid_cap(struct file *filp, void *priv,
 		desc = "YUYV";
 #endif
 		break;
+	case 1:
+		fmt->pixelformat = V4L2_PIX_FMT_NV12;
+#if LINUX_VERSION_CODE < KERNEL_VERSION(4,2,0)
+		desc = "NV12";
+#endif
+		break;
 	/* YVYU is not advertised: the ISP firmware's output for that format is
 	 * broken (wrong/garbage chroma, renders green and pink). Apps that
 	 * negotiate YVYU get a corrupted image; YUYV is correct. Requests for
@@ -502,7 +513,8 @@ static int fthd_v4l2_adjust_format(struct fthd_private *dev_priv,
 	unsigned int max_w = dev_priv->sensor_width  ? : FTHD_MAX_WIDTH;
 	unsigned int max_h = dev_priv->sensor_height ? : FTHD_MAX_HEIGHT;
 
-	if (pix->pixelformat != V4L2_PIX_FMT_YUYV)
+	if (pix->pixelformat != V4L2_PIX_FMT_YUYV &&
+	    pix->pixelformat != V4L2_PIX_FMT_NV12)
 		pix->pixelformat = V4L2_PIX_FMT_YUYV;
 
 	if (pix->width < FTHD_MIN_WIDTH)
@@ -525,6 +537,11 @@ static int fthd_v4l2_adjust_format(struct fthd_private *dev_priv,
 		pix->bytesperline = pix->width;
 		break;
 */
+	case V4L2_PIX_FMT_NV12:
+		/* Luma, then a half-height interleaved CbCr plane. */
+		pix->bytesperline = pix->width;
+		pix->sizeimage = pix->bytesperline * pix->height * 3 / 2;
+		break;
 	case V4L2_PIX_FMT_YUYV:
 	default:
 		pix->bytesperline = pix->width * 2;
@@ -585,6 +602,7 @@ static int fthd_v4l2_ioctl_s_fmt_vid_cap(struct file *filp, void *priv,
 		dev_priv->fmt.planes = 2;
 		break;
 	case V4L2_PIX_FMT_YUYV:
+	case V4L2_PIX_FMT_NV12:
 		dev_priv->fmt.planes = 1;
 		break;
 	}
@@ -672,7 +690,8 @@ static int fthd_v4l2_ioctl_enum_framesizes(struct file *filp, void *priv,
 	if (sizes->index)
 		return -EINVAL;
 
-	if (sizes->pixel_format != V4L2_PIX_FMT_YUYV)
+	if (sizes->pixel_format != V4L2_PIX_FMT_YUYV &&
+	    sizes->pixel_format != V4L2_PIX_FMT_NV12)
 		return -EINVAL;
 
 	sizes->type = V4L2_FRMSIZE_TYPE_STEPWISE;
@@ -699,7 +718,7 @@ static int fthd_v4l2_ioctl_enum_frameintervals(struct file *filp, void *priv,
 		return -EINVAL;
 
 	if (interval->pixel_format != V4L2_PIX_FMT_YUYV &&
-	    interval->pixel_format != V4L2_PIX_FMT_NV16)
+	    interval->pixel_format != V4L2_PIX_FMT_NV12)
 		return -EINVAL;
 
 	if (interval->width & 7
